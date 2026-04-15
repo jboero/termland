@@ -38,9 +38,21 @@ fn rgba_to_pixels(rgba: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+/// Parameters for initiating a new termland session.
+#[derive(Clone)]
+pub struct ConnectParams {
+    pub mode: SessionMode,
+    pub width: u32,
+    pub height: u32,
+    pub quality: u8,
+    pub desktop_shell: Option<String>,
+    pub encoder_preset: Option<String>,
+    pub encoder_crf: Option<u8>,
+    pub encoder_extra_params: Option<String>,
+}
+
 pub async fn connect(
-    server: &str, ssh: bool, mode: SessionMode, width: u32, height: u32, quality: u8,
-    desktop_shell: Option<String>,
+    server: &str, ssh: bool, params: ConnectParams,
 ) -> Result<(mpsc::UnboundedReceiver<ServerEvent>, mpsc::UnboundedSender<ClientCommand>)> {
     let (server_tx, server_rx) = mpsc::unbounded_channel();
     let (client_tx, client_rx) = mpsc::unbounded_channel();
@@ -54,7 +66,7 @@ pub async fn connect(
             .spawn().context("failed to spawn ssh")?;
         let io = tokio::io::join(child.stdout.unwrap(), child.stdin.unwrap());
         tokio::spawn(async move {
-            if let Err(e) = session_loop(io, mode, width, height, quality, desktop_shell, server_tx, client_rx).await {
+            if let Err(e) = session_loop(io, params, server_tx, client_rx).await {
                 tracing::error!("Session error: {e}");
             }
         });
@@ -63,7 +75,7 @@ pub async fn connect(
             .context(format!("failed to connect to {server}"))?;
         tracing::info!("Connected to {server}");
         tokio::spawn(async move {
-            if let Err(e) = session_loop(stream, mode, width, height, quality, desktop_shell, server_tx, client_rx).await {
+            if let Err(e) = session_loop(stream, params, server_tx, client_rx).await {
                 tracing::error!("Session error: {e}");
             }
         });
@@ -77,8 +89,7 @@ struct DecodeJob {
 }
 
 async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
-    io: T, mode: SessionMode, width: u32, height: u32, quality: u8,
-    desktop_shell: Option<String>,
+    io: T, params: ConnectParams,
     server_tx: mpsc::UnboundedSender<ServerEvent>,
     mut client_rx: mpsc::UnboundedReceiver<ClientCommand>,
 ) -> Result<()> {
@@ -93,7 +104,15 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
     }
 
     framed.send(Message::SessionCreate(SessionCreate {
-        mode, width, height, audio: false, quality, desktop_shell,
+        mode: params.mode,
+        width: params.width,
+        height: params.height,
+        audio: false,
+        quality: params.quality,
+        desktop_shell: params.desktop_shell,
+        encoder_preset: params.encoder_preset,
+        encoder_crf: params.encoder_crf,
+        encoder_extra_params: params.encoder_extra_params,
     })).await?;
     let msg = framed.next().await.context("closed")?.context("decode")?;
     match &msg {

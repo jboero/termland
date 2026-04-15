@@ -10,7 +10,7 @@ use winit::window::{Window, WindowId};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 
 use crate::Args;
-use crate::connection::{ClientCommand, ServerEvent, connect};
+use crate::connection::{ClientCommand, ConnectParams, ServerEvent, connect};
 use crate::overlay::{self, BarItem, BarLayout, MenuAction, MenuState, MENUBAR_HEIGHT};
 use termland_protocol::input;
 use winit::window::Fullscreen;
@@ -211,12 +211,17 @@ impl App {
     fn start_connection(&mut self) {
         let server = self.args.server.clone();
         let ssh = self.args.ssh;
-        let mode = self.args.session_mode();
-        let (w, h) = (self.args.width, self.args.height);
-
-        let quality = self.args.quality;
-        let desktop_shell = self.args.desktop_shell.clone();
-        match self.runtime.block_on(connect(&server, ssh, mode, w, h, quality, desktop_shell)) {
+        let params = ConnectParams {
+            mode: self.args.session_mode(),
+            width: self.args.width,
+            height: self.args.height,
+            quality: self.args.quality,
+            desktop_shell: self.args.desktop_shell.clone(),
+            encoder_preset: self.args.preset.clone(),
+            encoder_crf: self.args.crf,
+            encoder_extra_params: self.args.svt_params.clone(),
+        };
+        match self.runtime.block_on(connect(&server, ssh, params)) {
             Ok((rx, tx)) => { self.server_rx = Some(rx); self.client_tx = Some(tx); }
             Err(e) => tracing::error!("Connect failed: {e:#}"),
         }

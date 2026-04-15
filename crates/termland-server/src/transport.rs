@@ -129,6 +129,9 @@ where
     let height = session_create.height;
     let quality = session_create.quality.clamp(1, 100);
     let desktop_shell = session_create.desktop_shell.filter(|s| !s.is_empty());
+    let encoder_preset = session_create.encoder_preset.filter(|s| !s.is_empty());
+    let encoder_crf = session_create.encoder_crf;
+    let encoder_extra_params = session_create.encoder_extra_params.filter(|s| !s.is_empty());
     let mode: termland_compositor::SessionMode = session_create.mode.into();
 
     // Spawn the compositor + capture loop on a blocking thread.
@@ -143,6 +146,7 @@ where
 
     let capture_handle = std::thread::spawn(move || {
         capture_thread(width, height, quality, mode, desktop_shell,
+                       encoder_preset, encoder_crf, encoder_extra_params,
                        overlay_cursor_capture, frame_tx, display_tx, stop_rx);
     });
 
@@ -313,12 +317,16 @@ where
 }
 
 /// Capture thread: creates compositor, captures frames, sends display name back.
+#[allow(clippy::too_many_arguments)]
 fn capture_thread(
     width: u32,
     height: u32,
     quality: u8,
     mode: termland_compositor::SessionMode,
     desktop_shell: Option<String>,
+    encoder_preset: Option<String>,
+    encoder_crf: Option<u8>,
+    encoder_extra_params: Option<String>,
     overlay_cursor: Arc<AtomicBool>,
     frame_tx: tokio::sync::mpsc::Sender<CapturedFrame>,
     display_tx: tokio::sync::oneshot::Sender<String>,
@@ -349,6 +357,9 @@ fn capture_thread(
         fps: 30,
         bitrate_kbps,
         keyframe_interval: 30,
+        preset: encoder_preset,
+        crf: encoder_crf,
+        extra_svt_params: encoder_extra_params,
     };
 
     let mut av1_encoder: Option<Box<dyn termland_codec::Av1Encoder>> =

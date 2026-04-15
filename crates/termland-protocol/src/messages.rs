@@ -209,6 +209,19 @@ pub struct SessionCreate {
     /// If None/empty, server auto-detects a terminal emulator.
     #[serde(default)]
     pub desktop_shell: Option<String>,
+    /// Override encoder preset (SVT-AV1: 0-13, QSV: veryfast/faster/etc).
+    /// None = use the backend-specific default.
+    #[serde(default)]
+    pub encoder_preset: Option<String>,
+    /// Override CRF (0-63 for SVT-AV1, ignored by HW encoders).
+    /// None = use default (35 for SVT-AV1).
+    #[serde(default)]
+    pub encoder_crf: Option<u8>,
+    /// Extra key:value params passed verbatim as `svtav1-params` (SVT-AV1 only).
+    /// Merged with our mandatory low-delay params. Example:
+    /// "fast-decode=1:tile-columns=2:scm=2"
+    #[serde(default)]
+    pub encoder_extra_params: Option<String>,
 }
 
 fn default_quality() -> u8 { 75 }

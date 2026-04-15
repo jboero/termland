@@ -39,6 +39,21 @@ pub struct Args {
     /// If omitted, the server auto-detects an available terminal.
     #[arg(long)]
     pub desktop_shell: Option<String>,
+
+    /// Override encoder preset. SVT-AV1: 0..13 (higher = faster, lower latency).
+    /// QSV: veryfast|faster|fast|medium|slow|slower|veryslow.
+    /// NVENC: p1..p7 (p1 = fastest).
+    #[arg(long)]
+    pub preset: Option<String>,
+
+    /// Override CRF / quantizer (SVT-AV1 only). 0..63, higher = smaller / lower quality.
+    #[arg(long)]
+    pub crf: Option<u8>,
+
+    /// Extra svtav1-params to append to our low-delay defaults (SVT-AV1 only).
+    /// Format: "key=value:key=value". Example: "fast-decode=1:tile-columns=2:scm=2"
+    #[arg(long)]
+    pub svt_params: Option<String>,
 }
 
 impl Args {

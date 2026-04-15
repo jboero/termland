@@ -52,6 +52,14 @@ pub struct EncoderConfig {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub keyframe_interval: u32,
+    /// Override encoder preset. None = backend default.
+    /// SVT-AV1: "0".."13", QSV: "veryfast".."veryslow", NVENC: "p1".."p7".
+    pub preset: Option<String>,
+    /// Override constant rate factor (SVT-AV1 only). None = 35.
+    pub crf: Option<u8>,
+    /// Extra svtav1-params to merge with the mandatory low-delay ones.
+    /// Format: "key=value:key=value". SVT-AV1 only.
+    pub extra_svt_params: Option<String>,
 }
 
 impl Default for EncoderConfig {
@@ -62,6 +70,9 @@ impl Default for EncoderConfig {
             fps: 30,
             bitrate_kbps: 5000,
             keyframe_interval: 60,
+            preset: None,
+            crf: None,
+            extra_svt_params: None,
         }
     }
 }
@@ -145,27 +156,51 @@ impl FfmpegAv1Encoder {
         let mut opts = ffmpeg_next::Dictionary::new();
         match backend {
             EncoderBackend::SvtAv1 => {
-                opts.set("preset", "10");
-                opts.set("crf", "35");
-                opts.set("svtav1-params", "pred-struct=1:lad=0"); // low-delay, no lookahead
+                // Preset: user override OR our default (10)
+                let preset = config.preset.as_deref().unwrap_or("10");
+                opts.set("preset", preset);
+
+                // CRF: user override OR our default (35)
+                let crf = config.crf.map(|c| c.to_string()).unwrap_or_else(|| "35".to_string());
+                opts.set("crf", &crf);
+
+                // svtav1-params: mandatory low-delay params + any user extras.
+                // Mandatory: pred-struct=1 (low delay), lad=0 (no lookahead)
+                let mut svt_params = String::from("pred-struct=1:lad=0");
+                if let Some(extra) = &config.extra_svt_params {
+                    if !extra.is_empty() {
+                        svt_params.push(':');
+                        svt_params.push_str(extra);
+                    }
+                }
+                opts.set("svtav1-params", &svt_params);
                 encoder.set_max_b_frames(0);
+
+                tracing::info!("SVT-AV1 tuning: preset={preset} crf={crf} svtav1-params={svt_params}");
             }
             EncoderBackend::IntelQsv => {
                 encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
-                opts.set("preset", "veryfast");
+                let preset = config.preset.as_deref().unwrap_or("veryfast");
+                opts.set("preset", preset);
                 opts.set("look_ahead", "0");
                 opts.set("async_depth", "1");
                 opts.set("low_delay_brc", "1");
                 encoder.set_max_b_frames(0);
+                tracing::info!("QSV tuning: preset={preset}");
             }
             EncoderBackend::NvidiaEnc => {
                 encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
-                opts.set("preset", "p1");
+                let preset = config.preset.as_deref().unwrap_or("p1");
+                opts.set("preset", preset);
                 opts.set("tune", "ull");
                 opts.set("rc", "cbr");
+                tracing::info!("NVENC tuning: preset={preset}");
             }
             EncoderBackend::AmdAmf | EncoderBackend::AmdVaapi => {
                 encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                if let Some(preset) = &config.preset {
+                    opts.set("preset", preset);
+                }
             }
         }
 

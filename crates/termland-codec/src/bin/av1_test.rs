@@ -30,6 +30,7 @@ fn main() {
         fps: 30,
         bitrate_kbps: 8000,
         keyframe_interval: 30,
+        ..Default::default()
     };
 
     // Probe encoder
