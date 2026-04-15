@@ -1,0 +1,24 @@
+[package]
+name = "termland-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+termland-protocol = { workspace = true }
+termland-codec = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+winit = "0.30"
+softbuffer = "0.4"
+futures = "0.3"
+font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-backend = { version = "0.3", features = ["client_system"] }
+raw-window-handle = "0.6"

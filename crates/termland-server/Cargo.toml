@@ -1,0 +1,18 @@
+[package]
+name = "termland-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+termland-protocol = { workspace = true }
+termland-codec = { workspace = true }
+termland-compositor = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+futures = "0.3"

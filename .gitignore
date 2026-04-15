@@ -1,0 +1,11 @@
+/target
+
+# Editor / tooling
+.claude/
+*.swp
+*~
+.vscode/
+.idea/
+
+# Stray deploy artifacts (rsync mishaps etc.)
+/john@*

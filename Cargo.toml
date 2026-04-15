@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/termland-protocol",
+    "crates/termland-codec",
+    "crates/termland-compositor",
+    "crates/termland-server",
+    "crates/termland-client",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+termland-protocol = { path = "crates/termland-protocol" }
+termland-codec = { path = "crates/termland-codec" }
+termland-compositor = { path = "crates/termland-compositor" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+
+# Utilities
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
