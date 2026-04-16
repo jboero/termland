@@ -1,56 +1,24 @@
-//! Client-side UI overlays: the options menu, text rendering, and local cursor.
+//! Client-side UI overlays: the menubar, text rendering, and local cursor.
 //!
 //! Everything here draws directly into the softbuffer u32 framebuffer
-//! (format: 0x00RRGGBB). No GPU, no toolkit - a few hundred lines of
-//! plain blitting over decoded video frames.
+//! (format: 0x00RRGGBB). No GPU, no toolkit - plain pixel blitting over
+//! decoded video frames.
+//!
+//! See ROADMAP.md v0.2 blockers: this whole module is slated for
+//! replacement when the client is ported to GTK4/Qt.
 
 use font8x8::UnicodeFonts;
 
 // ─── Colors (0x00RRGGBB) ──────────────────────────────────────────────────
 
-const MENU_BG: u32       = 0x1E1E2E; // dark backing
-const MENU_BORDER: u32   = 0x89B4FA; // light blue border
-const MENU_TITLE: u32    = 0xF5E0DC; // warm white
-const MENU_TEXT: u32     = 0xCDD6F4; // light gray
-const MENU_SELECTED: u32 = 0x585B70; // highlight for selected row
-const MENU_HINT: u32     = 0x6C7086; // faint footer
-
 const CURSOR_OUTLINE: u32 = 0x000000;
 const CURSOR_FILL: u32    = 0xFFFFFF;
 
-// ─── Menu items ───────────────────────────────────────────────────────────
+// ─── UI state (shared between menubar and F10 toggle in display.rs) ──────
 
-/// Which item is currently selected in the menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MenuAction {
-    ShowDataRate,
-    ClientCursor,
-    Quit,
-}
-
-pub const MENU_ITEMS: &[MenuAction] = &[
-    MenuAction::ShowDataRate,
-    MenuAction::ClientCursor,
-    MenuAction::Quit,
-];
-
-impl MenuAction {
-    pub fn label(&self, show_data_rate: bool, client_cursor: bool) -> String {
-        match self {
-            Self::ShowDataRate => format!("[{}] Show data rate in title",
-                if show_data_rate { "x" } else { " " }),
-            Self::ClientCursor => format!("[{}] Client-side cursor (less lag)",
-                if client_cursor { "x" } else { " " }),
-            Self::Quit => "    Quit (clean disconnect)".to_string(),
-        }
-    }
-}
-
-// ─── Menu state ───────────────────────────────────────────────────────────
-
+/// Persistent per-option toggles. The old "dropdown menu" that this used
+/// to drive has been removed; the same flags now control the menubar items.
 pub struct MenuState {
-    pub visible: bool,
-    pub selected: usize,
     pub show_data_rate: bool,
     pub client_cursor: bool,
 }
@@ -58,38 +26,9 @@ pub struct MenuState {
 impl MenuState {
     pub fn new() -> Self {
         Self {
-            visible: false,
-            selected: 0,
             show_data_rate: false,
             client_cursor: false,
         }
-    }
-
-    pub fn toggle(&mut self) {
-        self.visible = !self.visible;
-    }
-
-    pub fn up(&mut self) {
-        if self.selected == 0 {
-            self.selected = MENU_ITEMS.len() - 1;
-        } else {
-            self.selected -= 1;
-        }
-    }
-
-    pub fn down(&mut self) {
-        self.selected = (self.selected + 1) % MENU_ITEMS.len();
-    }
-
-    /// Activate the currently selected item. Returns the action taken.
-    pub fn activate(&mut self) -> MenuAction {
-        let action = MENU_ITEMS[self.selected];
-        match action {
-            MenuAction::ShowDataRate => self.show_data_rate = !self.show_data_rate,
-            MenuAction::ClientCursor => self.client_cursor = !self.client_cursor,
-            MenuAction::Quit => {}
-        }
-        action
     }
 }
 
@@ -128,10 +67,6 @@ pub fn draw_text(buf: &mut [u32], stride: usize, x: usize, y: usize, text: &str,
     }
 }
 
-pub fn text_width_px(text: &str) -> usize {
-    text.chars().count() * 8 * 2
-}
-
 // ─── Rectangle helpers ────────────────────────────────────────────────────
 
 pub fn fill_rect(buf: &mut [u32], stride: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
@@ -145,68 +80,6 @@ pub fn fill_rect(buf: &mut [u32], stride: usize, x: usize, y: usize, w: usize, h
             }
         }
     }
-}
-
-pub fn stroke_rect(buf: &mut [u32], stride: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
-    fill_rect(buf, stride, x, y, w, 1, color);            // top
-    fill_rect(buf, stride, x, y + h - 1, w, 1, color);    // bottom
-    fill_rect(buf, stride, x, y, 1, h, color);            // left
-    fill_rect(buf, stride, x + w - 1, y, 1, h, color);    // right
-}
-
-// ─── Menu rendering ───────────────────────────────────────────────────────
-
-pub fn draw_menu(
-    buf: &mut [u32],
-    fb_width: u32,
-    fb_height: u32,
-    menu: &MenuState,
-) {
-    if !menu.visible {
-        return;
-    }
-
-    let stride = fb_width as usize;
-    let row_h = 24;
-    let pad = 16;
-    let title_text = "Termland Options";
-    let hint_text = "F10 close  ^v nav  Enter toggle  Esc cancel";
-
-    // Menu width: widest label determines it
-    let mut content_w = text_width_px(title_text);
-    for item in MENU_ITEMS {
-        let w = text_width_px(&item.label(menu.show_data_rate, menu.client_cursor));
-        if w > content_w { content_w = w; }
-    }
-    let w = content_w + pad * 2;
-    let h = row_h * (MENU_ITEMS.len() + 2) + pad;
-
-    // Center in the framebuffer
-    let x = (fb_width as usize).saturating_sub(w) / 2;
-    let y = (fb_height as usize).saturating_sub(h) / 2;
-
-    // Background + border
-    fill_rect(buf, stride, x, y, w, h, MENU_BG);
-    stroke_rect(buf, stride, x, y, w, h, MENU_BORDER);
-    stroke_rect(buf, stride, x + 1, y + 1, w - 2, h - 2, MENU_BORDER);
-
-    // Title
-    draw_text(buf, stride, x + pad, y + pad, title_text, MENU_TITLE);
-
-    // Items
-    let items_y = y + pad + row_h;
-    for (i, item) in MENU_ITEMS.iter().enumerate() {
-        let row_y = items_y + i * row_h;
-        if i == menu.selected {
-            fill_rect(buf, stride, x + 4, row_y - 2, w - 8, row_h, MENU_SELECTED);
-        }
-        let label = item.label(menu.show_data_rate, menu.client_cursor);
-        draw_text(buf, stride, x + pad, row_y, &label, MENU_TEXT);
-    }
-
-    // Footer hint
-    let hint_y = y + h - row_h;
-    draw_text(buf, stride, x + pad, hint_y, hint_text, MENU_HINT);
 }
 
 // ─── Local cursor sprite ──────────────────────────────────────────────────

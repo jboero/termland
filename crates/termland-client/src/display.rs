@@ -11,7 +11,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, Raw
 
 use crate::Args;
 use crate::connection::{ClientCommand, ConnectParams, ServerEvent, connect};
-use crate::overlay::{self, BarItem, BarLayout, MenuAction, MenuState, MENUBAR_HEIGHT};
+use crate::overlay::{self, BarItem, BarLayout, MenuState, MENUBAR_HEIGHT};
 use termland_protocol::input;
 use winit::window::Fullscreen;
 
@@ -135,10 +135,10 @@ struct App {
     frame_buffer: Vec<u32>,
     should_exit: bool,
     menu: MenuState,
-    /// Current cursor position in compositor coordinate space (matches what
-    /// we send to the server). Used to draw the local cursor overlay.
-    cursor_x: f64,
-    cursor_y: f64,
+    /// Current cursor position in window pixels (what winit gives us).
+    /// We store this and scale on demand when sending to the server.
+    cursor_win_x: f64,
+    cursor_win_y: f64,
     /// Whether the cursor is currently inside the window.
     cursor_in_window: bool,
     /// Latest reported network data rate in bytes/sec.
@@ -149,7 +149,9 @@ struct App {
     bar_layout: Option<BarLayout>,
     /// Menubar item currently under the mouse (for hover highlight).
     bar_hovered: Option<BarItem>,
-    /// Is the window currently fullscreen? (hides the menubar)
+    /// Is the menubar currently visible? Off by default — toggle with F10.
+    bar_visible: bool,
+    /// Is the window currently fullscreen? (also hides the menubar)
     fullscreen: bool,
     /// Pending window-size change that hasn't been sent to the server yet.
     /// We debounce resize events so we don't reconfigure the remote
@@ -167,12 +169,13 @@ impl App {
             runtime, frame_width: 0, frame_height: 0, frame_buffer: Vec::new(),
             should_exit: false,
             menu: MenuState::new(),
-            cursor_x: 0.0, cursor_y: 0.0,
+            cursor_win_x: 0.0, cursor_win_y: 0.0,
             cursor_in_window: false,
             data_rate: 0,
             last_title: String::new(),
             bar_layout: None,
             bar_hovered: None,
+            bar_visible: false,
             fullscreen: false,
             pending_resize: None,
             last_sent_size: None,
@@ -318,31 +321,68 @@ impl App {
 
     fn render(&mut self) {
         let Some(surface) = &mut self.surface else { return; };
+        let Some(window) = &self.window else { return; };
         if self.frame_buffer.is_empty() || self.frame_width == 0 { return; }
 
-        let w = NonZeroU32::new(self.frame_width).unwrap();
-        let h = NonZeroU32::new(self.frame_height).unwrap();
-        if surface.resize(w, h).is_err() { return; }
+        // Size softbuffer to the *window*, not the frame. This is the key
+        // fix for the "diagonal" / row-wrap artifact: attaching a
+        // differently-sized buffer to a surface during resize causes the
+        // compositor to apply its own scaling with the wrong stride.
+        let win_size = window.inner_size();
+        let Some(ww_nz) = NonZeroU32::new(win_size.width) else { return; };
+        let Some(wh_nz) = NonZeroU32::new(win_size.height) else { return; };
+        if surface.resize(ww_nz, wh_nz).is_err() { return; }
 
-        let fw = self.frame_width;
-        let fh = self.frame_height;
+        let win_w = ww_nz.get() as usize;
+        let win_h = wh_nz.get() as usize;
+        let fw = self.frame_width as usize;
+        let fh = self.frame_height as usize;
 
         if let Ok(mut buffer) = surface.buffer_mut() {
-            let len = buffer.len().min(self.frame_buffer.len());
-            buffer[..len].copy_from_slice(&self.frame_buffer[..len]);
-
-            // Draw local cursor over the video if client-side cursor is enabled.
-            // Skip the menubar area so the cursor doesn't pass over it.
-            if self.menu.client_cursor && self.cursor_in_window
-                && (self.fullscreen || self.cursor_y >= MENUBAR_HEIGHT as f64)
-            {
-                overlay::draw_local_cursor(&mut buffer, fw, fh, self.cursor_x, self.cursor_y);
+            if fw == win_w && fh == win_h {
+                // Happy path: dimensions match, direct 1:1 copy.
+                let len = buffer.len().min(self.frame_buffer.len());
+                buffer[..len].copy_from_slice(&self.frame_buffer[..len]);
+            } else if fw > 0 && fh > 0 {
+                // Transition frame: the window was resized but the server
+                // hasn't caught up yet. Nearest-neighbor scale the old frame
+                // into the new window buffer so the user sees *something*
+                // reasonable for the few hundred ms it takes the remote
+                // compositor + encoder to reconfigure.
+                //
+                // Fixed-point arithmetic so we don't call float ops in a
+                // hot per-pixel loop.
+                let x_ratio = ((fw << 16) / win_w.max(1)) as u32;
+                let y_ratio = ((fh << 16) / win_h.max(1)) as u32;
+                for y in 0..win_h {
+                    let src_y = ((y as u32 * y_ratio) >> 16) as usize;
+                    let src_y = src_y.min(fh - 1);
+                    let src_row = src_y * fw;
+                    let dst_row = y * win_w;
+                    for x in 0..win_w {
+                        let src_x = ((x as u32 * x_ratio) >> 16) as usize;
+                        let src_x = src_x.min(fw - 1);
+                        buffer[dst_row + x] = self.frame_buffer[src_row + src_x];
+                    }
+                }
+            } else {
+                // No frame yet - paint black.
+                buffer.fill(0);
             }
 
-            // Menubar (top strip) - only shown when NOT fullscreen.
-            if !self.fullscreen {
+            // Local cursor overlay in window-space.
+            // Skip the menubar area so the cursor doesn't pass over it.
+            let over_bar = self.bar_visible && !self.fullscreen
+                && self.cursor_win_y < MENUBAR_HEIGHT as f64;
+            if self.menu.client_cursor && self.cursor_in_window && !over_bar {
+                overlay::draw_local_cursor(&mut buffer, ww_nz.get(), wh_nz.get(),
+                    self.cursor_win_x, self.cursor_win_y);
+            }
+
+            // Menubar (toggle with F10, also hidden in fullscreen)
+            if self.bar_visible && !self.fullscreen {
                 let layout = overlay::draw_menubar(
-                    &mut buffer, fw, fh,
+                    &mut buffer, ww_nz.get(), wh_nz.get(),
                     self.menu.show_data_rate,
                     self.menu.client_cursor,
                     self.fullscreen,
@@ -352,10 +392,8 @@ impl App {
                 self.bar_layout = Some(layout);
             } else {
                 self.bar_layout = None;
+                self.bar_hovered = None;
             }
-
-            // Dropdown overlay menu (F10) on top of everything.
-            overlay::draw_menu(&mut buffer, fw, fh, &self.menu);
 
             let _ = buffer.present();
         }
@@ -469,12 +507,12 @@ impl ApplicationHandler for App {
                     tracing::trace!("key press: {:?}", event.physical_key);
                 }
 
-                // F10 toggles the dropdown menu (works even when menu is open).
+                // F10 toggles the menubar (hidden by default).
                 if event.state == ElementState::Pressed
                     && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F10))
                     && !event.repeat
                 {
-                    self.menu.toggle();
+                    self.bar_visible = !self.bar_visible;
                     return;
                 }
 
@@ -487,40 +525,7 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                // If menu is visible, consume navigation keys locally (don't forward)
-                if self.menu.visible {
-                    if event.state != ElementState::Pressed || event.repeat {
-                        return;
-                    }
-                    if let PhysicalKey::Code(kc) = event.physical_key {
-                        match kc {
-                            KeyCode::Escape => { self.menu.visible = false; }
-                            KeyCode::ArrowUp => { self.menu.up(); }
-                            KeyCode::ArrowDown => { self.menu.down(); }
-                            KeyCode::Enter | KeyCode::Space => {
-                                let action = self.menu.activate();
-                                match action {
-                                    MenuAction::Quit => {
-                                        self.send_cmd(ClientCommand::Disconnect);
-                                        event_loop.exit();
-                                    }
-                                    MenuAction::ClientCursor => {
-                                        // Menu already toggled the bool; tell server to
-                                        // include cursor in frame = !client_cursor.
-                                        self.send_cmd(ClientCommand::SetCursorInFrame(
-                                            !self.menu.client_cursor,
-                                        ));
-                                    }
-                                    MenuAction::ShowDataRate => {}
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    return;
-                }
-
-                // Menu closed: forward the key to the remote session as before
+                // Forward the key to the remote session as before.
                 if event.repeat { return; }
                 if let PhysicalKey::Code(keycode) = event.physical_key {
                     if let Some(scancode) = keycode_to_evdev(keycode) {
@@ -535,44 +540,44 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let (sx, sy) = if let Some(win) = &self.window {
-                    let ws = win.inner_size();
-                    if ws.width > 0 && ws.height > 0 && self.frame_width > 0 {
-                        (position.x * self.frame_width as f64 / ws.width as f64,
-                         position.y * self.frame_height as f64 / ws.height as f64)
-                    } else { (position.x, position.y) }
-                } else { (position.x, position.y) };
-                // Record in compositor-space coords so we can draw our local cursor.
-                self.cursor_x = sx;
-                self.cursor_y = sy;
+                // Store cursor in WINDOW pixels (what winit gives us).
+                self.cursor_win_x = position.x;
+                self.cursor_win_y = position.y;
 
-                // Hit-test the menubar for hover highlight.
-                self.bar_hovered = if !self.fullscreen {
-                    self.bar_layout.as_ref().and_then(|l| overlay::hit_test_menubar(l, sx, sy))
+                // Hit-test the menubar (window-space) for hover highlight.
+                self.bar_hovered = if self.bar_visible && !self.fullscreen {
+                    self.bar_layout.as_ref().and_then(|l|
+                        overlay::hit_test_menubar(l, position.x, position.y))
                 } else {
                     None
                 };
 
-                // Don't forward pointer motion when the cursor is over the menubar
-                // or while the dropdown menu is up.
-                let over_bar = !self.fullscreen && sy < MENUBAR_HEIGHT as f64;
-                if !self.menu.visible && !over_bar {
+                // Don't forward pointer motion while the cursor is over the
+                // visible menubar strip.
+                let over_bar = self.bar_visible && !self.fullscreen
+                    && position.y < MENUBAR_HEIGHT as f64;
+                if !over_bar {
+                    // Scale window coords to compositor (frame) coords for the server.
+                    let (sx, sy) = if let Some(win) = &self.window {
+                        let ws = win.inner_size();
+                        if ws.width > 0 && ws.height > 0 && self.frame_width > 0 {
+                            (position.x * self.frame_width as f64 / ws.width as f64,
+                             position.y * self.frame_height as f64 / ws.height as f64)
+                        } else { (position.x, position.y) }
+                    } else { (position.x, position.y) };
                     self.send_cmd(ClientCommand::MouseMove(input::MouseMove {
                         x: sx, y: sy, absolute: true,
                     }));
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if self.menu.visible {
-                    return; // swallow clicks while dropdown is open
-                }
-
                 // Check if the click is on a menubar item first.
-                let on_bar = !self.fullscreen && self.cursor_y < MENUBAR_HEIGHT as f64;
+                let on_bar = self.bar_visible && !self.fullscreen
+                    && self.cursor_win_y < MENUBAR_HEIGHT as f64;
                 if on_bar {
                     if state == ElementState::Pressed && button == WinitMouseButton::Left {
                         if let Some(item) = self.bar_layout.as_ref().and_then(|l|
-                            overlay::hit_test_menubar(l, self.cursor_x, self.cursor_y))
+                            overlay::hit_test_menubar(l, self.cursor_win_x, self.cursor_win_y))
                         {
                             self.activate_bar_item(item, event_loop);
                         }
@@ -590,7 +595,10 @@ impl ApplicationHandler for App {
                 }));
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.menu.visible { return; }
+                // Don't scroll the remote when the cursor is over the menubar.
+                let over_bar = self.bar_visible && !self.fullscreen
+                    && self.cursor_win_y < MENUBAR_HEIGHT as f64;
+                if over_bar { return; }
                 let (dx, dy) = match delta {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => (x as f64 * 15.0, y as f64 * 15.0),
                     winit::event::MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
