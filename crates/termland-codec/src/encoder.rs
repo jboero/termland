@@ -164,9 +164,11 @@ impl FfmpegAv1Encoder {
                 let crf = config.crf.map(|c| c.to_string()).unwrap_or_else(|| "35".to_string());
                 opts.set("crf", &crf);
 
-                // svtav1-params: mandatory low-delay params + any user extras.
-                // Mandatory: pred-struct=1 (low delay), lad=0 (no lookahead)
-                let mut svt_params = String::from("pred-struct=1:lad=0");
+                // svtav1-params: mandatory low-delay setting + any user extras.
+                // `pred-struct=1` selects the low-delay B prediction structure,
+                // which implies no lookahead. SVT-AV1 v3+ removed the `lad`
+                // alias, so we rely on pred-struct alone for low-latency.
+                let mut svt_params = String::from("pred-struct=1");
                 if let Some(extra) = &config.extra_svt_params {
                     if !extra.is_empty() {
                         svt_params.push(':');

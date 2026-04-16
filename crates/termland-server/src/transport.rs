@@ -445,6 +445,14 @@ fn capture_thread(
                 if (w, h) != encoder_dims {
                     tracing::info!("Capture dims changed {}x{} → {w}x{h}, reinitializing encoder",
                         encoder_dims.0, encoder_dims.1);
+                    // Flush the old encoder before dropping it. This sends
+                    // EOS to libsvtav1 so SVT doesn't complain with
+                    // "deinit called without sending EOS!" in its log.
+                    // We discard the flushed packets because they belong
+                    // to the old dimensions and would confuse the client.
+                    if let Some(old) = av1_encoder.as_mut() {
+                        let _ = old.flush();
+                    }
                     av1_encoder = init_encoder(&tuning, w, h);
                     encoder_dims = (w, h);
                 }
