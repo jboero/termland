@@ -4,7 +4,7 @@
 
 Termland streams full interactive desktop and application sessions over the network using AV1 video, Opus audio, and modern transport security. It exists because Wayland broke remote desktop workflows and nobody fixed them.
 
-[Screencast_20260416_125911.webm](***REMOVED***)
+[Screencast_20260416_143042.webm](https://github.com/user-attachments/assets/a47450a8-c8ec-4422-8ead-6d65bad59c72)
 
 
 ## Why This Exists
