@@ -4,6 +4,9 @@
 
 Termland streams full interactive desktop and application sessions over the network using AV1 video, Opus audio, and modern transport security. It exists because Wayland broke remote desktop workflows and nobody fixed them.
 
+[Screencast_20260416_125911.webm](***REMOVED***)
+
+
 ## Why This Exists
 
 For over two decades, X11 gave Linux a simple, reliable remote desktop story. X forwarding, NX/X2Go, and FreeNX let you run graphical sessions on remote servers as easily as SSH. Entire organizations built terminal server infrastructure on this — thin clients, shared workstations, remote development environments.
