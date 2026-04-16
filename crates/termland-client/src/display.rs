@@ -151,6 +151,12 @@ struct App {
     bar_hovered: Option<BarItem>,
     /// Is the window currently fullscreen? (hides the menubar)
     fullscreen: bool,
+    /// Pending window-size change that hasn't been sent to the server yet.
+    /// We debounce resize events so we don't reconfigure the remote
+    /// compositor + encoder on every drag pixel.
+    pending_resize: Option<(u32, u32, std::time::Instant)>,
+    /// Last size we actually sent to the server.
+    last_sent_size: Option<(u32, u32)>,
 }
 
 impl App {
@@ -168,6 +174,8 @@ impl App {
             bar_layout: None,
             bar_hovered: None,
             fullscreen: false,
+            pending_resize: None,
+            last_sent_size: None,
         }
     }
 
@@ -250,6 +258,21 @@ impl App {
                     tracing::info!("Session ended");
                     self.should_exit = true;
                 }
+            }
+        }
+    }
+
+    /// Send a `Resize` command to the server if the user has stopped dragging
+    /// for long enough that the size is stable. Prevents flooding the server
+    /// with mid-drag sizes.
+    fn flush_pending_resize(&mut self) {
+        const QUIESCE: std::time::Duration = std::time::Duration::from_millis(150);
+        if let Some((w, h, set_at)) = self.pending_resize {
+            if set_at.elapsed() >= QUIESCE && self.last_sent_size != Some((w, h)) {
+                self.send_cmd(ClientCommand::Resize(w, h));
+                self.last_sent_size = Some((w, h));
+                self.pending_resize = None;
+                tracing::info!("Requested remote resize to {w}x{h}");
             }
         }
     }
@@ -400,11 +423,17 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                self.send_cmd(ClientCommand::Resize(size.width, size.height));
+                // Don't send a Resize command on every pixel while the user is
+                // dragging the edge — we just remember the latest target and flush
+                // it once the resize quiesces (see flush_pending_resize()).
+                if size.width > 0 && size.height > 0 {
+                    self.pending_resize = Some((size.width, size.height, std::time::Instant::now()));
+                }
             }
             WindowEvent::RedrawRequested => {
                 self.process_events();
                 if self.should_exit { event_loop.exit(); return; }
+                self.flush_pending_resize();
                 self.update_title();
                 self.render();
                 if let Some(w) = &self.window { w.request_redraw(); }

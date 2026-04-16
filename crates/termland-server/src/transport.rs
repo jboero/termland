@@ -138,6 +138,8 @@ where
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(2);
     let (display_tx, display_rx) = tokio::sync::oneshot::channel::<String>();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    // Resize requests from the session loop → capture thread.
+    let (resize_tx, resize_rx) = std::sync::mpsc::channel::<(u32, u32)>();
 
     // Shared cursor-mode flag. Client defaults to server-side cursor rendering
     // (overlay_cursor=true). Can be toggled at runtime via CursorMode message.
@@ -147,7 +149,7 @@ where
     let capture_handle = std::thread::spawn(move || {
         capture_thread(width, height, quality, mode, desktop_shell,
                        encoder_preset, encoder_crf, encoder_extra_params,
-                       overlay_cursor_capture, frame_tx, display_tx, stop_rx);
+                       overlay_cursor_capture, resize_rx, frame_tx, display_tx, stop_rx);
     });
 
     // Wait for the compositor to report its Wayland display name
@@ -256,7 +258,12 @@ where
                                     timestamp_us: p.timestamp_us,
                                 })).await;
                             }
-                            Message::SessionResize(_sr) => {}
+                            Message::SessionResize(sr) => {
+                                let w = sr.width.clamp(320, 7680);
+                                let h = sr.height.clamp(240, 4320);
+                                tracing::info!("Client requested resize to {w}x{h}");
+                                let _ = resize_tx.send((w, h));
+                            }
                             Message::KeyEvent(ke) => {
                                 let pressed = ke.state == termland_protocol::input::KeyState::Pressed;
                                 tracing::debug!("Key received: scancode={} pressed={pressed}", ke.scancode);
@@ -316,6 +323,47 @@ where
     Ok(())
 }
 
+/// Encoder tuning collected once per session from the client.
+struct EncoderTuning {
+    bitrate_kbps: u32,
+    preset: Option<String>,
+    crf: Option<u8>,
+    extra_svt_params: Option<String>,
+}
+
+impl EncoderTuning {
+    fn build_config(&self, width: u32, height: u32) -> termland_codec::EncoderConfig {
+        termland_codec::EncoderConfig {
+            width,
+            height,
+            fps: 30,
+            bitrate_kbps: self.bitrate_kbps,
+            keyframe_interval: 30,
+            preset: self.preset.clone(),
+            crf: self.crf,
+            extra_svt_params: self.extra_svt_params.clone(),
+        }
+    }
+}
+
+/// Build a fresh AV1 encoder for the given dimensions + tuning.
+/// Returns None if no encoder is available (we fall back to raw RGBA).
+fn init_encoder(tuning: &EncoderTuning, width: u32, height: u32)
+    -> Option<Box<dyn termland_codec::Av1Encoder>>
+{
+    let config = tuning.build_config(width, height);
+    match termland_codec::probe_best_encoder(&config) {
+        Ok(enc) => {
+            tracing::info!("AV1 encoder ready for {width}x{height}: {}", enc.backend());
+            Some(enc)
+        }
+        Err(e) => {
+            tracing::warn!("No AV1 encoder available ({e}), using raw RGBA");
+            None
+        }
+    }
+}
+
 /// Capture thread: creates compositor, captures frames, sends display name back.
 #[allow(clippy::too_many_arguments)]
 fn capture_thread(
@@ -328,6 +376,7 @@ fn capture_thread(
     encoder_crf: Option<u8>,
     encoder_extra_params: Option<String>,
     overlay_cursor: Arc<AtomicBool>,
+    resize_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     frame_tx: tokio::sync::mpsc::Sender<CapturedFrame>,
     display_tx: tokio::sync::oneshot::Sender<String>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
@@ -345,34 +394,19 @@ fn capture_thread(
     // Send the Wayland display name back so input thread can connect
     let _ = display_tx.send(compositor.wayland_display().to_string());
 
-    // Map quality 1-100 to bitrate and CRF.
-    // quality 100 = 15000 kbps, quality 75 = 8000 kbps, quality 50 = 4000, quality 25 = 1500, quality 1 = 500
+    // Map quality 1-100 to bitrate. quality 100 → 15 Mbps, 50 → 7.5 Mbps, 1 → 500 kbps
     let bitrate_kbps = (quality as u32 * 150).max(500);
-    let crf = 51 - (quality as u32 * 40 / 100); // quality 100 → CRF 11, quality 50 → CRF 31, quality 1 → CRF 51
-    tracing::info!("Video quality={quality} → bitrate={bitrate_kbps}kbps crf={crf}");
+    tracing::info!("Video quality={quality} → bitrate={bitrate_kbps}kbps");
 
-    let encoder_config = termland_codec::EncoderConfig {
-        width,
-        height,
-        fps: 30,
+    let tuning = EncoderTuning {
         bitrate_kbps,
-        keyframe_interval: 30,
         preset: encoder_preset,
         crf: encoder_crf,
         extra_svt_params: encoder_extra_params,
     };
 
-    let mut av1_encoder: Option<Box<dyn termland_codec::Av1Encoder>> =
-        match termland_codec::probe_best_encoder(&encoder_config) {
-            Ok(enc) => {
-                tracing::info!("AV1 encoder ready: {}", enc.backend());
-                Some(enc)
-            }
-            Err(e) => {
-                tracing::warn!("No AV1 encoder available ({e}), using raw RGBA");
-                None
-            }
-        };
+    let mut av1_encoder = init_encoder(&tuning, width, height);
+    let mut encoder_dims = (width, height);
 
     let mut compositor = compositor;
     let frame_duration = std::time::Duration::from_millis(33);
@@ -388,10 +422,33 @@ fn capture_thread(
             break;
         }
 
+        // Drain pending resize requests - only act on the most recent one.
+        let mut latest_resize: Option<(u32, u32)> = None;
+        while let Ok(sz) = resize_rx.try_recv() {
+            latest_resize = Some(sz);
+        }
+        if let Some((rw, rh)) = latest_resize {
+            if (rw, rh) != encoder_dims {
+                match compositor.resize(rw, rh) {
+                    Ok(()) => tracing::info!("Compositor output resized to {rw}x{rh}"),
+                    Err(e) => tracing::warn!("Compositor resize failed: {e}"),
+                }
+                // Encoder reinit happens lazily when we detect new frame dims below.
+            }
+        }
+
         let start = std::time::Instant::now();
 
         match compositor.capture_frame(overlay_cursor.load(Ordering::Relaxed)) {
             Ok((w, h, rgba)) => {
+                // Rebuild the encoder if the captured frame size changed.
+                if (w, h) != encoder_dims {
+                    tracing::info!("Capture dims changed {}x{} → {w}x{h}, reinitializing encoder",
+                        encoder_dims.0, encoder_dims.1);
+                    av1_encoder = init_encoder(&tuning, w, h);
+                    encoder_dims = (w, h);
+                }
+
                 let timestamp_us = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()

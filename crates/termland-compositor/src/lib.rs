@@ -3,6 +3,7 @@
 //! via wlr-screencopy protocol.
 
 mod backend;
+mod output_resize;
 mod screencopy;
 mod session;
 pub mod input;

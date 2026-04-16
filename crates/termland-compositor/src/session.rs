@@ -2,6 +2,7 @@ use std::process::Child;
 use thiserror::Error;
 
 use crate::backend::{self, detect_desktop_shell};
+use crate::output_resize::OutputResizer;
 use crate::screencopy::ScreenCapturer;
 
 #[derive(Debug, Error)]
@@ -51,6 +52,10 @@ pub struct Compositor {
     process: Child,
     wayland_display: String,
     capturer: Option<ScreenCapturer>,
+    /// Separate Wayland client that drives zwlr_output_manager_v1 so we can
+    /// change the headless output's size at runtime. Optional because older
+    /// compositors may not advertise the protocol.
+    resizer: Option<OutputResizer>,
     /// Name of the compositor backend for logging.
     backend_name: &'static str,
     /// Kept alive so the compositor's stderr pipe stays drained for the
@@ -80,11 +85,23 @@ impl Compositor {
 
         tracing::info!("Screen capturer connected to {backend_name}");
 
+        // Optional: connect a second Wayland client for output management.
+        // If the protocol isn't available (older compositors), sessions still
+        // work - they just can't be resized after startup.
+        let resizer = match OutputResizer::connect(&launched.wayland_display) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!("OutputResizer unavailable ({e}) - remote resize disabled");
+                None
+            }
+        };
+
         Ok(Self {
             config,
             process: launched.process,
             wayland_display: launched.wayland_display,
             capturer: Some(capturer),
+            resizer,
             backend_name,
             _stderr_drain: launched._stderr_drain,
         })
@@ -124,14 +141,17 @@ impl Compositor {
         self.backend_name
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) {
+    /// Resize the headless output to (width, height). Requires that the
+    /// compositor exposed zwlr_output_manager_v1 at startup.
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), CompositorError> {
+        let resizer = self.resizer.as_mut().ok_or_else(|| {
+            CompositorError::WaylandError("output manager not available".into())
+        })?;
+        resizer.resize(width, height)
+            .map_err(|e| CompositorError::WaylandError(format!("resize: {e}")))?;
         self.config.width = width;
         self.config.height = height;
-        tracing::info!(
-            "Resize requested to {}x{} (not yet implemented)",
-            width,
-            height
-        );
+        Ok(())
     }
 }
 
