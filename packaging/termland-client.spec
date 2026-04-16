@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.3.0
+%global version 0.3.1
 
 Name:           termland-client
 Version:        %{version}
