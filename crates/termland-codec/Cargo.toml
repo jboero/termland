@@ -9,7 +9,7 @@ rust-version.workspace = true
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-ffmpeg-next = "7"
+ffmpeg-next = { version = "7", default-features = false, features = ["codec", "format", "software-scaling"] }
 libc = "0.2"
 opus = { workspace = true }
 
