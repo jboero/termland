@@ -409,7 +409,7 @@ fn create_memfd(size: usize) -> Result<OwnedFd, CaptureError> {
     )
     .map_err(|e| CaptureError::ShmError(format!("memfd_create: {e}")))?;
 
-    unistd::ftruncate(&fd, size as i64)
+    unistd::ftruncate(&fd, size as nix::libc::off_t)
         .map_err(|e| CaptureError::ShmError(format!("ftruncate: {e}")))?;
 
     Ok(fd)
