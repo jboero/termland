@@ -25,9 +25,8 @@ BuildRequires:  rust >= 1.85
 BuildRequires:  cargo >= 1.85
 
 # FFmpeg (AV1 decoding via dav1d/QSV/CUVID through libavcodec).
-# Prefers ffmpeg-devel (RPM Fusion) for hardware decoder support (QSV, CUVID).
-# Falls back to ffmpeg-free-devel (Fedora) for software-only (dav1d).
-BuildRequires:  (ffmpeg-devel or ffmpeg-free-devel)
+# ffmpeg-free-devel is in base Fedora; ffmpeg-devel (RPM Fusion) adds HW decoders.
+BuildRequires:  (ffmpeg-free-devel or ffmpeg-devel)
 
 # Opus audio codec (decoding)
 BuildRequires:  opus-devel

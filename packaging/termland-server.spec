@@ -25,9 +25,8 @@ BuildRequires:  rust >= 1.85
 BuildRequires:  cargo >= 1.85
 
 # FFmpeg development libraries (AV1 encoding via libavcodec/libavformat).
-# Prefers ffmpeg-devel (RPM Fusion) for hardware encoder support (QSV, NVENC, AMF).
-# Falls back to ffmpeg-free-devel (Fedora) for software-only (SVT-AV1).
-BuildRequires:  (ffmpeg-devel or ffmpeg-free-devel)
+# ffmpeg-free-devel is in base Fedora; ffmpeg-devel (RPM Fusion) adds HW encoders.
+BuildRequires:  (ffmpeg-free-devel or ffmpeg-devel)
 
 # Opus audio codec
 BuildRequires:  opus-devel
