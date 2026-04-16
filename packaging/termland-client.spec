@@ -15,9 +15,9 @@ Version:        %{version}
 Release:        1%{?dist}
 Summary:        Termland remote desktop client — view and interact with remote Wayland sessions
 
-License:        MIT OR Apache-2.0
+License:        LGPL-3.0-or-later
 URL:            https://github.com/jboero/termland
-Source0:        %{crate_name}-%{version}.tar.gz
+Source0:        https://github.com/jboero/termland/archive/v%{version}/%{crate_name}-%{version}.tar.gz
 
 # ─── Build dependencies ──────────────────────────────────────────────────────
 # Rust toolchain
@@ -110,7 +110,7 @@ install -Dm644 _termland-client     %{buildroot}%{_datadir}/zsh/site-functions/_
 install -Dm644 termland-client.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %files
-%license LICENSE-MIT LICENSE-APACHE
+%license LICENSE
 %doc README.md
 %{_bindir}/termland-client
 %{_datadir}/bash-completion/completions/termland-client

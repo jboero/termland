@@ -15,9 +15,9 @@ Version:        %{version}
 Release:        1%{?dist}
 Summary:        Termland remote desktop server — stream Wayland sessions via AV1/Opus
 
-License:        MIT OR Apache-2.0
+License:        LGPL-3.0-or-later
 URL:            https://github.com/jboero/termland
-Source0:        %{crate_name}-%{version}.tar.gz
+Source0:        https://github.com/jboero/termland/archive/v%{version}/%{crate_name}-%{version}.tar.gz
 
 # ─── Build dependencies ──────────────────────────────────────────────────────
 # Rust toolchain (cargo, rustc)
@@ -145,7 +145,7 @@ echo ""
 %systemd_postun_with_restart termland-server.service
 
 %files
-%license LICENSE-MIT LICENSE-APACHE
+%license LICENSE
 %doc README.md ROADMAP.md
 %{_bindir}/termland-server
 %{_unitdir}/termland-server.service

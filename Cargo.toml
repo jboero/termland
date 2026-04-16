@@ -11,7 +11,7 @@ resolver = "2"
 [workspace.package]
 version = "0.3.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "LGPL-3.0-or-later"
 rust-version = "1.85"
 
 [workspace.dependencies]
