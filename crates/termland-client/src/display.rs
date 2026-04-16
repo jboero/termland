@@ -219,10 +219,35 @@ impl App {
     fn start_connection(&mut self) {
         let server = self.args.server.clone();
         let ssh = self.args.ssh;
+
+        // Use the window's actual physical inner_size for the initial session.
+        // On a HiDPI display, `LogicalSize::new(1280, 720)` becomes a physical
+        // 1600x900 window (1.25x) or 2560x1440 (2x), and we want the remote
+        // compositor to render at those physical pixels so the stream is crisp
+        // when blitted 1:1 into the window. If we used the logical args size
+        // we'd immediately churn: create compositor at 1280x720, then the first
+        // Resized event would arrive at physical size and we'd reinit the
+        // encoder. Doing it this way means the first frame is already right.
+        let (phys_w, phys_h) = if let Some(win) = &self.window {
+            let sz = win.inner_size();
+            // Menubar covers the top MENUBAR_HEIGHT rows of the framebuffer,
+            // but the remote output doesn't know about it. We currently render
+            // the full remote frame and overlay the menubar on top. Keep the
+            // remote size matching the window size for 1:1 pixel mapping.
+            let w = sz.width.max(320);
+            let h = sz.height.max(240);
+            self.last_sent_size = Some((w, h));
+            (w, h)
+        } else {
+            (self.args.width, self.args.height)
+        };
+
+        tracing::info!("Initial remote size: {phys_w}x{phys_h} (physical pixels)");
+
         let params = ConnectParams {
             mode: self.args.session_mode(),
-            width: self.args.width,
-            height: self.args.height,
+            width: phys_w,
+            height: phys_h,
             quality: self.args.quality,
             desktop_shell: self.args.desktop_shell.clone(),
             encoder_preset: self.args.preset.clone(),

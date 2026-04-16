@@ -88,13 +88,30 @@ impl Compositor {
         // Optional: connect a second Wayland client for output management.
         // If the protocol isn't available (older compositors), sessions still
         // work - they just can't be resized after startup.
-        let resizer = match OutputResizer::connect(&launched.wayland_display) {
+        let mut resizer = match OutputResizer::connect(&launched.wayland_display) {
             Ok(r) => Some(r),
             Err(e) => {
                 tracing::warn!("OutputResizer unavailable ({e}) - remote resize disabled");
                 None
             }
         };
+
+        // Force the output to the requested dimensions immediately after
+        // startup. labwc's rc.xml `<output name="HEADLESS-1">` matching is
+        // unreliable in practice — the real output name isn't guaranteed
+        // to be "HEADLESS-1", so the config mode often silently falls back
+        // to a wlroots default (1280x720). WLR_HEADLESS_OUTPUT_MODE is
+        // similarly inconsistent across versions. Driving it via
+        // zwlr_output_manager_v1 is the only reliable path.
+        if let Some(r) = resizer.as_mut() {
+            if let Err(e) = r.resize(config.width, config.height) {
+                tracing::warn!(
+                    "Initial resize to {}x{} failed ({e}); session will use \
+                     the compositor default",
+                    config.width, config.height
+                );
+            }
+        }
 
         Ok(Self {
             config,
