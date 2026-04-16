@@ -32,62 +32,82 @@ happen before the project is suitable for outside use.
 - ✅ Multi-session server (many clients → many independent compositor
   instances in one `termland-server`)
 
-## v0.2 blockers
+## v0.2 — SHIPPED (v0.3.1)
 
-These need to land before I'd tag a 0.2 or invite outside users.
+All v0.2 blockers have been resolved:
 
-### Audio (Opus over PipeWire)
+- ✅ **Audio**: Opus 48kHz stereo via per-session PulseAudio null sink,
+  silence detection + DTX, cpal playback on client (`--audio`)
+- ✅ **TLS**: rustls with auto-generated self-signed certs (`--tls`),
+  custom cert/key paths, client `--accept-invalid-certs`
+- ✅ **PAM auth**: manual FFI bindings (no bindgen dep), falls back to
+  "login" service, 3s delay on failure (`--auth`)
+- ✅ **SSH subsystem**: zero-config via sshd drop-in config, client
+  `--ssh` with `--ssh-opt` for custom SSH args
+- ✅ **Security hardening**: command injection prevention (shell
+  metacharacter validation), password zeroing, max 32 concurrent
+  sessions, plaintext auth warnings
+- ✅ **RPM packaging**: server + client specs for COPR, systemd unit,
+  env config, PAM service, shell completions (bash/zsh/fish)
 
-Capture the compositor's per-session PulseAudio/PipeWire output,
-encode with `libopus`, stream as a new `AudioChunk` message. Client
-decodes and plays via `cpal`.
+### Remaining v0.2 items (deferred)
 
-Open questions: per-session PipeWire namespace so multi-session audio
-doesn't cross-contaminate; handshake for sample rate/channels; sync
-with video timestamps.
+- Session isolation: `setuid` into authenticated user after PAM auth
+  (currently sessions run as server user)
+- GUI client rewrite: Qt6 native menubar, session manager with saved
+  profiles, connection dialog (see v0.3 stretch goals)
 
-### Security: auth + TLS
+## v0.4 / GPU rendering + zero-copy capture
 
-Currently *any* TCP client on the LAN can start a session. Before this
-leaves the dev LAN we need:
+### GPU-accelerated rendering inside sessions
 
-- PAM-based username/password auth (`pam::Authenticator`) during the
-  Hello handshake
-- `rustls`-wrapped TLS transport for direct TCP mode, with a simple
-  self-signed-cert path for LAN use and pinned-cert verification on
-  the client
-- Session isolation: on successful auth, `setuid` into the target
-  user's account so compositor + apps run as them, not as the server
-  user
-- Connection rate-limiting + fail2ban-style lockout
+Currently sessions render via `llvmpipe` (CPU software rasterizer) because
+the headless wlroots backend has no GPU context. This means OpenGL/Vulkan
+apps run but are slow — fine for desktops and terminals, inadequate for
+3D apps, CAD, Blender, Shadertoy, or games.
 
-SSH subsystem mode will remain the zero-config secure option for
-power users.
+The goal: **full GPU rendering inside the session, with zero-copy handoff
+to the hardware AV1 encoder**. This would make Termland competitive with
+cloud gaming solutions (Sunshine/Moonlight, Parsec) — something no
+traditional remote desktop protocol (RDP, NX, X2Go, VNC) has achieved.
 
-### GUI client rewrite (GTK4 / Qt6 / tao+muda)
+Pipeline today (CPU render, CPU readback, HW encode):
+```
+App → llvmpipe (CPU) → wlr-screencopy → memcpy → AV1 HW encode → wire
+```
 
-The current client is `winit + softbuffer` with a hand-drawn bitmap-
-font menubar. Functional but "retro". Before a public release the
-client should have a **real native menubar** and proper toolkit
-integration, via one of:
+Target pipeline (GPU render, zero-copy, HW encode):
+```
+App → GPU EGL/Vulkan → DMA-BUF → VA-API/NVENC AV1 encode → wire
+```
 
-- **GTK4-rs** — most native-feeling on Linux, `GtkDrawingArea` or
-  `GLArea` for the video surface, `GtkPopoverMenuBar` for menus
-- **Qt6 + `cxx-qt`** — more polish, heavier, slightly awkward from
-  Rust
-- **`tao + muda`** — stays close to winit, gets native menus, but
-  muda on Wayland is still rough
+Implementation path:
+1. **DRM render node allocation** — expose a GPU render node to the
+   headless compositor via `WLR_RENDERER=vulkan` or `WLR_RENDERER=gles2`
+   with a real DRM device (not the headless shim)
+2. **DMA-BUF screencopy** — use `zwlr_screencopy_manager_v1` with
+   `wl_buffer` backed by DMA-BUF instead of SHM, so the captured frame
+   stays in GPU memory
+3. **Zero-copy encode** — feed the DMA-BUF directly to VA-API / NVENC
+   AV1 encoder without CPU readback. FFmpeg supports DMA-BUF input via
+   `hwframe` contexts
+4. **DRM lease for multi-GPU** — on systems with multiple GPUs (e.g.
+   iGPU + dGPU), lease a render node from the discrete GPU for the
+   session while the iGPU drives local display
 
-Whichever toolkit we pick we need to preserve:
+Benefits:
+- 3D/Vulkan apps run at native GPU speed inside remote sessions
+- No CPU copies in the capture→encode path (currently the bottleneck)
+- Enables 4K 60fps streaming for GPU-intensive workloads
+- Feature parity with cloud gaming, exceeding what RDP/NX/X2Go ever offered
 
-- `zwp_keyboard_shortcuts_inhibit` so modifier keys still reach the
-  remote session (toolkit must give us a raw `wl_surface`)
-- Cursor overlay + local cursor rendering
-- The menubar items we already have (data rate, client cursor toggle,
-  fullscreen, quit)
-- Transparent resize integration with our `SessionResize` protocol
+### QUIC / WebTransport
 
-Rough estimate: 1–2 days of focused work, plus testing.
+Replace TCP with QUIC for the video/audio data stream. Benefits:
+- UDP-based: no head-of-line blocking from lost packets
+- 0-RTT reconnection for session resume
+- Independent streams for video, audio, and control (no priority inversion)
+- WebTransport variant enables a future browser-based client
 
 ## v0.3 / stretch
 
