@@ -1,0 +1,26 @@
+# /etc/pam.d/termland
+# PAM configuration for Termland remote desktop server.
+#
+# This service is used when termland-server is started with --auth.
+# If this file doesn't exist, termland falls back to the "login" service.
+#
+# Customize this to match your site's auth policy. Common scenarios:
+#
+# LDAP/SSSD: no changes needed if pam_sss.so is in system-auth
+# 2FA/TOTP:  add pam_google_authenticator.so or pam_u2f.so to auth stack
+# Restrict:  add pam_listfile.so to limit which users can connect
+#
+# Example: only allow users in the "termland" group:
+#   auth required pam_succeed_if.so user ingroup termland
+
+# Standard system authentication (passwords, LDAP, Kerberos, SSSD, etc.)
+auth       required     pam_env.so
+auth       substack     system-auth
+auth       include      postlogin
+
+account    required     pam_nologin.so
+account    include      system-auth
+
+session    optional     pam_keyinit.so force revoke
+session    include      system-auth
+session    include      postlogin

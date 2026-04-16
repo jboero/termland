@@ -170,6 +170,8 @@ pub struct HelloAck {
     pub protocol_version: u32,
     pub server_name: String,
     pub session_id: String,
+    #[serde(default)]
+    pub auth_required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

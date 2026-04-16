@@ -3,19 +3,26 @@ mod display;
 mod overlay;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::Shell;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "termland-client", about = "Termland remote desktop client")]
+#[command(name = "termland-client", about = "Termland remote desktop client", version)]
 pub struct Args {
     /// Server address (host:port for TCP, user@host for SSH)
-    #[arg()]
-    pub server: String,
+    #[arg(required_unless_present = "completions")]
+    pub server: Option<String>,
 
-    /// Use SSH subsystem instead of direct TCP
+    /// Use SSH subsystem instead of direct TCP.
+    /// Runs: ssh -s <server> termland
     #[arg(long)]
     pub ssh: bool,
+
+    /// Extra options to pass to the ssh command (repeatable).
+    /// Example: --ssh-opt="-oPort=9022" --ssh-opt="-oCompression=yes"
+    #[arg(long)]
+    pub ssh_opt: Vec<String>,
 
     /// Requested width
     #[arg(long, default_value = "1280")]
@@ -25,7 +32,8 @@ pub struct Args {
     #[arg(long, default_value = "720")]
     pub height: u32,
 
-    /// Session mode: "desktop" or "app:command"
+    /// Session mode: "desktop" or "app:<command>"
+    /// Examples: --mode desktop, --mode app:firefox, --mode "app:konsole --profile Dark"
     #[arg(long, default_value = "desktop")]
     pub mode: String,
 
@@ -54,6 +62,31 @@ pub struct Args {
     /// Format: "key=value:key=value". Example: "fast-decode=1:tile-columns=2:scm=2"
     #[arg(long)]
     pub svt_params: Option<String>,
+
+    /// Enable audio forwarding (Opus over PulseAudio).
+    #[arg(long)]
+    pub audio: bool,
+
+    /// Connect with TLS encryption.
+    #[arg(long)]
+    pub tls: bool,
+
+    /// Accept self-signed or invalid TLS certificates (use with --tls).
+    #[arg(long)]
+    pub accept_invalid_certs: bool,
+
+    /// Username for authentication (defaults to current user).
+    #[arg(short, long)]
+    pub user: Option<String>,
+
+    /// Password for authentication.
+    #[arg(long)]
+    pub password: Option<String>,
+
+    /// Generate shell completion script and exit.
+    /// Usage: termland-client --completions fish > ~/.config/fish/completions/termland-client.fish
+    #[arg(long, value_name = "SHELL")]
+    pub completions: Option<Shell>,
 }
 
 impl Args {
@@ -73,12 +106,23 @@ impl Args {
 }
 
 fn main() -> Result<()> {
+    let args = Args::parse();
+
+    if let Some(shell) = args.completions {
+        clap_complete::generate(
+            shell,
+            &mut Args::command(),
+            "termland-client",
+            &mut std::io::stdout(),
+        );
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    let args = Args::parse();
     display::run(args)
 }

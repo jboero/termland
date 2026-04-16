@@ -135,7 +135,7 @@ impl Av1Decoder {
             if !self.confirmed_working {
                 return self.fallback_and_retry(data, format!("send packet: {e}"));
             }
-            return Err(DecoderError::DecodeFailed(format!("send packet: {e}")));
+            return self.reinit_and_retry(data, format!("send packet: {e}"));
         }
 
         let mut frame = ffmpeg_next::frame::Video::empty();
@@ -148,7 +148,7 @@ impl Av1Decoder {
                 if !self.confirmed_working {
                     return self.fallback_and_retry(data, format!("receive frame: {e}"));
                 }
-                return Err(DecoderError::DecodeFailed(format!("receive frame: {e}")));
+                return self.reinit_and_retry(data, format!("receive frame: {e}"));
             }
         }
 
@@ -195,6 +195,73 @@ impl Av1Decoder {
             }
         }
 
+        Ok((w, h, pixels))
+    }
+
+    /// Reinitialize the current backend (same codec) and retry. Used when a
+    /// confirmed-working decoder chokes — typically because a keyframe arrived
+    /// with new dimensions and the internal parser is still bound to the old
+    /// SPS. CUVID in particular throws CUDA_ERROR_UNKNOWN from
+    /// cuvidParseVideoData in this case. A fresh codec context re-parses the
+    /// incoming keyframe cleanly.
+    fn reinit_and_retry(&mut self, data: &[u8], reason: String) -> Result<(u32, u32, Vec<u32>), DecoderError> {
+        tracing::warn!("Decoder {} hiccup ({reason}), reinitializing same backend", self.backend);
+        let new_decoder = Self::open_codec(self.backend)
+            .map_err(|e| DecoderError::DecodeFailed(format!("reinit {}: {e}", self.backend)))?;
+        self.decoder = new_decoder;
+        self.scaler = None;
+        self.width = 0;
+        self.height = 0;
+        // Keep confirmed_working=true: we know this backend is fine in general.
+        // The packet we're about to feed must be a keyframe for this to succeed;
+        // if it's not, the decoder will EAGAIN and the next keyframe will work.
+        let packet = ffmpeg_next::Packet::copy(data);
+        match self.decoder.send_packet(&packet) {
+            Ok(()) => {}
+            Err(ffmpeg_next::Error::Other { errno: libc::EAGAIN }) => {
+                return Err(DecoderError::NoFrame);
+            }
+            Err(e) => return Err(DecoderError::DecodeFailed(format!("reinit send: {e}"))),
+        }
+        let mut frame = ffmpeg_next::frame::Video::empty();
+        match self.decoder.receive_frame(&mut frame) {
+            Ok(()) => {}
+            Err(ffmpeg_next::Error::Other { errno: libc::EAGAIN }) => {
+                return Err(DecoderError::NoFrame);
+            }
+            Err(e) => return Err(DecoderError::DecodeFailed(format!("reinit recv: {e}"))),
+        }
+        let w = frame.width();
+        let h = frame.height();
+        let fmt = frame.format();
+        let scaler = ffmpeg_next::software::scaling::Context::get(
+            fmt, w, h,
+            ffmpeg_next::format::Pixel::RGBA, w, h,
+            ffmpeg_next::software::scaling::Flags::BILINEAR
+                | ffmpeg_next::software::scaling::Flags::ACCURATE_RND
+                | ffmpeg_next::software::scaling::Flags::FULL_CHR_H_INT,
+        ).map_err(|e| DecoderError::DecodeFailed(format!("create scaler: {e}")))?;
+        self.scaler = Some(SendScaler(scaler));
+        self.width = w;
+        self.height = h;
+        let mut rgba_frame = ffmpeg_next::frame::Video::new(
+            ffmpeg_next::format::Pixel::RGBA, w, h,
+        );
+        self.scaler.as_mut().unwrap().run(&frame, &mut rgba_frame)
+            .map_err(|e| DecoderError::DecodeFailed(format!("scale: {e}")))?;
+        let stride = rgba_frame.stride(0);
+        let src = rgba_frame.data(0);
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for row in 0..h as usize {
+            let row_start = row * stride;
+            for col in 0..w as usize {
+                let i = row_start + col * 4;
+                let r = src[i] as u32;
+                let g = src[i + 1] as u32;
+                let b = src[i + 2] as u32;
+                pixels.push((r << 16) | (g << 8) | b);
+            }
+        }
         Ok((w, h, pixels))
     }
 

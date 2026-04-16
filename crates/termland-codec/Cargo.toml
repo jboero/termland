@@ -11,6 +11,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 ffmpeg-next = "7"
 libc = "0.2"
+opus = { workspace = true }
 
 [[bin]]
 name = "av1_test"

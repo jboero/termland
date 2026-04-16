@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
@@ -35,3 +35,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rcgen = "0.13"
+rustls-pemfile = "2"
+libc = "0.2"
+whoami = "1"
+rustls-native-certs = "0.8"
+opus = "0.3"
+cpal = "0.15"
+libpulse-binding = "2"
+libpulse-simple-binding = "2"

@@ -331,14 +331,38 @@ impl Av1Encoder for FfmpegAv1Encoder {
             EncoderError::EncodeFailed(format!("send eof: {e}"))
         })?;
 
+        // Drain until EOF. SVT-AV1 returns EAGAIN while it's still processing
+        // the EOS signal internally — a `while .is_ok()` loop breaks out early
+        // and triggers "deinit called without sending EOS!" on drop. Spin on
+        // EAGAIN with a short sleep and only terminate on EOF or real errors.
         let mut frames = Vec::new();
         let mut packet = ffmpeg_next::Packet::empty();
-        while self.encoder.receive_packet(&mut packet).is_ok() {
-            frames.push(EncodedFrame {
-                data: packet.data().unwrap_or(&[]).to_vec(),
-                keyframe: packet.is_key(),
-                timestamp_us: 0,
-            });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match self.encoder.receive_packet(&mut packet) {
+                Ok(()) => {
+                    let data = packet.data().unwrap_or(&[]).to_vec();
+                    if !data.is_empty() {
+                        frames.push(EncodedFrame {
+                            data,
+                            keyframe: packet.is_key(),
+                            timestamp_us: 0,
+                        });
+                    }
+                }
+                Err(ffmpeg_next::Error::Eof) => break,
+                Err(ffmpeg_next::Error::Other { errno: libc::EAGAIN }) => {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!("flush: EAGAIN deadline exceeded, giving up");
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(e) => {
+                    tracing::warn!("flush: receive_packet error: {e}");
+                    break;
+                }
+            }
         }
         Ok(frames)
     }

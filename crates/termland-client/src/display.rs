@@ -220,7 +220,7 @@ impl App {
     }
 
     fn start_connection(&mut self) {
-        let server = self.args.server.clone();
+        let server = self.args.server.clone().expect("server address required");
         let ssh = self.args.ssh;
 
         // Use the window's actual physical inner_size for the initial session.
@@ -252,13 +252,25 @@ impl App {
             width: phys_w,
             height: phys_h,
             quality: self.args.quality,
+            audio: self.args.audio,
+            ssh_opts: self.args.ssh_opt.clone(),
+            tls: self.args.tls || self.args.accept_invalid_certs,
+            accept_invalid_certs: self.args.accept_invalid_certs,
+            username: self.args.user.clone(),
+            password: self.args.password.clone(),
             desktop_shell: self.args.desktop_shell.clone(),
             encoder_preset: self.args.preset.clone(),
             encoder_crf: self.args.crf,
             encoder_extra_params: self.args.svt_params.clone(),
         };
         match self.runtime.block_on(connect(&server, ssh, params)) {
-            Ok((rx, tx)) => { self.server_rx = Some(rx); self.client_tx = Some(tx); }
+            Ok((rx, tx)) => {
+                self.server_rx = Some(rx);
+                self.client_tx = Some(tx);
+                // Sync initial cursor mode: client_cursor=true means server
+                // should NOT composite cursor (client renders it locally).
+                self.send_cmd(ClientCommand::SetCursorInFrame(!self.menu.client_cursor));
+            }
             Err(e) => tracing::error!("Connect failed: {e:#}"),
         }
     }

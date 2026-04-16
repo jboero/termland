@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::process::Command;
@@ -16,6 +17,11 @@ pub enum ServerEvent {
     #[allow(dead_code)]
     Pong(Pong),
     Disconnected,
+}
+
+/// Opus packet for the audio playback thread.
+struct AudioJob {
+    data: Vec<u8>,
 }
 
 #[allow(dead_code)]
@@ -45,6 +51,12 @@ pub struct ConnectParams {
     pub width: u32,
     pub height: u32,
     pub quality: u8,
+    pub audio: bool,
+    pub ssh_opts: Vec<String>,
+    pub tls: bool,
+    pub accept_invalid_certs: bool,
+    pub username: Option<String>,
+    pub password: Option<String>,
     pub desktop_shell: Option<String>,
     pub encoder_preset: Option<String>,
     pub encoder_crf: Option<u8>,
@@ -58,8 +70,10 @@ pub async fn connect(
     let (client_tx, client_rx) = mpsc::unbounded_channel();
 
     if ssh {
+        let mut ssh_args: Vec<String> = params.ssh_opts.clone();
+        ssh_args.extend(["-s".into(), server.to_string(), "termland".into()]);
         let child = Command::new("ssh")
-            .args(["-s", server, "termland"])
+            .args(&ssh_args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -67,6 +81,42 @@ pub async fn connect(
         let io = tokio::io::join(child.stdout.unwrap(), child.stdin.unwrap());
         tokio::spawn(async move {
             if let Err(e) = session_loop(io, params, server_tx, client_rx).await {
+                tracing::error!("Session error: {e}");
+            }
+        });
+    } else if params.tls {
+        let stream = TcpStream::connect(server).await
+            .context(format!("failed to connect to {server}"))?;
+        tracing::info!("Connected to {server} (TLS)");
+
+        let mut root_store = rustls::RootCertStore::empty();
+        // Add system roots
+        for cert in rustls_native_certs::load_native_certs().expect("load native certs") {
+            let _ = root_store.add(cert);
+        }
+
+        let config = if params.accept_invalid_certs {
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+                .with_no_client_auth()
+        } else {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let host = server.split(':').next().unwrap_or("localhost");
+        let domain = rustls::pki_types::ServerName::try_from(host.to_string())
+            .context("invalid server name for TLS")?;
+
+        let tls_stream = connector.connect(domain, stream).await
+            .context("TLS handshake failed")?;
+        tracing::info!("TLS handshake complete");
+
+        tokio::spawn(async move {
+            if let Err(e) = session_loop(tls_stream, params, server_tx, client_rx).await {
                 tracing::error!("Session error: {e}");
             }
         });
@@ -81,6 +131,35 @@ pub async fn connect(
         });
     }
     Ok((server_rx, client_tx))
+}
+
+/// Dummy certificate verifier for --accept-invalid-certs (self-signed servers).
+#[derive(Debug)]
+struct AcceptAnyCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms.supported_schemes()
+    }
 }
 
 /// AV1 packet for the decode thread.
@@ -103,11 +182,51 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
         other => anyhow::bail!("expected HelloAck, got {:?}", other.message_id()),
     }
 
+    // Handle auth if server requires it (indicated by auth_required in HelloAck)
+    let auth_required = match &msg {
+        Message::HelloAck(ha) => ha.auth_required,
+        _ => false,
+    };
+
+    if auth_required {
+        // Wait for AuthRequest
+        let msg = framed.next().await.context("closed")?.context("decode")?;
+        match msg {
+            Message::AuthRequest(ar) => {
+                tracing::info!("Server requires authentication (methods: {:?})", ar.methods);
+            }
+            other => anyhow::bail!("expected AuthRequest, got {:?}", other.message_id()),
+        }
+
+        let username = params.username.clone().unwrap_or_else(whoami::username);
+        let password = params.password.clone().unwrap_or_default();
+
+        if password.is_empty() {
+            tracing::warn!("Server requires auth but no --password provided");
+        }
+
+        framed.send(Message::AuthResponse(AuthResponse {
+            username: username.clone(),
+            credential: password,
+        })).await.context("send AuthResponse")?;
+
+        let result = framed.next().await.context("closed")?.context("decode")?;
+        match result {
+            Message::AuthResult(ar) if ar.success => {
+                tracing::info!("Authenticated as '{username}'");
+            }
+            Message::AuthResult(ar) => {
+                anyhow::bail!("Authentication failed: {}", ar.message);
+            }
+            other => anyhow::bail!("expected AuthResult, got {:?}", other.message_id()),
+        }
+    }
+
     framed.send(Message::SessionCreate(SessionCreate {
         mode: params.mode,
         width: params.width,
         height: params.height,
-        audio: false,
+        audio: params.audio,
         quality: params.quality,
         desktop_shell: params.desktop_shell,
         encoder_preset: params.encoder_preset,
@@ -129,6 +248,17 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
     let _decode_thread = std::thread::spawn(move || {
         decode_thread(decode_rx, display_tx);
     });
+
+    // Spawn audio playback thread if audio was requested
+    let audio_tx = if params.audio {
+        let (atx, arx) = std::sync::mpsc::channel::<AudioJob>();
+        std::thread::spawn(move || {
+            audio_playback_thread(arx);
+        });
+        Some(atx)
+    } else {
+        None
+    };
 
     // Data rate tracking: byte counter + last-reported instant.
     let mut bytes_since_report: u64 = 0;
@@ -178,8 +308,13 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                     Some(Ok(Message::VideoFrame(vf))) => {
                         if vf.data.is_empty() { continue; }
                         bytes_since_report += vf.data.len() as u64;
-                        // Send to decode thread (non-blocking)
                         let _ = decode_tx.send(DecodeJob { data: vf.data });
+                    }
+                    Some(Ok(Message::AudioChunk(ac))) => {
+                        bytes_since_report += ac.data.len() as u64;
+                        if let Some(ref atx) = audio_tx {
+                            let _ = atx.send(AudioJob { data: ac.data });
+                        }
                     }
                     Some(Ok(Message::SessionEnd(se))) => {
                         tracing::info!("Session ended: {}", se.reason);
@@ -195,6 +330,82 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     Ok(())
+}
+
+/// Audio playback thread: decodes Opus packets and writes PCM to cpal output.
+fn audio_playback_thread(rx: std::sync::mpsc::Receiver<AudioJob>) {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    let host = cpal::default_host();
+    let device = match host.default_output_device() {
+        Some(d) => d,
+        None => {
+            tracing::warn!("No audio output device found — audio disabled");
+            return;
+        }
+    };
+
+    let config = cpal::StreamConfig {
+        channels: termland_codec::audio::CHANNELS as u16,
+        sample_rate: cpal::SampleRate(termland_codec::audio::SAMPLE_RATE),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let mut opus_dec = match termland_codec::OpusDecoder::new() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Opus decoder init: {e}");
+            return;
+        }
+    };
+
+    // Ring buffer: decoded PCM samples waiting for cpal to consume.
+    let ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<i16>::with_capacity(48000)));
+    let ring_write = ring.clone();
+
+    let stream = match device.build_output_stream(
+        &config,
+        move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
+            let mut ring = ring.lock().unwrap();
+            for sample in out.iter_mut() {
+                *sample = ring.pop_front().unwrap_or(0);
+            }
+        },
+        |e| tracing::warn!("Audio stream error: {e}"),
+        None,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to build audio stream: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = stream.play() {
+        tracing::error!("Failed to start audio playback: {e}");
+        return;
+    }
+
+    tracing::info!("Audio playback started");
+
+    while let Ok(job) = rx.recv() {
+        match opus_dec.decode(&job.data) {
+            Ok(pcm) => {
+                let mut ring = ring_write.lock().unwrap();
+                // Cap buffer at ~500ms to prevent latency buildup while
+                // allowing enough headroom to absorb jitter.
+                let max_buffered = (termland_codec::audio::SAMPLE_RATE as usize) * (termland_codec::audio::CHANNELS as usize);
+                if ring.len() > max_buffered {
+                    let drain = ring.len() - max_buffered / 2;
+                    ring.drain(..drain);
+                }
+                ring.extend(pcm.iter());
+            }
+            Err(e) => tracing::warn!("Opus decode: {e}"),
+        }
+    }
+
+    tracing::info!("Audio playback thread exiting");
 }
 
 /// Dedicated decode thread - dav1d decode + YUV→pixel conversion.

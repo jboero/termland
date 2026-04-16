@@ -1,0 +1,67 @@
+# Termland Remote Desktop Server - systemd service unit
+#
+# This runs termland-server as a TCP listener with TLS and PAM authentication.
+# For SSH subsystem mode, you don't need this service - just add to sshd_config:
+#   Subsystem termland /usr/bin/termland-server --subsystem
+#
+# Installation:
+#   cp termland-server.service /usr/lib/systemd/system/
+#   cp termland-server.env /etc/sysconfig/termland-server
+#   systemctl daemon-reload
+#   systemctl enable --now termland-server
+#
+# The server needs root for PAM authentication. Each session runs a headless
+# Wayland compositor, so the system needs: labwc or cage, a Wayland-compatible
+# GPU driver (or software rendering via llvmpipe), and PulseAudio for audio.
+
+[Unit]
+Description=Termland Remote Desktop Server
+Documentation=https://github.com/jboero/termland
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Run as root for PAM auth. If you don't need PAM (e.g. SSH-only deployment),
+# you can run as a dedicated user instead:
+#   User=termland
+#   Group=termland
+User=root
+Group=root
+
+# Load configuration from environment file
+EnvironmentFile=-/etc/sysconfig/termland-server
+
+# Main command - flags are controlled via the environment file
+ExecStart=/usr/bin/termland-server \
+    --bind ${TERMLAND_BIND} \
+    --port ${TERMLAND_PORT} \
+    ${TERMLAND_TLS_FLAGS} \
+    ${TERMLAND_AUTH_FLAGS}
+
+# Restart on crash, but not on clean exit (e.g. SIGTERM)
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run /tmp /home
+PrivateTmp=true
+
+# Allow binding to privileged ports if needed
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Logging goes to journald via stderr
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=termland-server
+
+# Resource limits - each session spawns a compositor + encoder
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

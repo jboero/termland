@@ -1,13 +1,17 @@
+mod auth;
+mod tls;
 mod transport;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::Shell;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "termland-server", about = "Termland remote desktop server")]
+#[command(name = "termland-server", about = "Termland remote desktop server", version)]
 struct Args {
-    /// Run as SSH subsystem (read/write protocol on stdin/stdout)
+    /// Run as SSH subsystem (read/write protocol on stdin/stdout).
+    /// Register in sshd_config: Subsystem termland /usr/bin/termland-server --subsystem
     #[arg(long)]
     subsystem: bool,
 
@@ -18,10 +22,45 @@ struct Args {
     /// Bind address for TCP mode
     #[arg(short, long, default_value = "127.0.0.1")]
     bind: String,
+
+    /// Enable TLS for TCP connections. Auto-generates a self-signed cert
+    /// in ~/.config/termland/ if no --tls-cert/--tls-key is provided.
+    #[arg(long)]
+    tls: bool,
+
+    /// Path to TLS certificate PEM file (implies --tls)
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// Path to TLS private key PEM file (implies --tls)
+    #[arg(long)]
+    tls_key: Option<String>,
+
+    /// Require PAM authentication before session creation.
+    /// Uses the "termland" PAM service, falling back to "login".
+    #[arg(long)]
+    auth: bool,
+
+    /// Generate shell completion script and exit.
+    /// Usage: termland-server --completions bash > /etc/bash_completion.d/termland-server
+    #[arg(long, value_name = "SHELL")]
+    completions: Option<Shell>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    if let Some(shell) = args.completions {
+        clap_complete::generate(
+            shell,
+            &mut Args::command(),
+            "termland-server",
+            &mut std::io::stdout(),
+        );
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -29,14 +68,28 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let args = Args::parse();
-
     if args.subsystem {
         tracing::info!("Starting in SSH subsystem mode");
         transport::run_subsystem().await?;
     } else {
-        tracing::info!("Starting TCP listener on {}:{}", args.bind, args.port);
-        transport::run_tcp_listener(&args.bind, args.port).await?;
+        let use_tls = args.tls || args.tls_cert.is_some() || args.tls_key.is_some();
+
+        let acceptor = if use_tls {
+            let cert = args.tls_cert.as_deref().map(std::path::Path::new);
+            let key = args.tls_key.as_deref().map(std::path::Path::new);
+            Some(tls::build_tls_acceptor(cert, key)?)
+        } else {
+            None
+        };
+
+        tracing::info!(
+            "Starting TCP listener on {}:{} (TLS: {}, Auth: {})",
+            args.bind, args.port,
+            if use_tls { "enabled" } else { "disabled" },
+            if args.auth { "PAM" } else { "none" },
+        );
+
+        transport::run_tcp_listener(&args.bind, args.port, acceptor, args.auth).await?;
     }
 
     Ok(())

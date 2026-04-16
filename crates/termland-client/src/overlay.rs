@@ -26,8 +26,8 @@ pub struct MenuState {
 impl MenuState {
     pub fn new() -> Self {
         Self {
-            show_data_rate: false,
-            client_cursor: false,
+            show_data_rate: true,
+            client_cursor: true,
         }
     }
 }

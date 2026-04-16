@@ -6,25 +6,48 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
 use termland_protocol::*;
+use libpulse_binding as pulse;
+use libpulse_simple_binding as psimple;
 
 /// Run the server in SSH subsystem mode: protocol over stdin/stdout.
 pub async fn run_subsystem() -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let io = tokio::io::join(stdin, stdout);
-    handle_session(io).await
+    handle_session(io, false).await
 }
 
-/// Run the server as a TCP listener.
-pub async fn run_tcp_listener(bind: &str, port: u16) -> Result<()> {
+/// Run the server as a TCP listener, optionally with TLS and PAM auth.
+pub async fn run_tcp_listener(
+    bind: &str,
+    port: u16,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    require_auth: bool,
+) -> Result<()> {
     let listener = TcpListener::bind(format!("{bind}:{port}")).await?;
     tracing::info!("Listening on {bind}:{port}");
 
     loop {
         let (socket, addr) = listener.accept().await?;
         tracing::info!("Connection from {addr}");
+        let acceptor = tls_acceptor.clone();
+        let auth = require_auth;
         tokio::spawn(async move {
-            if let Err(e) = handle_session(socket).await {
+            let result = if let Some(acceptor) = acceptor {
+                match acceptor.accept(socket).await {
+                    Ok(tls_stream) => {
+                        tracing::info!("TLS handshake complete for {addr}");
+                        handle_session(tls_stream, auth).await
+                    }
+                    Err(e) => {
+                        tracing::warn!("TLS handshake failed for {addr}: {e}");
+                        return;
+                    }
+                }
+            } else {
+                handle_session(socket, auth).await
+            };
+            if let Err(e) = result {
                 tracing::error!("Session error for {addr}: {e}");
             }
         });
@@ -58,7 +81,8 @@ enum InputCommand {
 }
 
 /// Handle a single client session over any AsyncRead+AsyncWrite transport.
-async fn handle_session<T>(io: T) -> Result<()>
+#[allow(clippy::too_many_lines)]
+async fn handle_session<T>(io: T, require_auth: bool) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -90,6 +114,7 @@ where
             protocol_version: PROTOCOL_VERSION,
             server_name: "termland-server".into(),
             session_id: session_id.clone(),
+            auth_required: require_auth,
         }))
         .await
         .context("failed to send HelloAck")?;
@@ -100,6 +125,41 @@ where
             hello.protocol_version,
             PROTOCOL_VERSION
         );
+    }
+
+    // Authentication (if required)
+    if require_auth {
+        framed.send(Message::AuthRequest(AuthRequest {
+            methods: vec!["password".into()],
+        })).await.context("failed to send AuthRequest")?;
+
+        let msg = framed.next().await
+            .context("connection closed before AuthResponse")?
+            .context("failed to decode AuthResponse")?;
+
+        let (username, password) = match msg {
+            Message::AuthResponse(ar) => (ar.username, ar.credential),
+            other => anyhow::bail!("expected AuthResponse, got {:?}", other.message_id()),
+        };
+
+        let ok = tokio::task::spawn_blocking(move || {
+            crate::auth::pam_authenticate_user(&username, &password)
+        }).await??;
+
+        if !ok {
+            framed.send(Message::AuthResult(AuthResult {
+                success: false,
+                message: "authentication failed".into(),
+            })).await?;
+            anyhow::bail!("authentication failed");
+        }
+
+        framed.send(Message::AuthResult(AuthResult {
+            success: true,
+            message: "authenticated".into(),
+        })).await.context("failed to send AuthResult")?;
+
+        tracing::info!("Client authenticated");
     }
 
     // Wait for SessionCreate
@@ -143,7 +203,7 @@ where
 
     // Shared cursor-mode flag. Client defaults to server-side cursor rendering
     // (overlay_cursor=true). Can be toggled at runtime via CursorMode message.
-    let overlay_cursor = Arc::new(AtomicBool::new(true));
+    let overlay_cursor = Arc::new(AtomicBool::new(false));
     let overlay_cursor_capture = overlay_cursor.clone();
 
     let capture_handle = std::thread::spawn(move || {
@@ -201,8 +261,21 @@ where
     tracing::info!("  Compositor: headless wlroots on {wayland_display}");
     tracing::info!("  Resolution: {first_w}x{first_h}");
     tracing::info!("  Video encoder: {encoder_name}");
-    tracing::info!("  Audio encoder: none (Phase 5)");
-    tracing::info!("  Transport: TCP (unencrypted - use --ssh for encryption)");
+    // Optionally start audio capture if the client requested it.
+    let (mut audio_rx, _audio_stop_tx, _audio_handle) = if session_create.audio {
+        let (atx, arx) = tokio::sync::mpsc::channel::<AudioChunk>(8);
+        let (astop_tx, astop_rx) = tokio::sync::oneshot::channel::<()>();
+        let sid = session_id.clone();
+        let h = std::thread::spawn(move || {
+            audio_capture_thread(&sid, atx, astop_rx);
+        });
+        tracing::info!("  Audio encoder: Opus 48kHz stereo 64kbps");
+        (Some(arx), Some(astop_tx), Some(h))
+    } else {
+        tracing::info!("  Audio encoder: disabled (client did not request audio)");
+        (None, None, None)
+    };
+    tracing::info!("  Transport: TCP");
 
     // Send the first frame
     let first_msg = frame_to_message(&first_frame);
@@ -242,6 +315,20 @@ where
                 frame_num += 1;
                 if frame_num % 30 == 0 {
                     tracing::debug!("Sent frame {frame_num}");
+                }
+            }
+
+            audio = async {
+                match audio_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(chunk) = audio {
+                    if let Err(e) = framed.send(Message::AudioChunk(chunk)).await {
+                        tracing::error!("Failed to send audio: {e}");
+                        break;
+                    }
                 }
             }
 
@@ -316,8 +403,14 @@ where
     // Stop threads
     let _ = stop_tx.send(());
     let _ = input_tx.send(InputCommand::Stop);
+    if let Some(astop) = _audio_stop_tx {
+        let _ = astop.send(());
+    }
     let _ = capture_handle.join();
     let _ = input_handle.join();
+    if let Some(ah) = _audio_handle {
+        let _ = ah.join();
+    }
 
     tracing::info!("Session {session_id} ended");
     Ok(())
@@ -560,6 +653,138 @@ fn input_thread(
     }
 
     tracing::info!("Input thread exiting");
+}
+
+/// Audio capture thread: creates a PulseAudio null sink for the session,
+/// captures from its monitor, encodes Opus, and sends AudioChunk packets.
+fn audio_capture_thread(
+    session_id: &str,
+    audio_tx: tokio::sync::mpsc::Sender<AudioChunk>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    let sink_name = format!("termland_{}", session_id.replace('-', "_"));
+    let monitor_source = format!("{sink_name}.monitor");
+
+    // Load a null sink so apps in this session have somewhere to output audio.
+    let load_result = std::process::Command::new("pactl")
+        .args(["load-module", "module-null-sink",
+               &format!("sink_name={sink_name}"),
+               &format!("sink_properties=device.description=\"Termland\\ {session_id}\"")])
+        .output();
+
+    let module_id = match load_result {
+        Ok(out) if out.status.success() => {
+            let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            tracing::info!("Loaded PA null sink '{sink_name}' (module {id})");
+            Some(id)
+        }
+        Ok(out) => {
+            tracing::warn!("pactl load-module failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("Could not run pactl: {e} — audio disabled");
+            return;
+        }
+    };
+
+    // Set this sink as the default so apps in the session use it.
+    let _ = std::process::Command::new("pactl")
+        .args(["set-default-sink", &sink_name])
+        .output();
+
+    // Open a PulseAudio recording stream from the monitor source.
+    let spec = pulse::sample::Spec {
+        format: pulse::sample::Format::S16le,
+        rate: termland_codec::audio::SAMPLE_RATE,
+        channels: termland_codec::audio::CHANNELS,
+    };
+
+    let pa = match psimple::Simple::new(
+        None,
+        "termland-server",
+        pulse::stream::Direction::Record,
+        Some(&monitor_source),
+        "session audio capture",
+        &spec,
+        None,
+        None,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("PA record stream failed for '{monitor_source}': {e}");
+            cleanup_null_sink(module_id.as_deref());
+            return;
+        }
+    };
+
+    let mut opus_enc = match termland_codec::OpusEncoder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("Opus encoder init: {e}");
+            cleanup_null_sink(module_id.as_deref());
+            return;
+        }
+    };
+
+    tracing::info!("Audio capture started from '{monitor_source}'");
+
+    let frame_samples = termland_codec::audio::FRAME_SIZE * termland_codec::audio::CHANNELS as usize;
+    let mut pcm_buf = vec![0i16; frame_samples];
+    let byte_buf: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(
+            pcm_buf.as_mut_ptr() as *mut u8,
+            frame_samples * 2,
+        )
+    };
+
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+
+        if let Err(e) = pa.read(byte_buf) {
+            tracing::warn!("PA read error: {e}");
+            break;
+        }
+
+        // Skip true digital silence (all zeros). Opus already handles near-silence
+        // efficiently via DTX, so only skip completely empty buffers to avoid
+        // clipping quiet audio.
+        let is_silence = pcm_buf.iter().all(|&s| s == 0);
+        if is_silence {
+            continue;
+        }
+
+        match opus_enc.encode(&pcm_buf) {
+            Ok(opus_data) => {
+                let chunk = AudioChunk {
+                    timestamp_us: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as u64,
+                    sample_rate: termland_codec::audio::SAMPLE_RATE,
+                    channels: termland_codec::audio::CHANNELS,
+                    data: opus_data,
+                };
+                if audio_tx.blocking_send(chunk).is_err() {
+                    break;
+                }
+            }
+            Err(e) => tracing::warn!("Opus encode: {e}"),
+        }
+    }
+
+    cleanup_null_sink(module_id.as_deref());
+    tracing::info!("Audio capture thread exiting");
+}
+
+fn cleanup_null_sink(module_id: Option<&str>) {
+    if let Some(id) = module_id {
+        let _ = std::process::Command::new("pactl")
+            .args(["unload-module", id])
+            .output();
+    }
 }
 
 /// Convert a captured frame (AV1 or raw) into a protocol message.
