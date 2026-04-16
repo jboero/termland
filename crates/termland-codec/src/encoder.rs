@@ -259,13 +259,28 @@ impl Av1Encoder for FfmpegAv1Encoder {
             )));
         }
 
-        // Create RGBA input frame
+        // Create RGBA input frame. ffmpeg_next::Video::new() calls
+        // av_frame_get_buffer(align=32) internally, so each row is padded
+        // to a 32-byte boundary for SIMD. For widths whose `w*4` is not
+        // already a multiple of 32 (e.g. 1250 → 5000 bytes → padded to
+        // 5024), the destination stride is LARGER than the source row
+        // width and a flat copy_from_slice diagonally wraps every row.
+        //
+        // We have to copy row-by-row using the frame's actual stride.
         let mut rgba_frame = ffmpeg_next::frame::Video::new(
             ffmpeg_next::format::Pixel::RGBA,
             w,
             h,
         );
-        rgba_frame.data_mut(0)[..expected_size].copy_from_slice(rgba_data);
+        let dst_stride = rgba_frame.stride(0);
+        let src_stride = (w * 4) as usize;
+        let dst = rgba_frame.data_mut(0);
+        for row in 0..h as usize {
+            let src_start = row * src_stride;
+            let dst_start = row * dst_stride;
+            dst[dst_start..dst_start + src_stride]
+                .copy_from_slice(&rgba_data[src_start..src_start + src_stride]);
+        }
 
         // Convert RGBA -> target pixel format
         let mut yuv_frame = ffmpeg_next::frame::Video::new(
