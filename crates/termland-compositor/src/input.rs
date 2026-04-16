@@ -172,7 +172,7 @@ impl InputInjector {
         let fd = memfd::memfd_create(c"termland-keymap", memfd::MemFdCreateFlag::MFD_CLOEXEC)
             .map_err(|e| InputError::InjectFailed(format!("memfd_create: {e}")))?;
 
-        unistd::ftruncate(&fd, size as i64)
+        unistd::ftruncate(&fd, size as nix::libc::off_t)
             .map_err(|e| InputError::InjectFailed(format!("ftruncate: {e}")))?;
 
         // Write keymap to fd
