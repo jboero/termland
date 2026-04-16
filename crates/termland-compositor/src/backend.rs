@@ -41,8 +41,39 @@ pub fn compositor_command(program: &str, width: u32, height: u32) -> Command {
 /// Shell wrapper that echoes the compositor-assigned WAYLAND_DISPLAY to
 /// stderr as "TERMLAND_SOCKET:<name>" before exec'ing the real child command.
 /// Used to reliably detect which wayland-N socket the compositor created.
+///
+/// SECURITY: `child_command` is embedded in a shell string. Callers MUST
+/// sanitize or validate this input before passing it here.
 pub fn socket_wrapper_cmd(child_command: &str) -> String {
     format!("echo \"TERMLAND_SOCKET:$WAYLAND_DISPLAY\" >&2; exec {child_command}")
+}
+
+/// Validate a command string for shell safety. Rejects characters that could
+/// enable command injection when embedded in a shell context.
+/// Allows: alphanumeric, spaces, hyphens, underscores, dots, slashes, equals,
+/// colons, commas, single quotes (for arguments), and @.
+pub fn validate_shell_command(cmd: &str) -> Result<(), CompositorError> {
+    if cmd.is_empty() {
+        return Err(CompositorError::StartFailed("empty command".into()));
+    }
+    for ch in cmd.chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => {}
+            ' ' | '-' | '_' | '.' | '/' | '=' | ':' | ',' | '\'' | '@' | '+' => {}
+            _ => {
+                return Err(CompositorError::StartFailed(format!(
+                    "rejected shell metacharacter '{ch}' in command: {cmd}"
+                )));
+            }
+        }
+    }
+    // Reject if it starts with a dash (option injection)
+    if cmd.starts_with('-') {
+        return Err(CompositorError::StartFailed(format!(
+            "command must not start with '-': {cmd}"
+        )));
+    }
+    Ok(())
 }
 
 /// Read the socket name from the compositor's stderr stream, then spawn a

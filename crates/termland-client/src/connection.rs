@@ -199,7 +199,9 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
         }
 
         let username = params.username.clone().unwrap_or_else(whoami::username);
-        let password = params.password.clone().unwrap_or_default();
+        let password = params.password.clone()
+            .or_else(|| std::env::var("TERMLAND_PASSWORD").ok())
+            .unwrap_or_default();
 
         if password.is_empty() {
             tracing::warn!("Server requires auth but no --password provided");

@@ -38,6 +38,9 @@ BuildRequires:  pulseaudio-libs-devel
 # PAM development headers (authentication)
 BuildRequires:  pam-devel
 
+# libclang (ffmpeg-sys-next uses bindgen for FFI generation)
+BuildRequires:  clang-devel
+
 # TLS (aws-lc-rs / ring build deps)
 BuildRequires:  cmake
 BuildRequires:  gcc

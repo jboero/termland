@@ -80,6 +80,7 @@ pub struct Args {
     pub user: Option<String>,
 
     /// Password for authentication.
+    /// WARNING: visible in /proc/pid/cmdline. Prefer TERMLAND_PASSWORD env var.
     #[arg(long)]
     pub password: Option<String>,
 

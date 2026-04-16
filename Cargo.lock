@@ -2395,6 +2395,7 @@ name = "termland-server"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "clap",
  "clap_complete",
  "futures",

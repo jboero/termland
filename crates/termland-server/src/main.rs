@@ -74,6 +74,15 @@ async fn main() -> Result<()> {
     } else {
         let use_tls = args.tls || args.tls_cert.is_some() || args.tls_key.is_some();
 
+        if args.auth && !use_tls {
+            tracing::warn!("WARNING: --auth without --tls sends credentials in PLAINTEXT!");
+            tracing::warn!("Anyone on the network can intercept passwords.");
+            tracing::warn!("Add --tls or use SSH subsystem mode for secure authentication.");
+        }
+        if !use_tls && args.bind != "127.0.0.1" && args.bind != "::1" {
+            tracing::warn!("Listening without TLS on non-localhost ({}) — traffic is unencrypted", args.bind);
+        }
+
         let acceptor = if use_tls {
             let cert = args.tls_cert.as_deref().map(std::path::Path::new);
             let key = args.tls_key.as_deref().map(std::path::Path::new);

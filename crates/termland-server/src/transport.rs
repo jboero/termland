@@ -17,6 +17,8 @@ pub async fn run_subsystem() -> Result<()> {
     handle_session(io, false).await
 }
 
+const MAX_CONCURRENT_SESSIONS: usize = 32;
+
 /// Run the server as a TCP listener, optionally with TLS and PAM auth.
 pub async fn run_tcp_listener(
     bind: &str,
@@ -25,11 +27,23 @@ pub async fn run_tcp_listener(
     require_auth: bool,
 ) -> Result<()> {
     let listener = TcpListener::bind(format!("{bind}:{port}")).await?;
-    tracing::info!("Listening on {bind}:{port}");
+    tracing::info!("Listening on {bind}:{port} (max {MAX_CONCURRENT_SESSIONS} sessions)");
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS));
 
     loop {
         let (socket, addr) = listener.accept().await?;
-        tracing::info!("Connection from {addr}");
+
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!("Rejected connection from {addr}: max sessions reached");
+                drop(socket);
+                continue;
+            }
+        };
+
+        tracing::info!("Connection from {addr} ({} active)", MAX_CONCURRENT_SESSIONS - semaphore.available_permits());
         let acceptor = tls_acceptor.clone();
         let auth = require_auth;
         tokio::spawn(async move {
@@ -50,6 +64,7 @@ pub async fn run_tcp_listener(
             if let Err(e) = result {
                 tracing::error!("Session error for {addr}: {e}");
             }
+            drop(permit);
         });
     }
 }
@@ -147,6 +162,8 @@ where
         }).await??;
 
         if !ok {
+            // Delay before responding to slow down brute-force attempts
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             framed.send(Message::AuthResult(AuthResult {
                 success: false,
                 message: "authentication failed".into(),
@@ -192,6 +209,30 @@ where
     let encoder_preset = session_create.encoder_preset.filter(|s| !s.is_empty());
     let encoder_crf = session_create.encoder_crf;
     let encoder_extra_params = session_create.encoder_extra_params.filter(|s| !s.is_empty());
+
+    // SECURITY: validate client-supplied commands before they reach any shell.
+    // desktop_shell and app command/args come from the untrusted client.
+    if let Some(ref shell) = desktop_shell {
+        termland_compositor::validate_shell_command(shell)
+            .map_err(|e| anyhow::anyhow!("rejected desktop_shell: {e}"))?;
+    }
+    if let termland_protocol::SessionMode::App { ref command, ref args } = session_create.mode {
+        termland_compositor::validate_shell_command(command)
+            .map_err(|e| anyhow::anyhow!("rejected app command: {e}"))?;
+        for arg in args {
+            termland_compositor::validate_shell_command(arg)
+                .map_err(|e| anyhow::anyhow!("rejected app arg: {e}"))?;
+        }
+    }
+    if let Some(ref preset) = encoder_preset {
+        termland_compositor::validate_shell_command(preset)
+            .map_err(|e| anyhow::anyhow!("rejected encoder_preset: {e}"))?;
+    }
+    if let Some(ref extra) = encoder_extra_params {
+        termland_compositor::validate_shell_command(extra)
+            .map_err(|e| anyhow::anyhow!("rejected encoder_extra_params: {e}"))?;
+    }
+
     let mode: termland_compositor::SessionMode = session_create.mode.into();
 
     // Spawn the compositor + capture loop on a blocking thread.
@@ -730,27 +771,19 @@ fn audio_capture_thread(
     tracing::info!("Audio capture started from '{monitor_source}'");
 
     let frame_samples = termland_codec::audio::FRAME_SIZE * termland_codec::audio::CHANNELS as usize;
-    let mut pcm_buf = vec![0i16; frame_samples];
-    let byte_buf: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(
-            pcm_buf.as_mut_ptr() as *mut u8,
-            frame_samples * 2,
-        )
-    };
+    let mut byte_buf = vec![0u8; frame_samples * 2];
 
     loop {
         if stop_rx.try_recv().is_ok() {
             break;
         }
 
-        if let Err(e) = pa.read(byte_buf) {
+        if let Err(e) = pa.read(&mut byte_buf) {
             tracing::warn!("PA read error: {e}");
             break;
         }
 
-        // Skip true digital silence (all zeros). Opus already handles near-silence
-        // efficiently via DTX, so only skip completely empty buffers to avoid
-        // clipping quiet audio.
+        let pcm_buf: &[i16] = bytemuck::cast_slice(&byte_buf);
         let is_silence = pcm_buf.iter().all(|&s| s == 0);
         if is_silence {
             continue;

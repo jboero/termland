@@ -115,6 +115,12 @@ pub fn pam_authenticate_user(username: &str, password: &str) -> Result<bool> {
 
     unsafe { pam_end(pamh, rc) };
 
+    // Zero the password in memory so it doesn't linger on the heap.
+    let mut pass_bytes = conv_data.password.into_bytes_with_nul();
+    for b in pass_bytes.iter_mut() {
+        unsafe { std::ptr::write_volatile(b as *mut u8, 0) };
+    }
+
     if success {
         tracing::info!("PAM: user '{username}' authenticated via '{service}'");
     } else {

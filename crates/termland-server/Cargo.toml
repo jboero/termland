@@ -24,3 +24,4 @@ tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
 libc = { workspace = true }
+bytemuck = { workspace = true }

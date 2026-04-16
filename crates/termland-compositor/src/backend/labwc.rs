@@ -8,7 +8,7 @@ use crate::session::CompositorError;
 /// Launch labwc headlessly with the given startup command inside it.
 ///
 /// `shell_cmd` is run as labwc's session process. When it exits, labwc exits.
-/// Examples: "konsole", "startplasma-wayland", "waybar & konsole"
+/// Examples: "konsole", "startplasma-wayland"
 pub fn launch(
     width: u32,
     height: u32,

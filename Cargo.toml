@@ -41,6 +41,7 @@ tokio-rustls = "0.26"
 rcgen = "0.13"
 rustls-pemfile = "2"
 libc = "0.2"
+bytemuck = { version = "1", features = ["derive"] }
 whoami = "1"
 rustls-native-certs = "0.8"
 opus = "0.3"

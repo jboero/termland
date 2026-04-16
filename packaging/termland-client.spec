@@ -35,6 +35,9 @@ BuildRequires:  opus-devel
 # Audio playback via ALSA (cpal backend)
 BuildRequires:  alsa-lib-devel
 
+# libclang (ffmpeg-sys-next uses bindgen for FFI generation)
+BuildRequires:  clang-devel
+
 # TLS (aws-lc-rs build deps)
 BuildRequires:  cmake
 BuildRequires:  gcc

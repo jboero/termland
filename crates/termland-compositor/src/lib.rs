@@ -10,3 +10,4 @@ pub mod input;
 
 pub use session::{Compositor, CompositorConfig, CompositorError, SessionMode};
 pub use input::InputInjector;
+pub use backend::validate_shell_command;
