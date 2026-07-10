@@ -224,6 +224,11 @@ pub struct SessionCreate {
     /// "fast-decode=1:tile-columns=2:scm=2"
     #[serde(default)]
     pub encoder_extra_params: Option<String>,
+    /// Codecs this client can decode, in preference order. The server picks
+    /// the best encoder whose codec appears in this set. An omitted field
+    /// (older client) means "all codecs supported".
+    #[serde(default = "VideoCodec::all_preferred")]
+    pub supported_codecs: Vec<VideoCodec>,
 }
 
 fn default_quality() -> u8 { 75 }
@@ -233,6 +238,11 @@ pub struct SessionReady {
     pub width: u32,
     pub height: u32,
     pub xkb_keymap: Option<String>,
+    /// Codec the server chose to encode this session with, so the client can
+    /// construct the matching decoder up front. `None` (older server) means
+    /// the client should fall back to auto-detecting from the frame stream.
+    #[serde(default)]
+    pub codec: Option<VideoCodec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,12 +274,60 @@ pub enum FrameType {
     Inter,
 }
 
+/// Video codec carried by a `VideoFrame`. Used for codec negotiation:
+/// the client advertises the codecs it can decode in `SessionCreate`,
+/// the server reports the one it chose in `SessionReady`, and every
+/// `VideoFrame` is tagged so the client can pick the matching decoder
+/// deterministically instead of guessing by trial-and-error.
+///
+/// Listed in preference order (best compression / most open first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoCodec {
+    Av1,
+    Vp9,
+    Vp8,
+    H265,
+    H264,
+}
+
+impl VideoCodec {
+    /// All codecs in preference order. Used as the default advertised set
+    /// (a client that omits `supported_codecs` is treated as supporting all)
+    /// and as the client's own advertised capabilities.
+    pub fn all_preferred() -> Vec<VideoCodec> {
+        vec![
+            VideoCodec::Av1,
+            VideoCodec::Vp9,
+            VideoCodec::Vp8,
+            VideoCodec::H265,
+            VideoCodec::H264,
+        ]
+    }
+}
+
+impl std::fmt::Display for VideoCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            VideoCodec::Av1 => "AV1",
+            VideoCodec::Vp9 => "VP9",
+            VideoCodec::Vp8 => "VP8",
+            VideoCodec::H265 => "H.265",
+            VideoCodec::H264 => "H.264",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoFrame {
     pub timestamp_us: u64,
     pub frame_type: FrameType,
     pub width: u16,
     pub height: u16,
+    /// Codec this frame is encoded with. `None` (older server) means the
+    /// client should decode with whatever it negotiated at SessionReady.
+    #[serde(default)]
+    pub codec: Option<VideoCodec>,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }

@@ -69,20 +69,15 @@ pub async fn run_tcp_listener(
     }
 }
 
-/// Frame data from the capture thread (already AV1-encoded or raw fallback).
+/// Frame data from the capture thread (video-encoded).
 enum CapturedFrame {
-    Av1 {
+    Video {
         data: Vec<u8>,
         keyframe: bool,
         width: u16,
         height: u16,
         timestamp_us: u64,
-    },
-    Raw {
-        rgba: Vec<u8>,
-        width: u32,
-        height: u32,
-        timestamp_us: u64,
+        codec: termland_protocol::VideoCodec,
     },
 }
 
@@ -209,6 +204,15 @@ where
     let encoder_preset = session_create.encoder_preset.filter(|s| !s.is_empty());
     let encoder_crf = session_create.encoder_crf;
     let encoder_extra_params = session_create.encoder_extra_params.filter(|s| !s.is_empty());
+    // Codecs the client can decode. An empty set (unusual) means the client
+    // advertised nothing decodable; fall back to no restriction so the session
+    // can still start rather than panic.
+    let supported_codecs = if session_create.supported_codecs.is_empty() {
+        termland_protocol::VideoCodec::all_preferred()
+    } else {
+        session_create.supported_codecs.clone()
+    };
+    tracing::info!("Client supports codecs: {supported_codecs:?}");
 
     // SECURITY: validate client-supplied commands before they reach any shell.
     // desktop_shell and app command/args come from the untrusted client.
@@ -247,9 +251,11 @@ where
     let overlay_cursor = Arc::new(AtomicBool::new(false));
     let overlay_cursor_capture = overlay_cursor.clone();
 
+    let capture_codecs = supported_codecs.clone();
     let capture_handle = std::thread::spawn(move || {
         capture_thread(width, height, quality, mode, desktop_shell,
                        encoder_preset, encoder_crf, encoder_extra_params,
+                       capture_codecs,
                        overlay_cursor_capture, resize_rx, frame_tx, display_tx, stop_rx);
     });
 
@@ -278,30 +284,28 @@ where
     .context("timeout waiting for first frame")?
     .context("capture thread died before producing a frame")?;
 
-    let (first_w, first_h) = match &first_frame {
-        CapturedFrame::Av1 { width: w, height: h, .. } => (*w as u32, *h as u32),
-        CapturedFrame::Raw { width: w, height: h, .. } => (*w, *h),
+    let (first_w, first_h, first_codec) = match &first_frame {
+        CapturedFrame::Video { width: w, height: h, codec, .. } => (*w as u32, *h as u32, *codec),
     };
 
-    // Send SessionReady
+    // Send SessionReady, announcing the negotiated codec so the client builds
+    // the matching decoder up front instead of guessing from the stream.
     framed
         .send(Message::SessionReady(SessionReady {
             width: first_w,
             height: first_h,
             xkb_keymap: None,
+            codec: Some(first_codec),
         }))
         .await
         .context("failed to send SessionReady")?;
 
-    // Log session info
-    let encoder_name = match &first_frame {
-        CapturedFrame::Av1 { .. } => "AV1 (see encoder log above)",
-        CapturedFrame::Raw { .. } => "raw RGBA (no AV1 encoder available)",
-    };
     tracing::info!("Session {session_id} active");
     tracing::info!("  Compositor: headless wlroots on {wayland_display}");
     tracing::info!("  Resolution: {first_w}x{first_h}");
-    tracing::info!("  Video encoder: {encoder_name}");
+    tracing::info!("  Video codec: {first_codec}");
+    tracing::info!("  Transport: TCP");
+
     // Optionally start audio capture if the client requested it.
     let (mut audio_rx, _audio_stop_tx, _audio_handle) = if session_create.audio {
         let (atx, arx) = tokio::sync::mpsc::channel::<AudioChunk>(8);
@@ -316,7 +320,6 @@ where
         tracing::info!("  Audio encoder: disabled (client did not request audio)");
         (None, None, None)
     };
-    tracing::info!("  Transport: TCP");
 
     // Send the first frame
     let first_msg = frame_to_message(&first_frame);
@@ -340,8 +343,7 @@ where
                 };
 
                 let (fw, fh) = match &frame {
-                    CapturedFrame::Av1 { width: w, height: h, .. } => (*w as u32, *h as u32),
-                    CapturedFrame::Raw { width: w, height: h, .. } => (*w, *h),
+                    CapturedFrame::Video { width: w, height: h, .. } => (*w as u32, *h as u32),
                 };
                 current_width = fw;
                 current_height = fh;
@@ -480,20 +482,27 @@ impl EncoderTuning {
     }
 }
 
-/// Build a fresh AV1 encoder for the given dimensions + tuning.
-/// Returns None if no encoder is available (we fall back to raw RGBA).
-fn init_encoder(tuning: &EncoderTuning, width: u32, height: u32)
-    -> Option<Box<dyn termland_codec::Av1Encoder>>
-{
+/// Build a fresh video encoder for the given dimensions + tuning, restricted
+/// to codecs the client advertised it can decode.
+/// Panics if no encoder is available (no supported codec could initialize).
+fn init_encoder(
+    tuning: &EncoderTuning,
+    width: u32,
+    height: u32,
+    supported_codecs: &[termland_protocol::VideoCodec],
+) -> Box<dyn termland_codec::VideoEncoder> {
     let config = tuning.build_config(width, height);
-    match termland_codec::probe_best_encoder(&config) {
+    match termland_codec::probe_best_encoder(&config, supported_codecs) {
         Ok(enc) => {
-            tracing::info!("AV1 encoder ready for {width}x{height}: {}", enc.backend());
-            Some(enc)
+            let backend = enc.backend();
+            tracing::info!(
+                "Video encoder ready for {width}x{height}: {backend} (codec {})",
+                backend.codec()
+            );
+            enc
         }
         Err(e) => {
-            tracing::warn!("No AV1 encoder available ({e}), using raw RGBA");
-            None
+            panic!("No video encoder available for client-supported codecs {supported_codecs:?}: {e}");
         }
     }
 }
@@ -509,6 +518,7 @@ fn capture_thread(
     encoder_preset: Option<String>,
     encoder_crf: Option<u8>,
     encoder_extra_params: Option<String>,
+    supported_codecs: Vec<termland_protocol::VideoCodec>,
     overlay_cursor: Arc<AtomicBool>,
     resize_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     frame_tx: tokio::sync::mpsc::Sender<CapturedFrame>,
@@ -539,7 +549,8 @@ fn capture_thread(
         extra_svt_params: encoder_extra_params,
     };
 
-    let mut av1_encoder = init_encoder(&tuning, width, height);
+    let mut video_encoder = init_encoder(&tuning, width, height, &supported_codecs);
+    let mut encoder_codec = video_encoder.backend().codec();
     let mut encoder_dims = (width, height);
 
     let mut compositor = compositor;
@@ -580,14 +591,10 @@ fn capture_thread(
                     tracing::info!("Capture dims changed {}x{} → {w}x{h}, reinitializing encoder",
                         encoder_dims.0, encoder_dims.1);
                     // Flush the old encoder before dropping it. This sends
-                    // EOS to libsvtav1 so SVT doesn't complain with
-                    // "deinit called without sending EOS!" in its log.
-                    // We discard the flushed packets because they belong
-                    // to the old dimensions and would confuse the client.
-                    if let Some(old) = av1_encoder.as_mut() {
-                        let _ = old.flush();
-                    }
-                    av1_encoder = init_encoder(&tuning, w, h);
+                    // EOS so the encoder can properly close.
+                    let _ = video_encoder.flush();
+                    video_encoder = init_encoder(&tuning, w, h, &supported_codecs);
+                    encoder_codec = video_encoder.backend().codec();
                     encoder_dims = (w, h);
                 }
 
@@ -596,33 +603,33 @@ fn capture_thread(
                     .unwrap_or_default()
                     .as_micros() as u64;
 
-                let frames: Vec<CapturedFrame> = if let Some(encoder) = &mut av1_encoder {
-                    match encoder.encode_frame(&rgba, timestamp_us, false) {
-                        Ok(packets) if !packets.is_empty() => {
-                            packets.into_iter().map(|p| {
-                                if p.keyframe {
-                                    tracing::info!("AV1 keyframe: {} bytes", p.data.len());
-                                }
-                                CapturedFrame::Av1 {
-                                    data: p.data,
-                                    keyframe: p.keyframe,
-                                    width: w as u16,
-                                    height: h as u16,
-                                    timestamp_us,
-                                }
-                            }).collect()
-                        }
-                        Ok(_) => {
-                            // Encoder warming up - send raw so client isn't blank
-                            vec![CapturedFrame::Raw { rgba, width: w, height: h, timestamp_us }]
-                        }
-                        Err(e) => {
-                            tracing::warn!("AV1 encode failed: {e}, sending raw");
-                            vec![CapturedFrame::Raw { rgba, width: w, height: h, timestamp_us }]
-                        }
+                // Force a keyframe when dimensions change
+                let force_keyframe = (w, h) != encoder_dims;
+
+                let frames: Vec<CapturedFrame> = match video_encoder.encode_frame(&rgba, timestamp_us, force_keyframe) {
+                    Ok(packets) if !packets.is_empty() => {
+                        packets.into_iter().map(|p| {
+                            let keyframe_str = if p.keyframe { "keyframe" } else { "frame" };
+                            tracing::debug!("{keyframe_str}: {} bytes", p.data.len());
+                            CapturedFrame::Video {
+                                data: p.data,
+                                keyframe: p.keyframe,
+                                width: w as u16,
+                                height: h as u16,
+                                timestamp_us,
+                                codec: encoder_codec,
+                            }
+                        }).collect()
                     }
-                } else {
-                    vec![CapturedFrame::Raw { rgba, width: w, height: h, timestamp_us }]
+                    Ok(_) => {
+                        // Encoder buffering - send nothing this iteration
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Video encode failed: {e}");
+                        // Continue capturing - the encoder may recover
+                        continue;
+                    }
                 };
 
                 let mut send_failed = false;
@@ -820,27 +827,17 @@ fn cleanup_null_sink(module_id: Option<&str>) {
     }
 }
 
-/// Convert a captured frame (AV1 or raw) into a protocol message.
+/// Convert a captured frame (video) into a protocol message.
 fn frame_to_message(frame: &CapturedFrame) -> Message {
     match frame {
-        CapturedFrame::Av1 { data, keyframe, width, height, timestamp_us } => {
+        CapturedFrame::Video { data, keyframe, width, height, timestamp_us, codec } => {
             Message::VideoFrame(VideoFrame {
                 timestamp_us: *timestamp_us,
                 frame_type: if *keyframe { FrameType::Keyframe } else { FrameType::Inter },
+                codec: Some(*codec),
                 width: *width,
                 height: *height,
                 data: data.clone(),
-            })
-        }
-        CapturedFrame::Raw { rgba, width, height, timestamp_us } => {
-            Message::StillFrame(StillFrame {
-                timestamp_us: *timestamp_us,
-                x: 0,
-                y: 0,
-                width: *width,
-                height: *height,
-                lossless: true,
-                data: rgba.clone(),
             })
         }
     }

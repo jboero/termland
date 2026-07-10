@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.3.1
+%global version 0.4.0
 
 Name:           termland-client
 Version:        %{version}
@@ -120,6 +120,15 @@ install -Dm644 termland-client.fish %{buildroot}%{_datadir}/fish/vendor_completi
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Fri Jul 10 2026 John Boero - 0.4.0-1
+- v0.4.0 release
+- Multi-codec decoding with automatic fallback: AV1, VP9, VP8, H.265/HEVC, H.264
+- Codec negotiation: advertises decodable codecs to the server and builds the
+  decoder deterministically for the codec announced in SessionReady, instead of
+  guessing from the bitstream (falls back to auto-detect with older servers)
+- Decoder prefers CUVID/VA-API/V4L2 over Intel QSV on non-Intel systems to avoid
+  wasting the opening frames on a doomed QSV context
+
 * Wed Apr 15 2026 John Boero - 0.3.0-1
 - v0.3.0 release
 - AV1 decoding with auto-fallback (QSV > CUVID > dav1d)

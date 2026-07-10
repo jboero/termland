@@ -162,9 +162,12 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
     }
 }
 
-/// AV1 packet for the decode thread.
+/// Encoded video packet for the decode thread.
 struct DecodeJob {
     data: Vec<u8>,
+    /// Codec this packet is encoded with, if the server tagged it. Lets the
+    /// decode thread switch decoders if the server ever changes codec mid-stream.
+    codec: Option<VideoCodec>,
 }
 
 async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
@@ -234,21 +237,30 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
         encoder_preset: params.encoder_preset,
         encoder_crf: params.encoder_crf,
         encoder_extra_params: params.encoder_extra_params,
+        // The client's ffmpeg-based decoder supports every codec; advertise all
+        // in preference order so the server picks the best its hardware can encode.
+        supported_codecs: termland_protocol::VideoCodec::all_preferred(),
     })).await?;
     let msg = framed.next().await.context("closed")?.context("decode")?;
-    match &msg {
+    let negotiated_codec = match &msg {
         Message::SessionReady(sr) => {
-            tracing::info!("Session ready: {}x{}", sr.width, sr.height);
+            match sr.codec {
+                Some(c) => tracing::info!("Session ready: {}x{} codec={c}", sr.width, sr.height),
+                None => tracing::info!("Session ready: {}x{} (codec unannounced, will auto-detect)", sr.width, sr.height),
+            }
             let _ = server_tx.send(ServerEvent::SessionReady(sr.clone()));
+            sr.codec
         }
         other => anyhow::bail!("expected SessionReady, got {:?}", other.message_id()),
-    }
+    };
 
-    // Spawn a dedicated decode thread so it doesn't block the network task
+    // Spawn a dedicated decode thread so it doesn't block the network task.
+    // It builds the decoder for the negotiated codec (or auto-detects if the
+    // server didn't announce one).
     let (decode_tx, decode_rx) = std::sync::mpsc::channel::<DecodeJob>();
     let display_tx = server_tx.clone();
     let _decode_thread = std::thread::spawn(move || {
-        decode_thread(decode_rx, display_tx);
+        decode_thread(decode_rx, display_tx, negotiated_codec);
     });
 
     // Spawn audio playback thread if audio was requested
@@ -310,7 +322,7 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                     Some(Ok(Message::VideoFrame(vf))) => {
                         if vf.data.is_empty() { continue; }
                         bytes_since_report += vf.data.len() as u64;
-                        let _ = decode_tx.send(DecodeJob { data: vf.data });
+                        let _ = decode_tx.send(DecodeJob { data: vf.data, codec: vf.codec });
                     }
                     Some(Ok(Message::AudioChunk(ac))) => {
                         bytes_since_report += ac.data.len() as u64;
@@ -410,16 +422,23 @@ fn audio_playback_thread(rx: std::sync::mpsc::Receiver<AudioJob>) {
     tracing::info!("Audio playback thread exiting");
 }
 
-/// Dedicated decode thread - dav1d decode + YUV→pixel conversion.
+/// Dedicated decode thread - video decoder (AV1/VP9/VP8/H.265/H.264) + YUV→pixel conversion.
 /// Runs independently of the network task so input is never blocked.
 fn decode_thread(
     rx: std::sync::mpsc::Receiver<DecodeJob>,
     display_tx: mpsc::UnboundedSender<ServerEvent>,
+    negotiated_codec: Option<VideoCodec>,
 ) {
-    let mut decoder = match termland_codec::Av1Decoder::new() {
+    // Build the decoder for the codec the server negotiated. If the server
+    // didn't announce one (older server), auto-detect across all codecs.
+    let build = |codec: Option<VideoCodec>| match codec {
+        Some(c) => termland_codec::VideoDecoder::for_codec(c),
+        None => termland_codec::VideoDecoder::new(),
+    };
+    let mut decoder = match build(negotiated_codec) {
         Ok(d) => d,
         Err(e) => {
-            tracing::error!("dav1d init: {e}");
+            tracing::error!("video decoder init: {e}");
             return;
         }
     };
@@ -427,12 +446,23 @@ fn decode_thread(
     let mut count: u64 = 0;
 
     while let Ok(job) = rx.recv() {
+        // If the server switched codec mid-stream (e.g. encoder reinit after a
+        // resize landed on a different backend), rebuild the decoder to match.
+        if let Some(c) = job.codec {
+            if c != decoder.codec() {
+                tracing::info!("Stream codec changed to {c}, rebuilding decoder");
+                match termland_codec::VideoDecoder::for_codec(c) {
+                    Ok(d) => decoder = d,
+                    Err(e) => { tracing::error!("rebuild decoder for {c}: {e}"); continue; }
+                }
+            }
+        }
         match decoder.decode(&job.data) {
             Ok((w, h, pixels)) => {
                 let _ = display_tx.send(ServerEvent::Frame { width: w, height: h, pixels });
                 count += 1;
                 if count == 1 {
-                    tracing::info!("First AV1 frame decoded ({})", decoder.backend());
+                    tracing::info!("First frame decoded (backend: {}) - {}x{}", decoder.backend(), w, h);
                 }
             }
             Err(termland_codec::decoder::DecoderError::NoFrame) => {}

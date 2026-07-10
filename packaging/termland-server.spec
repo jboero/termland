@@ -8,12 +8,12 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.3.1
+%global version 0.4.0
 
 Name:           termland-server
 Version:        %{version}
 Release:        1%{?dist}
-Summary:        Termland remote desktop server — stream Wayland sessions via AV1/Opus
+Summary:        Termland remote desktop server — stream Wayland sessions via AV1/VP9/HEVC/H.264/Opus
 
 License:        LGPL-3.0-or-later
 URL:            https://github.com/jboero/termland
@@ -159,6 +159,18 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Fri Jul 10 2026 John Boero - 0.4.0-1
+- v0.4.0 release
+- Multi-codec video with automatic fallback: AV1, VP9, VP8, H.265/HEVC, H.264
+- Codec negotiation: client advertises decodable codecs in SessionCreate;
+  server picks the best its hardware supports and announces it in SessionReady;
+  every VideoFrame is codec-tagged (backward compatible with older peers)
+- Encoder/decoder probe is hardware-first (open-source codecs first within each
+  tier), so GPUs without AV1 encode (e.g. Volta/GV100) use hardware HEVC/H.264
+  instead of falling back to software AV1
+- Decoder skips the Intel QSV backend ahead of CUVID/VA-API/V4L2 to avoid
+  wasting the opening frames on a doomed QSV context on non-Intel systems
+
 * Wed Apr 15 2026 John Boero - 0.3.0-1
 - v0.3.0 release
 - AV1 video encoding (QSV/NVENC/AMF/VA-API/SVT-AV1 auto-detect)

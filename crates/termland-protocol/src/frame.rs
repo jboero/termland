@@ -125,6 +125,7 @@ mod tests {
             frame_type: crate::FrameType::Keyframe,
             width: 1920,
             height: 1080,
+            codec: Some(crate::VideoCodec::Av1),
             data: vec![0xDE, 0xAD, 0xBE, 0xEF],
         });
 

@@ -1,4 +1,5 @@
 use thiserror::Error;
+use termland_protocol::VideoCodec;
 
 #[derive(Debug, Error)]
 pub enum DecoderError {
@@ -10,20 +11,74 @@ pub enum DecoderError {
     NoFrame,
 }
 
-/// Which decoder backend is in use.
+/// Which video decoder backend is in use.
+/// Priority order (open-source first):
+/// 1. AV1 (hardware) → AV1 (software)
+/// 2. VP9 (hardware) → VP9 (software)
+/// 3. VP8 (hardware) → VP8 (software)
+/// 4. H.265/HEVC (hardware) → H.265 (software)
+/// 5. H.264/AVC (hardware) → H.264 (software)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderBackend {
+    // AV1
     IntelQsv,
     NvidiaCuvid,
     Dav1d,
+    
+    // VP9
+    Vp9Vaapi,
+    Vp9V4l2m2m,
+    LibvpxVp9,
+    
+    // VP8
+    Vp8V4l2m2m,
+    Libvpx,
+    
+    // H.265/HEVC
+    HevcQsv,
+    HevcCuvid,
+    HevcVaapi,
+    HevcV4l2m2m,
+    Libx265,
+    
+    // H.264
+    H264Qsv,
+    H264Cuvid,
+    H264Vaapi,
+    H264V4l2m2m,
+    Libx264,
 }
 
 impl std::fmt::Display for DecoderBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IntelQsv => write!(f, "Intel QSV (av1_qsv)"),
-            Self::NvidiaCuvid => write!(f, "NVIDIA CUVID (av1_cuvid)"),
-            Self::Dav1d => write!(f, "dav1d (software)"),
+            // AV1
+            DecoderBackend::IntelQsv => write!(f, "Intel QSV (av1_qsv)"),
+            DecoderBackend::NvidiaCuvid => write!(f, "NVIDIA CUVID (av1_cuvid)"),
+            DecoderBackend::Dav1d => write!(f, "dav1d (software)"),
+            
+            // VP9
+            DecoderBackend::Vp9Vaapi => write!(f, "VA-API (vp9_vaapi)"),
+            DecoderBackend::Vp9V4l2m2m => write!(f, "v4l2m2m (vp9_v4l2m2m)"),
+            DecoderBackend::LibvpxVp9 => write!(f, "libvpx-vp9 (software)"),
+            
+            // VP8
+            DecoderBackend::Vp8V4l2m2m => write!(f, "v4l2m2m (vp8_v4l2m2m)"),
+            DecoderBackend::Libvpx => write!(f, "libvpx (vp8, software)"),
+            
+            // H.265
+            DecoderBackend::HevcQsv => write!(f, "Intel QSV (hevc_qsv)"),
+            DecoderBackend::HevcCuvid => write!(f, "NVIDIA CUVID (hevc_cuvid)"),
+            DecoderBackend::HevcVaapi => write!(f, "VA-API (hevc_vaapi)"),
+            DecoderBackend::HevcV4l2m2m => write!(f, "v4l2m2m (hevc_v4l2m2m)"),
+            DecoderBackend::Libx265 => write!(f, "libx265 (software)"),
+            
+            // H.264
+            DecoderBackend::H264Qsv => write!(f, "Intel QSV (h264_qsv)"),
+            DecoderBackend::H264Cuvid => write!(f, "NVIDIA CUVID (h264_cuvid)"),
+            DecoderBackend::H264Vaapi => write!(f, "VA-API (h264_vaapi)"),
+            DecoderBackend::H264V4l2m2m => write!(f, "v4l2m2m (h264_v4l2m2m)"),
+            DecoderBackend::Libx264 => write!(f, "libx264 (software)"),
         }
     }
 }
@@ -31,26 +86,119 @@ impl std::fmt::Display for DecoderBackend {
 impl DecoderBackend {
     fn codec_name(&self) -> &'static str {
         match self {
-            Self::IntelQsv => "av1_qsv",
-            Self::NvidiaCuvid => "av1_cuvid",
-            Self::Dav1d => "libdav1d",
+            // AV1
+            DecoderBackend::IntelQsv => "av1_qsv",
+            DecoderBackend::NvidiaCuvid => "av1_cuvid",
+            DecoderBackend::Dav1d => "libdav1d",
+            
+            // VP9
+            DecoderBackend::Vp9Vaapi => "vp9_vaapi",
+            DecoderBackend::Vp9V4l2m2m => "vp9_v4l2m2m",
+            DecoderBackend::LibvpxVp9 => "libvpx-vp9",
+            
+            // VP8
+            DecoderBackend::Vp8V4l2m2m => "vp8_v4l2m2m",
+            DecoderBackend::Libvpx => "libvpx",
+            
+            // H.265
+            DecoderBackend::HevcQsv => "hevc_qsv",
+            DecoderBackend::HevcCuvid => "hevc_cuvid",
+            DecoderBackend::HevcVaapi => "hevc_vaapi",
+            DecoderBackend::HevcV4l2m2m => "hevc_v4l2m2m",
+            DecoderBackend::Libx265 => "libx265",
+            
+            // H.264
+            DecoderBackend::H264Qsv => "h264_qsv",
+            DecoderBackend::H264Cuvid => "h264_cuvid",
+            DecoderBackend::H264Vaapi => "h264_vaapi",
+            DecoderBackend::H264V4l2m2m => "h264_v4l2m2m",
+            DecoderBackend::Libx264 => "libx264",
+        }
+    }
+
+    /// The wire codec this backend decodes.
+    pub fn codec(&self) -> VideoCodec {
+        match self {
+            DecoderBackend::IntelQsv
+            | DecoderBackend::NvidiaCuvid
+            | DecoderBackend::Dav1d => VideoCodec::Av1,
+
+            DecoderBackend::Vp9Vaapi
+            | DecoderBackend::Vp9V4l2m2m
+            | DecoderBackend::LibvpxVp9 => VideoCodec::Vp9,
+
+            DecoderBackend::Vp8V4l2m2m
+            | DecoderBackend::Libvpx => VideoCodec::Vp8,
+
+            DecoderBackend::HevcQsv
+            | DecoderBackend::HevcCuvid
+            | DecoderBackend::HevcVaapi
+            | DecoderBackend::HevcV4l2m2m
+            | DecoderBackend::Libx265 => VideoCodec::H265,
+
+            DecoderBackend::H264Qsv
+            | DecoderBackend::H264Cuvid
+            | DecoderBackend::H264Vaapi
+            | DecoderBackend::H264V4l2m2m
+            | DecoderBackend::Libx264 => VideoCodec::H264,
         }
     }
 }
 
-/// Backends to try, in priority order.
+/// Backends to try, in priority order (used by `new()` auto-detect; with a
+/// negotiated codec, `for_codec` filters this to a single codec's backends).
+///
+/// Priority: hardware before software; within each tier, open-source codecs
+/// first then patent-encumbered. Intel QSV decoders are placed *after* the
+/// other hardware backends of the same codec: QSV opens successfully even with
+/// no Intel GPU present and only fails on the first packet, whereas CUVID /
+/// VA-API / V4L2 fail cleanly at init — so trying them first avoids wasting the
+/// opening frames on a doomed QSV context (e.g. on an NVIDIA-only box).
 const BACKEND_PRIORITY: &[DecoderBackend] = &[
-    DecoderBackend::IntelQsv,
+    // --- Hardware decoders (open-source codecs first) ---
+    // AV1 HW
     DecoderBackend::NvidiaCuvid,
+    DecoderBackend::IntelQsv,
+    // VP9 HW
+    DecoderBackend::Vp9Vaapi,
+    DecoderBackend::Vp9V4l2m2m,
+    // VP8 HW
+    DecoderBackend::Vp8V4l2m2m,
+    // H.265/HEVC HW (patent-encumbered)
+    DecoderBackend::HevcCuvid,
+    DecoderBackend::HevcVaapi,
+    DecoderBackend::HevcV4l2m2m,
+    DecoderBackend::HevcQsv,
+    // H.264 HW (patent-encumbered)
+    DecoderBackend::H264Cuvid,
+    DecoderBackend::H264Vaapi,
+    DecoderBackend::H264V4l2m2m,
+    DecoderBackend::H264Qsv,
+
+    // --- Software decoders (open-source codecs first) ---
     DecoderBackend::Dav1d,
+    DecoderBackend::LibvpxVp9,
+    DecoderBackend::Libvpx,
+    DecoderBackend::Libx265,
+    DecoderBackend::Libx264,
 ];
 
-/// AV1 decoder using FFmpeg hardware decoders with automatic fallback.
+struct SendScaler(ffmpeg_next::software::scaling::Context);
+unsafe impl Send for SendScaler {}
+impl std::ops::Deref for SendScaler {
+    type Target = ffmpeg_next::software::scaling::Context;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl std::ops::DerefMut for SendScaler {
+    fn deref_mut(&mut self) -> &mut ffmpeg_next::software::scaling::Context { &mut self.0 }
+}
+
+/// Video decoder using FFmpeg with automatic codec detection and fallback.
+/// Supports AV1, VP9, VP8, H.265, and H.264.
 ///
-/// Because FFmpeg decoders don't always fail cleanly at init time, we verify
-/// the decoder works by decoding the first packet. If that fails, we fall
-/// back to the next backend in the priority list.
-pub struct Av1Decoder {
+/// The decoder auto-detects the codec from the bitstream and falls back to
+/// the next backend in the priority list if decoding fails.
+pub struct VideoDecoder {
     backend: DecoderBackend,
     decoder: ffmpeg_next::decoder::Video,
     scaler: Option<SendScaler>,
@@ -63,36 +211,48 @@ pub struct Av1Decoder {
     /// Have we successfully decoded at least one frame? Once true, we trust
     /// this backend and won't fall back on transient errors.
     confirmed_working: bool,
+    /// When set (via codec negotiation), only backends decoding this codec are
+    /// considered — both at init and during fallback. `None` = try any codec.
+    codec_filter: Option<VideoCodec>,
 }
 
-struct SendScaler(ffmpeg_next::software::scaling::Context);
-unsafe impl Send for SendScaler {}
-impl std::ops::Deref for SendScaler {
-    type Target = ffmpeg_next::software::scaling::Context;
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-impl std::ops::DerefMut for SendScaler {
-    fn deref_mut(&mut self) -> &mut ffmpeg_next::software::scaling::Context { &mut self.0 }
-}
-
-impl Av1Decoder {
-    /// Create a new AV1 decoder, probing hardware first. The first backend
-    /// that can be initialized is returned; if it later fails to decode,
-    /// we'll transparently fall back to the next one.
+impl VideoDecoder {
+    /// Create a new video decoder, probing for the best available backend
+    /// across all codecs. Use this only when the codec is unknown (e.g. an
+    /// older server that doesn't announce one). If it later fails to decode,
+    /// we transparently fall back to the next backend in the priority list.
     pub fn new() -> Result<Self, DecoderError> {
         ffmpeg_next::init().map_err(|e| DecoderError::InitFailed(format!("ffmpeg: {e}")))?;
-        Self::init_from_index(0, Vec::new())
+        Self::init_from_index(0, Vec::new(), None)
     }
 
-    fn init_from_index(start: usize, failed: Vec<DecoderBackend>) -> Result<Self, DecoderError> {
+    /// Create a decoder for a specific negotiated codec. Only backends that
+    /// decode `codec` are probed, so a VP9 stream never gets fed to an AV1 or
+    /// H.264 decoder. Falls back among that codec's backends (HW → SW) if one
+    /// fails at runtime.
+    pub fn for_codec(codec: VideoCodec) -> Result<Self, DecoderError> {
+        ffmpeg_next::init().map_err(|e| DecoderError::InitFailed(format!("ffmpeg: {e}")))?;
+        Self::init_from_index(0, Vec::new(), Some(codec))
+    }
+
+    fn init_from_index(
+        start: usize,
+        failed: Vec<DecoderBackend>,
+        codec_filter: Option<VideoCodec>,
+    ) -> Result<Self, DecoderError> {
         for (idx, backend) in BACKEND_PRIORITY.iter().enumerate().skip(start) {
             if failed.contains(backend) {
                 continue;
             }
-            tracing::info!("Probing AV1 decoder: {backend}...");
+            if let Some(codec) = codec_filter {
+                if backend.codec() != codec {
+                    continue;
+                }
+            }
+            tracing::info!("Probing video decoder: {backend}...");
             match Self::open_codec(*backend) {
                 Ok(decoder) => {
-                    tracing::info!("Selected AV1 decoder: {backend}");
+                    tracing::info!("Selected video decoder: {backend}");
                     return Ok(Self {
                         backend: *backend,
                         decoder,
@@ -102,12 +262,16 @@ impl Av1Decoder {
                         backend_index: idx,
                         failed_backends: failed,
                         confirmed_working: false,
+                        codec_filter,
                     });
                 }
                 Err(e) => tracing::debug!("  {backend}: {e}"),
             }
         }
-        Err(DecoderError::InitFailed("no AV1 decoder available".into()))
+        Err(DecoderError::InitFailed(match codec_filter {
+            Some(c) => format!("no {c} decoder available"),
+            None => "no video decoder available".into(),
+        }))
     }
 
     fn open_codec(backend: DecoderBackend) -> Result<ffmpeg_next::decoder::Video, DecoderError> {
@@ -123,7 +287,12 @@ impl Av1Decoder {
         self.backend
     }
 
-    /// Decode an AV1 packet. Returns (width, height, pixels).
+    /// The codec the current backend decodes.
+    pub fn codec(&self) -> VideoCodec {
+        self.backend.codec()
+    }
+
+    /// Decode a video packet (AV1, VP9, VP8, H.265, or H.264). Returns (width, height, pixels).
     ///
     /// On repeated decode errors with an unconfirmed backend, automatically
     /// falls back to the next decoder in the priority list.
@@ -199,7 +368,7 @@ impl Av1Decoder {
     }
 
     /// Reinitialize the current backend (same codec) and retry. Used when a
-    /// confirmed-working decoder chokes — typically because a keyframe arrived
+    /// confirmed-working decoder chokes - typically because a keyframe arrived
     /// with new dimensions and the internal parser is still bound to the old
     /// SPS. CUVID in particular throws CUDA_ERROR_UNKNOWN from
     /// cuvidParseVideoData in this case. A fresh codec context re-parses the
@@ -271,7 +440,7 @@ impl Av1Decoder {
         let mut failed = std::mem::take(&mut self.failed_backends);
         failed.push(self.backend);
         let next_index = self.backend_index + 1;
-        let new_decoder = Self::init_from_index(next_index, failed)?;
+        let new_decoder = Self::init_from_index(next_index, failed, self.codec_filter)?;
         *self = new_decoder;
         self.decode(data)
     }

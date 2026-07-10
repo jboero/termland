@@ -33,8 +33,8 @@ fn main() {
         ..Default::default()
     };
 
-    // Probe encoder
-    let mut encoder = match probe_best_encoder(&config) {
+    // Probe encoder (no codec restriction - accept any available backend)
+    let mut encoder = match probe_best_encoder(&config, &[]) {
         Ok(enc) => enc,
         Err(e) => {
             eprintln!("No encoder available: {e}");
@@ -98,8 +98,8 @@ fn main() {
     }
 
     // Now try decoding
-    println!("\nDecoding with dav1d...");
-    let mut decoder = match Av1Decoder::new() {
+    println!("\nDecoding with VideoDecoder (AV1/VP9/VP8/H.265/H.264)...");
+    let mut decoder = match termland_codec::VideoDecoder::new() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Decoder init failed: {e}");

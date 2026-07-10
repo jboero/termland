@@ -1,4 +1,5 @@
 use thiserror::Error;
+use termland_protocol::VideoCodec;
 
 #[derive(Debug, Error)]
 pub enum EncoderError {
@@ -10,25 +11,115 @@ pub enum EncoderError {
     EncodeFailed(String),
 }
 
-/// Which AV1 encoder backend is in use.
+/// Which video encoder backend is in use.
+/// Priority order (best to worst):
+/// 1. AV1 (modern, efficient)
+/// 2. VP9 (open source, good compression)
+/// 3. VP8 (open source, widely supported)
+/// 4. H.265/HEVC (patent-encumbered, good compression)
+/// 5. H.264/AVC (patent-encumbered, universal support)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderBackend {
+    // AV1 backends
     IntelQsv,
     NvidiaEnc,
     AmdAmf,
     AmdVaapi,
     SvtAv1,
+    
+    // VP9 backends (open source priority)
+    Vp9Vaapi,
+    Vp9V4l2m2m,
+    SvtVp9,
+    
+    // VP8 backends (open source priority)
+    Vp8V4l2m2m,
+    Vp8Libvpx,
+    
+    // H.265/HEVC backends
+    H265Qsv,
+    H265Nvenc,
+    H265Amf,
+    H265Vaapi,
+    H265V4l2m2m,
+    Libx265,
+    
+    // H.264 backends (last resort)
+    H264Qsv,
+    H264Nvenc,
+    H264Amf,
+    H264Vaapi,
+    H264V4l2m2m,
+    Libx264,
 }
 
 impl EncoderBackend {
     /// FFmpeg encoder name for this backend.
     fn codec_name(&self) -> &'static str {
         match self {
-            Self::IntelQsv => "av1_qsv",
-            Self::NvidiaEnc => "av1_nvenc",
-            Self::AmdAmf => "av1_amf",
-            Self::AmdVaapi => "av1_vaapi",
-            Self::SvtAv1 => "libsvtav1",
+            // AV1
+            EncoderBackend::IntelQsv => "av1_qsv",
+            EncoderBackend::NvidiaEnc => "av1_nvenc",
+            EncoderBackend::AmdAmf => "av1_amf",
+            EncoderBackend::AmdVaapi => "av1_vaapi",
+            EncoderBackend::SvtAv1 => "libsvtav1",
+            
+            // VP9
+            EncoderBackend::Vp9Vaapi => "vp9_vaapi",
+            EncoderBackend::Vp9V4l2m2m => "vp9_v4l2m2m",
+            EncoderBackend::SvtVp9 => "libvpx-vp9",
+            
+            // VP8
+            EncoderBackend::Vp8V4l2m2m => "vp8_v4l2m2m",
+            EncoderBackend::Vp8Libvpx => "libvpx",
+            
+            // H.265/HEVC
+            EncoderBackend::H265Qsv => "hevc_qsv",
+            EncoderBackend::H265Nvenc => "hevc_nvenc",
+            EncoderBackend::H265Amf => "hevc_amf",
+            EncoderBackend::H265Vaapi => "hevc_vaapi",
+            EncoderBackend::H265V4l2m2m => "hevc_v4l2m2m",
+            EncoderBackend::Libx265 => "libx265",
+            
+            // H.264
+            EncoderBackend::H264Qsv => "h264_qsv",
+            EncoderBackend::H264Nvenc => "h264_nvenc",
+            EncoderBackend::H264Amf => "h264_amf",
+            EncoderBackend::H264Vaapi => "h264_vaapi",
+            EncoderBackend::H264V4l2m2m => "h264_v4l2m2m",
+            EncoderBackend::Libx264 => "libx264",
+        }
+    }
+
+    /// The wire codec produced by this backend.
+    pub fn codec(&self) -> VideoCodec {
+        match self {
+            EncoderBackend::IntelQsv
+            | EncoderBackend::NvidiaEnc
+            | EncoderBackend::AmdAmf
+            | EncoderBackend::AmdVaapi
+            | EncoderBackend::SvtAv1 => VideoCodec::Av1,
+
+            EncoderBackend::Vp9Vaapi
+            | EncoderBackend::Vp9V4l2m2m
+            | EncoderBackend::SvtVp9 => VideoCodec::Vp9,
+
+            EncoderBackend::Vp8V4l2m2m
+            | EncoderBackend::Vp8Libvpx => VideoCodec::Vp8,
+
+            EncoderBackend::H265Qsv
+            | EncoderBackend::H265Nvenc
+            | EncoderBackend::H265Amf
+            | EncoderBackend::H265Vaapi
+            | EncoderBackend::H265V4l2m2m
+            | EncoderBackend::Libx265 => VideoCodec::H265,
+
+            EncoderBackend::H264Qsv
+            | EncoderBackend::H264Nvenc
+            | EncoderBackend::H264Amf
+            | EncoderBackend::H264Vaapi
+            | EncoderBackend::H264V4l2m2m
+            | EncoderBackend::Libx264 => VideoCodec::H264,
         }
     }
 }
@@ -36,11 +127,37 @@ impl EncoderBackend {
 impl std::fmt::Display for EncoderBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IntelQsv => write!(f, "Intel QSV (av1_qsv)"),
-            Self::NvidiaEnc => write!(f, "NVIDIA NVENC (av1_nvenc)"),
-            Self::AmdAmf => write!(f, "AMD AMF (av1_amf)"),
-            Self::AmdVaapi => write!(f, "VA-API (av1_vaapi)"),
-            Self::SvtAv1 => write!(f, "SVT-AV1 (libsvtav1, software)"),
+            // AV1
+            EncoderBackend::IntelQsv => write!(f, "Intel QSV (av1_qsv)"),
+            EncoderBackend::NvidiaEnc => write!(f, "NVIDIA NVENC (av1_nvenc)"),
+            EncoderBackend::AmdAmf => write!(f, "AMD AMF (av1_amf)"),
+            EncoderBackend::AmdVaapi => write!(f, "VA-API (av1_vaapi)"),
+            EncoderBackend::SvtAv1 => write!(f, "SVT-AV1 (libsvtav1, software)"),
+            
+            // VP9
+            EncoderBackend::Vp9Vaapi => write!(f, "VA-API (vp9_vaapi)"),
+            EncoderBackend::Vp9V4l2m2m => write!(f, "v4l2m2m (vp9_v4l2m2m)"),
+            EncoderBackend::SvtVp9 => write!(f, "SVT-VP9 (libvpx-vp9, software)"),
+            
+            // VP8
+            EncoderBackend::Vp8V4l2m2m => write!(f, "v4l2m2m (vp8_v4l2m2m)"),
+            EncoderBackend::Vp8Libvpx => write!(f, "libvpx (vp8, software)"),
+            
+            // H.265
+            EncoderBackend::H265Qsv => write!(f, "Intel QSV (hevc_qsv)"),
+            EncoderBackend::H265Nvenc => write!(f, "NVIDIA NVENC (hevc_nvenc)"),
+            EncoderBackend::H265Amf => write!(f, "AMD AMF (hevc_amf)"),
+            EncoderBackend::H265Vaapi => write!(f, "VA-API (hevc_vaapi)"),
+            EncoderBackend::H265V4l2m2m => write!(f, "v4l2m2m (hevc_v4l2m2m)"),
+            EncoderBackend::Libx265 => write!(f, "libx265 (software)"),
+            
+            // H.264
+            EncoderBackend::H264Qsv => write!(f, "Intel QSV (h264_qsv)"),
+            EncoderBackend::H264Nvenc => write!(f, "NVIDIA NVENC (h264_nvenc)"),
+            EncoderBackend::H264Amf => write!(f, "AMD AMF (h264_amf)"),
+            EncoderBackend::H264Vaapi => write!(f, "VA-API (h264_vaapi)"),
+            EncoderBackend::H264V4l2m2m => write!(f, "v4l2m2m (h264_v4l2m2m)"),
+            EncoderBackend::Libx264 => write!(f, "libx264 (software)"),
         }
     }
 }
@@ -84,8 +201,8 @@ pub struct EncodedFrame {
     pub timestamp_us: u64,
 }
 
-/// Trait for AV1 encoding backends.
-pub trait Av1Encoder: Send {
+/// Trait for video encoding backends.
+pub trait VideoEncoder: Send {
     fn backend(&self) -> EncoderBackend;
 
     /// Encode an RGBA frame. Returns all available encoded packets
@@ -112,8 +229,8 @@ impl std::ops::DerefMut for SendScaler {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
 }
 
-/// FFmpeg-based AV1 encoder. Works with any backend (HW or SW).
-pub struct FfmpegAv1Encoder {
+/// FFmpeg-based encoder. Works with any backend (HW or SW).
+pub struct FfmpegVideoEncoder {
     backend: EncoderBackend,
     encoder: ffmpeg_next::encoder::Video,
     converter: SendScaler,
@@ -122,7 +239,7 @@ pub struct FfmpegAv1Encoder {
     config: EncoderConfig,
 }
 
-impl FfmpegAv1Encoder {
+impl FfmpegVideoEncoder {
     fn new(backend: EncoderBackend, config: &EncoderConfig) -> Result<Self, EncoderError> {
         let codec_name = backend.codec_name();
 
@@ -137,8 +254,22 @@ impl FfmpegAv1Encoder {
         // Hardware encoders need NV12, software uses YUV420P
         let is_hw = matches!(
             backend,
-            EncoderBackend::IntelQsv | EncoderBackend::NvidiaEnc |
-            EncoderBackend::AmdAmf | EncoderBackend::AmdVaapi
+            EncoderBackend::IntelQsv
+            | EncoderBackend::NvidiaEnc
+            | EncoderBackend::AmdAmf
+            | EncoderBackend::AmdVaapi
+            | EncoderBackend::Vp9Vaapi
+            | EncoderBackend::Vp8V4l2m2m
+            | EncoderBackend::H265Qsv
+            | EncoderBackend::H265Nvenc
+            | EncoderBackend::H265Amf
+            | EncoderBackend::H265Vaapi
+            | EncoderBackend::H265V4l2m2m
+            | EncoderBackend::H264Qsv
+            | EncoderBackend::H264Nvenc
+            | EncoderBackend::H264Amf
+            | EncoderBackend::H264Vaapi
+            | EncoderBackend::H264V4l2m2m
         );
         let pixel_fmt = if is_hw {
             ffmpeg_next::format::Pixel::NV12
@@ -155,19 +286,14 @@ impl FfmpegAv1Encoder {
         // Backend-specific tuning
         let mut opts = ffmpeg_next::Dictionary::new();
         match backend {
+            // AV1 tuning
             EncoderBackend::SvtAv1 => {
-                // Preset: user override OR our default (10)
                 let preset = config.preset.as_deref().unwrap_or("10");
                 opts.set("preset", preset);
 
-                // CRF: user override OR our default (35)
                 let crf = config.crf.map(|c| c.to_string()).unwrap_or_else(|| "35".to_string());
                 opts.set("crf", &crf);
 
-                // svtav1-params: mandatory low-delay setting + any user extras.
-                // `pred-struct=1` selects the low-delay B prediction structure,
-                // which implies no lookahead. SVT-AV1 v3+ removed the `lad`
-                // alias, so we rely on pred-struct alone for low-latency.
                 let mut svt_params = String::from("pred-struct=1");
                 if let Some(extra) = &config.extra_svt_params {
                     if !extra.is_empty() {
@@ -204,6 +330,89 @@ impl FfmpegAv1Encoder {
                     opts.set("preset", preset);
                 }
             }
+
+            // VP9 tuning (SVT-VP9)
+            EncoderBackend::SvtVp9 => {
+                let preset = config.preset.as_deref().unwrap_or("8");
+                opts.set("preset", preset);
+
+                let crf = config.crf.map(|c| c.to_string()).unwrap_or_else(|| "35".to_string());
+                opts.set("crf", &crf);
+                encoder.set_max_b_frames(0);
+
+                tracing::info!("SVT-VP9 tuning: preset={preset} crf={crf}");
+            }
+
+            // H.265/HEVC tuning
+            EncoderBackend::H265Qsv => {
+                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                let preset = config.preset.as_deref().unwrap_or("veryfast");
+                opts.set("preset", preset);
+                opts.set("look_ahead", "0");
+                opts.set("async_depth", "1");
+                encoder.set_max_b_frames(0);
+                tracing::info!("QSV HEVC tuning: preset={preset}");
+            }
+            EncoderBackend::H265Nvenc => {
+                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                let preset = config.preset.as_deref().unwrap_or("p1");
+                opts.set("preset", preset);
+                opts.set("tune", "ull");
+                opts.set("rc", "cbr");
+                tracing::info!("NVENC HEVC tuning: preset={preset}");
+            }
+            EncoderBackend::H265Amf | EncoderBackend::H265Vaapi | EncoderBackend::H265V4l2m2m => {
+                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                if let Some(preset) = &config.preset {
+                    opts.set("preset", preset);
+                }
+            }
+            EncoderBackend::Libx265 => {
+                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                let preset = config.preset.as_deref().unwrap_or("fast");
+                opts.set("preset", preset);
+                let crf = config.crf.map(|c| c.to_string()).unwrap_or_else(|| "23".to_string());
+                opts.set("crf", &crf);
+                tracing::info!("libx265 tuning: preset={preset} crf={crf}");
+            }
+
+            // H.264 tuning
+            EncoderBackend::H264Qsv => {
+                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                let preset = config.preset.as_deref().unwrap_or("veryfast");
+                opts.set("preset", preset);
+                opts.set("look_ahead", "0");
+                opts.set("async_depth", "1");
+                encoder.set_max_b_frames(0);
+                tracing::info!("QSV H.264 tuning: preset={preset}");
+            }
+            EncoderBackend::H264Nvenc => {
+                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                let preset = config.preset.as_deref().unwrap_or("p1");
+                opts.set("preset", preset);
+                opts.set("tune", "ull");
+                opts.set("rc", "cbr");
+                tracing::info!("NVENC H.264 tuning: preset={preset}");
+            }
+            EncoderBackend::H264Amf | EncoderBackend::H264Vaapi | EncoderBackend::H264V4l2m2m => {
+                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                if let Some(preset) = &config.preset {
+                    opts.set("preset", preset);
+                }
+            }
+            EncoderBackend::Libx264 => {
+                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                let preset = config.preset.as_deref().unwrap_or("fast");
+                opts.set("preset", preset);
+                let crf = config.crf.map(|c| c.to_string()).unwrap_or_else(|| "23".to_string());
+                opts.set("crf", &crf);
+                tracing::info!("libx264 tuning: preset={preset} crf={crf}");
+            }
+
+            // VP8 and other backends with generic settings
+            _ => {
+                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+            }
         }
 
         let encoder = encoder.open_with(opts).map_err(|e| {
@@ -222,7 +431,7 @@ impl FfmpegAv1Encoder {
         )
         .map_err(|e| EncoderError::InitFailed(format!("create scaler: {e}")))?);
 
-        tracing::info!("AV1 encoder initialized: {backend} @ {}x{} fmt={pixel_fmt:?}",
+        tracing::info!("Video encoder initialized: {backend} @ {}x{} fmt={pixel_fmt:?}",
             config.width, config.height);
 
         Ok(Self {
@@ -236,7 +445,7 @@ impl FfmpegAv1Encoder {
     }
 }
 
-impl Av1Encoder for FfmpegAv1Encoder {
+impl VideoEncoder for FfmpegVideoEncoder {
     fn backend(&self) -> EncoderBackend {
         self.backend
     }
@@ -259,14 +468,7 @@ impl Av1Encoder for FfmpegAv1Encoder {
             )));
         }
 
-        // Create RGBA input frame. ffmpeg_next::Video::new() calls
-        // av_frame_get_buffer(align=32) internally, so each row is padded
-        // to a 32-byte boundary for SIMD. For widths whose `w*4` is not
-        // already a multiple of 32 (e.g. 1250 → 5000 bytes → padded to
-        // 5024), the destination stride is LARGER than the source row
-        // width and a flat copy_from_slice diagonally wraps every row.
-        //
-        // We have to copy row-by-row using the frame's actual stride.
+        // Create RGBA input frame
         let mut rgba_frame = ffmpeg_next::frame::Video::new(
             ffmpeg_next::format::Pixel::RGBA,
             w,
@@ -331,10 +533,6 @@ impl Av1Encoder for FfmpegAv1Encoder {
             EncoderError::EncodeFailed(format!("send eof: {e}"))
         })?;
 
-        // Drain until EOF. SVT-AV1 returns EAGAIN while it's still processing
-        // the EOS signal internally — a `while .is_ok()` loop breaks out early
-        // and triggers "deinit called without sending EOS!" on drop. Spin on
-        // EAGAIN with a short sleep and only terminate on EOF or real errors.
         let mut frames = Vec::new();
         let mut packet = ffmpeg_next::Packet::empty();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
@@ -368,24 +566,68 @@ impl Av1Encoder for FfmpegAv1Encoder {
     }
 }
 
-/// Probe available AV1 encoders and return the best one.
-/// Priority: QSV > NVENC > AMF > VA-API > SVT-AV1.
-pub fn probe_best_encoder(config: &EncoderConfig) -> Result<Box<dyn Av1Encoder>, EncoderError> {
+/// Probe available video encoders and return the best one.
+/// Priority (open-source first, then patent-encumbered):
+/// 1. AV1 (hardware) → AV1 (SVT-AV1 software)
+/// 2. VP9 (hardware) → VP9 (SVT-VP9 software)
+/// 3. VP8 (hardware) → VP8 (libvpx software)
+/// 4. H.265/HEVC (patent-encumbered, last resort)
+/// 5. H.264/AVC (patent-encumbered, universal, last of last)
+///
+/// `allowed` restricts the search to codecs the client advertised it can
+/// decode (codec negotiation). An empty slice means "no restriction".
+pub fn probe_best_encoder(
+    config: &EncoderConfig,
+    allowed: &[VideoCodec],
+) -> Result<Box<dyn VideoEncoder>, EncoderError> {
     ffmpeg_next::init().map_err(|e| EncoderError::InitFailed(format!("ffmpeg init: {e}")))?;
 
+    // Priority: hardware before software; within each tier, open-source codecs
+    // first (AV1 → VP9 → VP8) then patent-encumbered (H.265 → H.264). This uses
+    // whatever GPU is present (e.g. a Volta GV100's HEVC engine) before falling
+    // back to a software encoder that would otherwise always "win" the probe.
     let backends = [
+        // --- Hardware encoders (open-source codecs first) ---
+        // AV1 HW
         EncoderBackend::IntelQsv,
         EncoderBackend::NvidiaEnc,
         EncoderBackend::AmdAmf,
         EncoderBackend::AmdVaapi,
+        // VP9 HW
+        EncoderBackend::Vp9Vaapi,
+        EncoderBackend::Vp9V4l2m2m,
+        // VP8 HW
+        EncoderBackend::Vp8V4l2m2m,
+        // H.265/HEVC HW (patent-encumbered)
+        EncoderBackend::H265Qsv,
+        EncoderBackend::H265Nvenc,
+        EncoderBackend::H265Amf,
+        EncoderBackend::H265Vaapi,
+        EncoderBackend::H265V4l2m2m,
+        // H.264 HW (patent-encumbered, universal)
+        EncoderBackend::H264Qsv,
+        EncoderBackend::H264Nvenc,
+        EncoderBackend::H264Amf,
+        EncoderBackend::H264Vaapi,
+        EncoderBackend::H264V4l2m2m,
+
+        // --- Software encoders (open-source codecs first) ---
         EncoderBackend::SvtAv1,
+        EncoderBackend::SvtVp9,   // libvpx-vp9
+        EncoderBackend::Vp8Libvpx, // libvpx
+        EncoderBackend::Libx265,
+        EncoderBackend::Libx264,
     ];
 
     for backend in &backends {
-        tracing::info!("Probing AV1 encoder: {backend}...");
-        match FfmpegAv1Encoder::new(*backend, config) {
+        // Skip codecs the client can't decode (empty `allowed` = no restriction).
+        if !allowed.is_empty() && !allowed.contains(&backend.codec()) {
+            continue;
+        }
+        tracing::info!("Probing video encoder: {backend}...");
+        match FfmpegVideoEncoder::new(*backend, config) {
             Ok(enc) => {
-                tracing::info!("Selected AV1 encoder: {backend}");
+                tracing::info!("Selected video encoder: {backend} (codec {})", backend.codec());
                 return Ok(Box::new(enc));
             }
             Err(e) => {
