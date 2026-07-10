@@ -61,6 +61,9 @@ pub struct ConnectParams {
     pub encoder_preset: Option<String>,
     pub encoder_crf: Option<u8>,
     pub encoder_extra_params: Option<String>,
+    /// Force a specific codec. When set, the client advertises only this codec
+    /// so the server must encode with it; otherwise all codecs are offered.
+    pub codec: Option<termland_protocol::VideoCodec>,
 }
 
 pub async fn connect(
@@ -237,9 +240,13 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
         encoder_preset: params.encoder_preset,
         encoder_crf: params.encoder_crf,
         encoder_extra_params: params.encoder_extra_params,
-        // The client's ffmpeg-based decoder supports every codec; advertise all
-        // in preference order so the server picks the best its hardware can encode.
-        supported_codecs: termland_protocol::VideoCodec::all_preferred(),
+        // If a codec was forced, advertise only it so the server must use it;
+        // otherwise advertise all (our ffmpeg decoder handles any) in preference
+        // order so the server picks the best its hardware can encode.
+        supported_codecs: match params.codec {
+            Some(c) => vec![c],
+            None => termland_protocol::VideoCodec::all_preferred(),
+        },
     })).await?;
     let msg = framed.next().await.context("closed")?.context("decode")?;
     let negotiated_codec = match &msg {

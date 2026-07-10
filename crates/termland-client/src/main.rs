@@ -7,6 +7,21 @@ use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use tracing_subscriber::EnvFilter;
 
+/// Parse a `--codec` value into a wire codec, accepting common aliases.
+fn parse_codec(s: &str) -> Result<termland_protocol::VideoCodec, String> {
+    use termland_protocol::VideoCodec;
+    match s.to_ascii_lowercase().as_str() {
+        "av1" => Ok(VideoCodec::Av1),
+        "vp9" => Ok(VideoCodec::Vp9),
+        "vp8" => Ok(VideoCodec::Vp8),
+        "h265" | "hevc" => Ok(VideoCodec::H265),
+        "h264" | "avc" => Ok(VideoCodec::H264),
+        other => Err(format!(
+            "unknown codec '{other}' (expected one of: av1, vp9, vp8, h265/hevc, h264/avc)"
+        )),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "termland-client", about = "Termland remote desktop client", version)]
 pub struct Args {
@@ -41,6 +56,13 @@ pub struct Args {
     /// Default 75. Typical: 90=high, 75=balanced, 50=low, 25=very low.
     #[arg(short, long, default_value = "75")]
     pub quality: u8,
+
+    /// Force a specific video codec instead of negotiating the best available.
+    /// One of: av1, vp9, vp8, h265 (aka hevc), h264 (aka avc). When set, the
+    /// server MUST encode with this codec (falling back to a software encoder
+    /// for it if no hardware is available); the session fails if it cannot.
+    #[arg(long, value_parser = parse_codec)]
+    pub codec: Option<termland_protocol::VideoCodec>,
 
     /// For --mode desktop: startup command to run inside labwc.
     /// Examples: "konsole", "startplasma-wayland", "dbus-run-session sway".

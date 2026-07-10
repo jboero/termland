@@ -262,6 +262,7 @@ impl App {
             encoder_preset: self.args.preset.clone(),
             encoder_crf: self.args.crf,
             encoder_extra_params: self.args.svt_params.clone(),
+            codec: self.args.codec,
         };
         match self.runtime.block_on(connect(&server, ssh, params)) {
             Ok((rx, tx)) => {
