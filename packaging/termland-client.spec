@@ -8,11 +8,11 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.4.1
+%global version 0.4.2
 
 Name:           termland-client
 Version:        %{version}
-Release:        2%{?dist}
+Release:        1%{?dist}
 Summary:        Termland remote desktop client — view and interact with remote Wayland sessions
 
 License:        LGPL-3.0-or-later
@@ -134,6 +134,15 @@ install -Dm644 termland-client.fish %{buildroot}%{_datadir}/fish/vendor_completi
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Fri Jul 10 2026 John Boero - 0.4.2-1
+- Fix HEVC/H.264 software decode fallback: use the native "hevc"/"h264" decoders
+  (were pointed at encoder-only libx265/libx264); a hardware decoder dying
+  mid-session now falls through to software instead of stalling
+- Add --codec to force a specific codec (av1/vp9/vp8/h265/h264), with shell
+  completion of the codec names
+- Hold Ctrl while resizing to scale the frame (local zoom) instead of resizing
+  the remote session
+
 * Fri Jul 10 2026 John Boero - 0.4.1-2
 - Build offline from vendored crate deps (COPR/mock build roots have no network)
 

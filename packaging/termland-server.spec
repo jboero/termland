@@ -8,11 +8,11 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.4.1
+%global version 0.4.2
 
 Name:           termland-server
 Version:        %{version}
-Release:        2%{?dist}
+Release:        1%{?dist}
 Summary:        Termland remote desktop server — stream Wayland sessions via AV1/VP9/HEVC/H.264/Opus
 
 License:        LGPL-3.0-or-later
@@ -173,6 +173,11 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Fri Jul 10 2026 John Boero - 0.4.2-1
+- Version bump in lockstep with the client (client-side decode/codec/UX fixes;
+  no server behavior changes)
+- Shared codec crate: fixed HEVC/H.264 software decode fallback
+
 * Fri Jul 10 2026 John Boero - 0.4.1-2
 - Build offline from vendored crate deps (COPR/mock build roots have no network)
 

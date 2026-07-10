@@ -15,6 +15,13 @@ happen before the project is suitable for outside use.
   with SVT-AV1 software fallback
 - ✅ Hardware-accelerated AV1 decode (QSV / CUVID / dav1d) with runtime
   fallback when the chosen backend fails on the first frame
+- ✅ Multi-codec video with negotiation and fallback (v0.4.x) — AV1, VP9,
+  VP8, H.265/HEVC, H.264; hardware-first probe (e.g. a Volta/GV100 without
+  AV1 encode uses its hardware HEVC), the client builds its decoder from the
+  codec the server announces and falls back to software if no hardware
+  decoder is available; `--codec` forces a specific codec
+- ✅ Ctrl-drag to scale the frame locally (zoom) instead of resizing the
+  remote session
 - ✅ cage backend for single-app kiosk sessions (`--mode app:<cmd>`)
 - ✅ labwc backend for multi-window desktop sessions (`--mode desktop`)
 - ✅ Auto-detects plasmashell when KDE is available and launches a
@@ -55,7 +62,7 @@ All v0.2 blockers have been resolved:
 - Session isolation: `setuid` into authenticated user after PAM auth
   (currently sessions run as server user)
 - GUI client rewrite: Qt6 native menubar, session manager with saved
-  profiles, connection dialog (see v0.3 stretch goals)
+  profiles, connection dialog (now folded into the v0.5 milestone below)
 
 ## v0.4 / GPU rendering + zero-copy capture
 
@@ -108,6 +115,62 @@ Replace TCP with QUIC for the video/audio data stream. Benefits:
 - 0-RTT reconnection for session resume
 - Independent streams for video, audio, and control (no priority inversion)
 - WebTransport variant enables a future browser-based client
+
+## v0.5 / Persistent sessions + Qt6 session manager
+
+X2Go/NX-style **detachable sessions**: a session keeps running on the server
+after the client disconnects, and any client can reconnect and resume it —
+plus a tray-resident Qt6 manager that lists and resumes sessions.
+
+The two halves are independent. **Session persistence is a server refactor
+and is the bulk of the milestone**; the Qt6/tray UI is comparatively small
+chrome layered on the existing Rust client engine. Keep the Rust
+codec/decode/render/input pipeline — do **not** rewrite the client in C++.
+
+### A. Server-side session persistence (the milestone)
+
+- **Decouple session lifetime from the connection.** Today
+  [`transport.rs`](crates/termland-server/src/transport.rs) spawns a
+  compositor + capture per connection and tears it down on disconnect.
+  Instead, a long-lived session daemon owns compositors in a registry keyed
+  by session id.
+- **Detach on disconnect:** keep the compositor + capture running; stop the
+  encoder stream but preserve session state.
+- **Attach / resume:** a reconnecting client attaches by session id; the
+  server reinitializes the encoder and sends a fresh keyframe so the client
+  renders immediately.
+- **SSH-subsystem implication (important):** `ssh -s … termland` spawns a
+  fresh, *stateless* server process per connection, so persistence requires a
+  background **daemon** (systemd service) that the per-connection subsystem
+  process proxies to over a local Unix socket. TCP mode embeds or proxies to
+  the same daemon.
+- **Lifecycle:** sessions live until explicitly closed (client "quit
+  session" or a server idle/timeout policy), not until disconnect.
+
+### B. Control-plane protocol for sessions
+
+- New messages to **list / create / attach / close** sessions (a small
+  extension to the `Message` enum), returning id, mode, resolution, age, and
+  codec.
+- Client caches known sessions per host to populate the resume list.
+
+### C. Qt6 tray + session manager (client chrome)
+
+- **One global systray icon** (StatusNotifierItem) for all open connections;
+  its menu lists active/resumable sessions with attach/close actions.
+- **Session manager window:** saved connection profiles, per-host session
+  list, new-session dialog. Build with **`cxx-qt`** (Rust-driven Qt6/QML) so
+  the existing decode/render/input engine stays in Rust and the viewer
+  window simply becomes "attach to session N".
+- Supersedes the deferred v0.2 "Qt6 GUI client rewrite" item, and folds in
+  the "seamless reconnect" and "foreground session observability" items from
+  the stretch list below.
+
+### Suggested order
+
+1. Session daemon + registry + detach/attach (A) — the long pole.
+2. Control-plane messages (B) — small, unblocks the UI.
+3. Tray + manager (C) — build on the working attach/resume flow.
 
 ## v0.3 / stretch
 
