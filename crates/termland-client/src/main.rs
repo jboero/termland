@@ -7,18 +7,29 @@ use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use tracing_subscriber::EnvFilter;
 
-/// Parse a `--codec` value into a wire codec, accepting common aliases.
-fn parse_codec(s: &str) -> Result<termland_protocol::VideoCodec, String> {
-    use termland_protocol::VideoCodec;
-    match s.to_ascii_lowercase().as_str() {
-        "av1" => Ok(VideoCodec::Av1),
-        "vp9" => Ok(VideoCodec::Vp9),
-        "vp8" => Ok(VideoCodec::Vp8),
-        "h265" | "hevc" => Ok(VideoCodec::H265),
-        "h264" | "avc" => Ok(VideoCodec::H264),
-        other => Err(format!(
-            "unknown codec '{other}' (expected one of: av1, vp9, vp8, h265/hevc, h264/avc)"
-        )),
+/// Video codec selectable via `--codec`. A `ValueEnum` (rather than a bare
+/// string parser) so shell completions offer the codec names as suggestions.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum CodecArg {
+    Av1,
+    Vp9,
+    Vp8,
+    #[value(name = "h265", alias = "hevc")]
+    H265,
+    #[value(name = "h264", alias = "avc")]
+    H264,
+}
+
+impl CodecArg {
+    pub fn to_wire(self) -> termland_protocol::VideoCodec {
+        use termland_protocol::VideoCodec;
+        match self {
+            CodecArg::Av1 => VideoCodec::Av1,
+            CodecArg::Vp9 => VideoCodec::Vp9,
+            CodecArg::Vp8 => VideoCodec::Vp8,
+            CodecArg::H265 => VideoCodec::H265,
+            CodecArg::H264 => VideoCodec::H264,
+        }
     }
 }
 
@@ -58,11 +69,11 @@ pub struct Args {
     pub quality: u8,
 
     /// Force a specific video codec instead of negotiating the best available.
-    /// One of: av1, vp9, vp8, h265 (aka hevc), h264 (aka avc). When set, the
-    /// server MUST encode with this codec (falling back to a software encoder
-    /// for it if no hardware is available); the session fails if it cannot.
-    #[arg(long, value_parser = parse_codec)]
-    pub codec: Option<termland_protocol::VideoCodec>,
+    /// When set, the server MUST encode with this codec (falling back to a
+    /// software encoder for it if no hardware is available); the session fails
+    /// if it cannot. Aliases: hevc = h265, avc = h264.
+    #[arg(long, value_enum)]
+    pub codec: Option<CodecArg>,
 
     /// For --mode desktop: startup command to run inside labwc.
     /// Examples: "konsole", "startplasma-wayland", "dbus-run-session sway".
