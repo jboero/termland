@@ -1,6 +1,7 @@
 mod connection;
 mod display;
 mod overlay;
+mod tray;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -88,6 +89,11 @@ pub struct Args {
     #[arg(long, value_name = "SESSION_ID")]
     pub close: Option<String>,
 
+    /// Run as a system-tray session manager for the given host (one global
+    /// icon; lists/ resumes/ closes sessions and starts new ones).
+    #[arg(long)]
+    pub tray: bool,
+
     /// For --mode desktop: startup command to run inside labwc.
     /// Examples: "konsole", "startplasma-wayland", "dbus-run-session sway".
     /// If omitted, the server auto-detects an available terminal.
@@ -171,14 +177,11 @@ fn main() -> Result<()> {
         )
         .init();
 
-    // One-shot session-management ops run without a GUI window and exit.
-    if args.list_sessions || args.close.is_some() {
+    // One-shot session-management ops (and the tray) run without a session
+    // window.
+    if args.list_sessions || args.close.is_some() || args.tray {
         use anyhow::Context;
         let server = args.server.clone().context("a server address is required")?;
-        let op = match args.close.clone() {
-            Some(id) => connection::ControlOp::Close(id),
-            None => connection::ControlOp::List,
-        };
         let params = connection::ConnectParams {
             mode: args.session_mode(),
             width: args.width,
@@ -196,6 +199,16 @@ fn main() -> Result<()> {
             encoder_extra_params: None,
             codec: None,
             attach: None,
+        };
+
+        if args.tray {
+            // Blocks until quit; runs its own refresh loop + runtime.
+            return tray::run(server, args.ssh, params);
+        }
+
+        let op = match args.close.clone() {
+            Some(id) => connection::ControlOp::Close(id),
+            None => connection::ControlOp::List,
         };
         let rt = tokio::runtime::Runtime::new()?;
         return rt.block_on(connection::run_control(&server, args.ssh, params, op));

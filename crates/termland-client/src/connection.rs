@@ -129,6 +129,21 @@ pub enum ControlOp {
     Close(String),
 }
 
+/// Fetch the list of resumable sessions (used by the tray manager).
+pub async fn fetch_sessions(
+    server: &str, ssh: bool, params: &ConnectParams,
+) -> Result<Vec<termland_protocol::SessionInfo>> {
+    let io = open_io(server, ssh, params).await?;
+    let mut framed = Framed::new(io, TermlandCodec);
+    handshake(&mut framed, params).await?;
+    framed.send(Message::SessionList(SessionList {})).await.context("send SessionList")?;
+    let resp = framed.next().await.context("closed")?.context("decode")?;
+    match resp {
+        Message::SessionListResult(r) => Ok(r.sessions),
+        other => anyhow::bail!("expected SessionListResult, got {:?}", other.message_id()),
+    }
+}
+
 /// Run a one-shot control op against the server and print the result.
 pub async fn run_control(server: &str, ssh: bool, params: ConnectParams, op: ControlOp) -> Result<()> {
     let io = open_io(server, ssh, &params).await?;

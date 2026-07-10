@@ -30,3 +30,4 @@ tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-native-certs = { workspace = true }
 whoami = { workspace = true }
+ksni = "0.3"  # pure-Rust (zbus) StatusNotifierItem; no system dbus-devel needed
