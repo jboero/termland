@@ -159,6 +159,10 @@ struct App {
     pending_resize: Option<(u32, u32, std::time::Instant)>,
     /// Last size we actually sent to the server.
     last_sent_size: Option<(u32, u32)>,
+    /// Whether Ctrl is currently held. When held during a window resize we
+    /// scale the remote frame to fit the window instead of resizing the remote
+    /// session (like a zoom), leaving the session resolution untouched.
+    scale_modifier_held: bool,
 }
 
 impl App {
@@ -179,6 +183,7 @@ impl App {
             fullscreen: false,
             pending_resize: None,
             last_sent_size: None,
+            scale_modifier_held: false,
         }
     }
 
@@ -499,10 +504,18 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                // Don't send a Resize command on every pixel while the user is
-                // dragging the edge — we just remember the latest target and flush
-                // it once the resize quiesces (see flush_pending_resize()).
-                if size.width > 0 && size.height > 0 {
+                // With Ctrl held, scale the remote frame to the window instead of
+                // resizing the remote session: skip the Resize command entirely and
+                // let render() scale the current frame to the new window size. This
+                // keeps the session resolution fixed (a local zoom).
+                if self.scale_modifier_held {
+                    // Drop any queued resize so a size captured just before Ctrl
+                    // was pressed doesn't leak through to the server.
+                    self.pending_resize = None;
+                } else if size.width > 0 && size.height > 0 {
+                    // Don't send a Resize command on every pixel while the user is
+                    // dragging the edge — remember the latest target and flush it
+                    // once the resize quiesces (see flush_pending_resize()).
                     self.pending_resize = Some((size.width, size.height, std::time::Instant::now()));
                 }
             }
@@ -518,6 +531,15 @@ impl ApplicationHandler for App {
                 // Debug: log all physical keys so we can see whether F10/F11 reach us.
                 if event.state == ElementState::Pressed && !event.repeat {
                     tracing::trace!("key press: {:?}", event.physical_key);
+                }
+
+                // Track Ctrl state for scale-on-resize. ModifiersChanged is
+                // unreliable with the shortcut inhibitor, so derive it from the
+                // key stream (which is always delivered).
+                if matches!(event.physical_key,
+                    PhysicalKey::Code(KeyCode::ControlLeft | KeyCode::ControlRight))
+                {
+                    self.scale_modifier_held = event.state == ElementState::Pressed;
                 }
 
                 // F10 toggles the menubar (hidden by default).
