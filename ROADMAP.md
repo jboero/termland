@@ -116,16 +116,33 @@ Replace TCP with QUIC for the video/audio data stream. Benefits:
 - Independent streams for video, audio, and control (no priority inversion)
 - WebTransport variant enables a future browser-based client
 
-## v0.5 / Persistent sessions + Qt6 session manager
+## v0.5 — SHIPPED (v0.5.0): Persistent sessions + tray session manager
 
-X2Go/NX-style **detachable sessions**: a session keeps running on the server
-after the client disconnects, and any client can reconnect and resume it —
-plus a tray-resident Qt6 manager that lists and resumes sessions.
+X2Go/NX-style **detachable sessions** and a global tray manager — done and
+tested on the Z840 (GV100).
 
-The two halves are independent. **Session persistence is a server refactor
-and is the bulk of the milestone**; the Qt6/tray UI is comparatively small
-chrome layered on the existing Rust client engine. Keep the Rust
-codec/decode/render/input pipeline — do **not** rewrite the client in C++.
+- ✅ **Daemon-free persistence.** Each session is a *detached* compositor
+  (`setsid` + stdio→logfile) that outlives the connection process — even a
+  stateless SSH-subsystem one — recorded in a filesystem registry at
+  `$XDG_RUNTIME_DIR/termland/sessions/<id>.session`. Any new connection reads
+  the dir to list/validate/attach; no daemon needed.
+- ✅ **Detach vs close.** Disconnect leaves the compositor running (resumable);
+  an explicit close (or `--close`) terminates it.
+- ✅ **Control protocol.** `SessionList`/`SessionListResult`/`SessionInfo`,
+  `SessionAttach`, `SessionClose`; `session_id` on `SessionReady`.
+- ✅ **Client.** `--attach <id>` resumes; `--list-sessions` / `--close`
+  manage from the CLI; `--tray` runs a global systray manager.
+- ✅ **Tray.** A StatusNotifierItem via **ksni** (pure-Rust zbus — no
+  cxx-qt/Qt6 build burden, and it satisfies the "one global icon + session
+  list" goal). Lists sessions with Resume/Close, plus New session.
+
+Verified: create session → disconnect (compositor + app keep running) → kill
+the server process (compositor survives via `setsid`) → fresh server process →
+attach resumes and decodes. Tray registers and lists live sessions.
+
+Deferred to a later pass: session-sink audio continuity across detach/attach;
+a `.desktop`/autostart entry for the tray; per-session idle-timeout policy;
+and, if ever wanted, a richer cxx-qt UI (the ksni tray covers the core need).
 
 ### A. Server-side session persistence (the milestone)
 

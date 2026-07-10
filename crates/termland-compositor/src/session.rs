@@ -1,4 +1,4 @@
-use std::process::Child;
+use std::path::Path;
 use thiserror::Error;
 
 use crate::backend::{self, detect_desktop_shell};
@@ -46,10 +46,13 @@ impl From<termland_protocol::SessionMode> for SessionMode {
     }
 }
 
-/// A compositor session. The backend (cage or labwc) is chosen based on mode.
+/// A per-connection *attachment* to a compositor session. Holds the screen
+/// capturer and output resizer, but NOT the compositor process — the compositor
+/// is spawned detached (see [`Compositor::create`]) and outlives any single
+/// attachment. Dropping this disconnects capture/input but leaves the session
+/// running; terminate the compositor explicitly via its PID.
 pub struct Compositor {
     config: CompositorConfig,
-    process: Child,
     wayland_display: String,
     capturer: Option<ScreenCapturer>,
     /// Separate Wayland client that drives zwlr_output_manager_v1 so we can
@@ -58,37 +61,53 @@ pub struct Compositor {
     resizer: Option<OutputResizer>,
     /// Name of the compositor backend for logging.
     backend_name: &'static str,
-    /// Kept alive so the compositor's stderr pipe stays drained for the
-    /// session's lifetime. Without this, children SIGPIPE and crash.
-    _stderr_drain: std::thread::JoinHandle<()>,
 }
 
 impl Compositor {
-    /// Launch the appropriate compositor for the session mode and connect
-    /// the screen capturer to it.
-    pub fn new(config: CompositorConfig) -> Result<Self, CompositorError> {
-        let (launched, backend_name) = match &config.mode {
+    /// Spawn a NEW detached compositor for `config` and attach to it. Returns
+    /// the attachment plus the detached compositor's PID (record it in the
+    /// session registry). The compositor survives this process.
+    pub fn create(config: CompositorConfig, log_path: &Path) -> Result<(Self, u32), CompositorError> {
+        let (pid, wayland_display, backend_name) = match &config.mode {
             SessionMode::Desktop => {
                 let shell = config.desktop_shell
                     .clone()
                     .unwrap_or_else(detect_desktop_shell);
                 tracing::info!("Desktop shell: {shell}");
-                (backend::labwc::launch(config.width, config.height, &shell)?, "labwc")
+                let d = backend::labwc::launch_detached(config.width, config.height, &shell, log_path)?;
+                (d.pid, d.wayland_display, "labwc")
             }
             SessionMode::App { command, args } => {
-                (backend::cage::launch(config.width, config.height, command, args)?, "cage")
+                let d = backend::cage::launch_detached(config.width, config.height, command, args, log_path)?;
+                (d.pid, d.wayland_display, "cage")
             }
         };
+        let comp = Self::connect(config, wayland_display, backend_name)?;
+        Ok((comp, pid))
+    }
 
-        let capturer = ScreenCapturer::connect(&launched.wayland_display)
+    /// Attach to an ALREADY-RUNNING compositor by its Wayland display name
+    /// (session resume). Does not spawn anything; just connects a fresh
+    /// capturer/resizer and re-asserts the output size.
+    pub fn attach(config: CompositorConfig, wayland_display: String) -> Result<Self, CompositorError> {
+        Self::connect(config, wayland_display, "compositor")
+    }
+
+    /// Connect the screen capturer + output resizer to a running compositor.
+    fn connect(
+        config: CompositorConfig,
+        wayland_display: String,
+        backend_name: &'static str,
+    ) -> Result<Self, CompositorError> {
+        let capturer = ScreenCapturer::connect(&wayland_display)
             .map_err(|e| CompositorError::WaylandError(format!("connect to {backend_name}: {e}")))?;
 
-        tracing::info!("Screen capturer connected to {backend_name}");
+        tracing::info!("Screen capturer connected to {backend_name} ({wayland_display})");
 
         // Optional: connect a second Wayland client for output management.
         // If the protocol isn't available (older compositors), sessions still
         // work - they just can't be resized after startup.
-        let mut resizer = match OutputResizer::connect(&launched.wayland_display) {
+        let mut resizer = match OutputResizer::connect(&wayland_display) {
             Ok(r) => Some(r),
             Err(e) => {
                 tracing::warn!("OutputResizer unavailable ({e}) - remote resize disabled");
@@ -96,13 +115,10 @@ impl Compositor {
             }
         };
 
-        // Force the output to the requested dimensions immediately after
-        // startup. labwc's rc.xml `<output name="HEADLESS-1">` matching is
-        // unreliable in practice — the real output name isn't guaranteed
-        // to be "HEADLESS-1", so the config mode often silently falls back
-        // to a wlroots default (1280x720). WLR_HEADLESS_OUTPUT_MODE is
-        // similarly inconsistent across versions. Driving it via
-        // zwlr_output_manager_v1 is the only reliable path.
+        // Force the output to the requested dimensions. labwc's rc.xml
+        // `<output name="HEADLESS-1">` matching is unreliable in practice, so
+        // driving it via zwlr_output_manager_v1 is the only reliable path. On
+        // attach this also re-asserts the size the resuming client wants.
         if let Some(r) = resizer.as_mut() {
             if let Err(e) = r.resize(config.width, config.height) {
                 tracing::warn!(
@@ -115,18 +131,11 @@ impl Compositor {
 
         Ok(Self {
             config,
-            process: launched.process,
-            wayland_display: launched.wayland_display,
+            wayland_display,
             capturer: Some(capturer),
             resizer,
             backend_name,
-            _stderr_drain: launched._stderr_drain,
         })
-    }
-
-    /// Check if the compositor process is still running.
-    pub fn is_alive(&mut self) -> bool {
-        matches!(self.process.try_wait(), Ok(None))
     }
 
     /// Capture the current frame. Returns (width, height, rgba_data).
@@ -172,10 +181,5 @@ impl Compositor {
     }
 }
 
-impl Drop for Compositor {
-    fn drop(&mut self) {
-        tracing::info!("Stopping {} (pid {})", self.backend_name, self.process.id());
-        let _ = self.process.kill();
-        let _ = self.process.wait();
-    }
-}
+// No Drop kill: the compositor process is detached and owned by the session
+// registry (terminated explicitly via its PID), not by this attachment.

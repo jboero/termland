@@ -1,6 +1,7 @@
 mod connection;
 mod display;
 mod overlay;
+mod tray;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -74,6 +75,24 @@ pub struct Args {
     /// if it cannot. Aliases: hevc = h265, avc = h264.
     #[arg(long, value_enum)]
     pub codec: Option<CodecArg>,
+
+    /// Resume an existing session by id (see --list-sessions) instead of
+    /// creating a new one. The remote apps keep running across disconnects.
+    #[arg(long, value_name = "SESSION_ID")]
+    pub attach: Option<String>,
+
+    /// List resumable sessions on the server and exit (no window).
+    #[arg(long)]
+    pub list_sessions: bool,
+
+    /// Close (terminate) a session by id and exit (no window).
+    #[arg(long, value_name = "SESSION_ID")]
+    pub close: Option<String>,
+
+    /// Run as a system-tray session manager for the given host (one global
+    /// icon; lists/ resumes/ closes sessions and starts new ones).
+    #[arg(long)]
+    pub tray: bool,
 
     /// For --mode desktop: startup command to run inside labwc.
     /// Examples: "konsole", "startplasma-wayland", "dbus-run-session sway".
@@ -157,6 +176,43 @@ fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // One-shot session-management ops (and the tray) run without a session
+    // window.
+    if args.list_sessions || args.close.is_some() || args.tray {
+        use anyhow::Context;
+        let server = args.server.clone().context("a server address is required")?;
+        let params = connection::ConnectParams {
+            mode: args.session_mode(),
+            width: args.width,
+            height: args.height,
+            quality: args.quality,
+            audio: false,
+            ssh_opts: args.ssh_opt.clone(),
+            tls: args.tls || args.accept_invalid_certs,
+            accept_invalid_certs: args.accept_invalid_certs,
+            username: args.user.clone(),
+            password: args.password.clone(),
+            desktop_shell: None,
+            encoder_preset: None,
+            encoder_crf: None,
+            encoder_extra_params: None,
+            codec: None,
+            attach: None,
+        };
+
+        if args.tray {
+            // Blocks until quit; runs its own refresh loop + runtime.
+            return tray::run(server, args.ssh, params);
+        }
+
+        let op = match args.close.clone() {
+            Some(id) => connection::ControlOp::Close(id),
+            None => connection::ControlOp::List,
+        };
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(connection::run_control(&server, args.ssh, params, op));
+    }
 
     display::run(args)
 }

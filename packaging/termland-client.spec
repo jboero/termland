@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.4.2
+%global version 0.5.0
 
 Name:           termland-client
 Version:        %{version}
@@ -134,6 +134,12 @@ install -Dm644 termland-client.fish %{buildroot}%{_datadir}/fish/vendor_completi
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Fri Jul 10 2026 John Boero - 0.5.0-1
+- Resume persistent sessions: --attach <id> reconnects to a running session;
+  --list-sessions and --close <id> manage them from the CLI
+- --tray: a global system-tray session manager (StatusNotifierItem via ksni)
+  that lists, resumes, closes, and starts sessions for a host
+
 * Fri Jul 10 2026 John Boero - 0.4.2-1
 - Fix HEVC/H.264 software decode fallback: use the native "hevc"/"h264" decoders
   (were pointed at encoder-only libx265/libx264); a hardware decoder dying

@@ -1,62 +1,44 @@
 //! labwc backend - lightweight wlroots compositor with multiple-window support.
 //! Used for `SessionMode::Desktop` to host a real desktop session.
 
-use std::process::Stdio;
-use crate::backend::{compositor_command, read_socket_name, socket_wrapper_cmd, wait_socket_ready, LaunchedBackend};
+use std::path::Path;
+use crate::backend::{detached_compositor_command, read_socket_from_log, socket_wrapper_cmd, wait_socket_ready, DetachedBackend};
 use crate::session::CompositorError;
 
-/// Launch labwc headlessly with the given startup command inside it.
-///
-/// `shell_cmd` is run as labwc's session process. When it exits, labwc exits.
-/// Examples: "konsole", "startplasma-wayland"
-pub fn launch(
+/// Launch labwc **detached** (setsid, stdio → `log_path`) so it survives the
+/// spawning connection. Returns the PID + Wayland socket; the process is not
+/// owned/killed here — terminate it explicitly via the session registry.
+pub fn launch_detached(
     width: u32,
     height: u32,
     shell_cmd: &str,
-) -> Result<LaunchedBackend, CompositorError> {
-    tracing::info!("Launching labwc: {shell_cmd} ({width}x{height})");
-
-    // Use a minimal config dir so we don't pick up user's ~/.config/labwc.
-    // This keeps sessions reproducible and avoids surprising behavior.
+    log_path: &Path,
+) -> Result<DetachedBackend, CompositorError> {
+    tracing::info!("Launching detached labwc: {shell_cmd} ({width}x{height})");
     let config_dir = write_minimal_config(width, height)?;
 
-    // labwc's -S (session) flag parses its argument with g_shell_parse_argv and
-    // execs the result directly (via g_spawn_async), WITHOUT invoking /bin/sh -c.
-    // That means shell syntax (;, $VAR, pipes) won't be expanded unless we wrap
-    // the whole command in an explicit `sh -c '...'`.
     let wrapper = socket_wrapper_cmd(shell_cmd);
     let sh_arg = format!("sh -c '{}'", wrapper.replace('\'', r"'\''"));
 
-    let mut cmd = compositor_command("labwc", width, height);
+    let mut cmd = detached_compositor_command("labwc", width, height, log_path)?;
     cmd.arg("-C").arg(&config_dir)
         .arg("-S").arg(&sh_arg)
-        // Ensure labwc can find a cursor theme to render. Without these vars,
-        // the remote cursor is invisible because no bitmap is loaded.
         .env("XCURSOR_THEME", "Adwaita")
-        .env("XCURSOR_SIZE", "24")
-        .stdout(Stdio::null());
+        .env("XCURSOR_SIZE", "24");
 
     let mut process = cmd
         .spawn()
         .map_err(|e| CompositorError::StartFailed(format!("spawn labwc: {e}")))?;
+    let pid = process.id();
+    tracing::info!("labwc started detached (pid {pid}), waiting for socket...");
 
-    tracing::info!("labwc started (pid {}), waiting for socket...", process.id());
-
-    let stderr = process
-        .stderr
-        .take()
-        .ok_or_else(|| CompositorError::StartFailed("no stderr from labwc".into()))?;
-
-    let (wayland_display, drain) = read_socket_name(stderr, &mut process)?;
+    let wayland_display = read_socket_from_log(log_path, &mut process)?;
     tracing::info!("labwc created socket: {wayland_display}");
-
     wait_socket_ready(&wayland_display);
 
-    Ok(LaunchedBackend {
-        process,
-        wayland_display,
-        _stderr_drain: drain,
-    })
+    // Drop `process` without waiting/killing: std Child does not kill on drop,
+    // so the detached compositor keeps running.
+    Ok(DetachedBackend { pid, wayland_display })
 }
 
 /// Write a minimal labwc config to a temp directory and return its path.

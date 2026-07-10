@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.4.2
+%global version 0.5.0
 
 Name:           termland-server
 Version:        %{version}
@@ -173,6 +173,15 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Fri Jul 10 2026 John Boero - 0.5.0-1
+- Persistent detachable sessions (X2Go/NX-style): a session keeps running on the
+  server after the client disconnects and can be resumed later. Daemon-free —
+  each session is a detached compositor (setsid) tracked in a filesystem
+  registry under $XDG_RUNTIME_DIR/termland/sessions, so even a stateless SSH
+  subsystem connection can list and resume it.
+- Session control protocol: list / attach / close; session_id in SessionReady.
+- Disconnect detaches (session persists); explicit close terminates it.
+
 * Fri Jul 10 2026 John Boero - 0.4.2-1
 - Version bump in lockstep with the client (client-side decode/codec/UX fixes;
   no server behavior changes)

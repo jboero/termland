@@ -64,14 +64,18 @@ pub struct ConnectParams {
     /// Force a specific codec. When set, the client advertises only this codec
     /// so the server must encode with it; otherwise all codecs are offered.
     pub codec: Option<termland_protocol::VideoCodec>,
+    /// Resume an existing session by id instead of creating a new one.
+    pub attach: Option<String>,
 }
 
-pub async fn connect(
-    server: &str, ssh: bool, params: ConnectParams,
-) -> Result<(mpsc::UnboundedReceiver<ServerEvent>, mpsc::UnboundedSender<ClientCommand>)> {
-    let (server_tx, server_rx) = mpsc::unbounded_channel();
-    let (client_tx, client_rx) = mpsc::unbounded_channel();
+/// Any bidirectional byte stream we can run the protocol over (SSH pipe, TCP,
+/// or TLS). Boxed so the transport can be chosen at runtime and reused by both
+/// the streaming path and one-shot control ops.
+pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
+/// Open the transport to the server: SSH subsystem, plain TCP, or TLS.
+async fn open_io(server: &str, ssh: bool, params: &ConnectParams) -> Result<Box<dyn Io>> {
     if ssh {
         let mut ssh_args: Vec<String> = params.ssh_opts.clone();
         ssh_args.extend(["-s".into(), server.to_string(), "termland".into()]);
@@ -81,19 +85,13 @@ pub async fn connect(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn().context("failed to spawn ssh")?;
-        let io = tokio::io::join(child.stdout.unwrap(), child.stdin.unwrap());
-        tokio::spawn(async move {
-            if let Err(e) = session_loop(io, params, server_tx, client_rx).await {
-                tracing::error!("Session error: {e}");
-            }
-        });
+        Ok(Box::new(tokio::io::join(child.stdout.unwrap(), child.stdin.unwrap())))
     } else if params.tls {
         let stream = TcpStream::connect(server).await
             .context(format!("failed to connect to {server}"))?;
         tracing::info!("Connected to {server} (TLS)");
 
         let mut root_store = rustls::RootCertStore::empty();
-        // Add system roots
         for cert in rustls_native_certs::load_native_certs().expect("load native certs") {
             let _ = root_store.add(cert);
         }
@@ -113,26 +111,99 @@ pub async fn connect(
         let host = server.split(':').next().unwrap_or("localhost");
         let domain = rustls::pki_types::ServerName::try_from(host.to_string())
             .context("invalid server name for TLS")?;
-
         let tls_stream = connector.connect(domain, stream).await
             .context("TLS handshake failed")?;
         tracing::info!("TLS handshake complete");
-
-        tokio::spawn(async move {
-            if let Err(e) = session_loop(tls_stream, params, server_tx, client_rx).await {
-                tracing::error!("Session error: {e}");
-            }
-        });
+        Ok(Box::new(tls_stream))
     } else {
         let stream = TcpStream::connect(server).await
             .context(format!("failed to connect to {server}"))?;
         tracing::info!("Connected to {server}");
-        tokio::spawn(async move {
-            if let Err(e) = session_loop(stream, params, server_tx, client_rx).await {
-                tracing::error!("Session error: {e}");
-            }
-        });
+        Ok(Box::new(stream))
     }
+}
+
+/// One-shot session-management operations (no GUI window).
+pub enum ControlOp {
+    List,
+    Close(String),
+}
+
+/// Fetch the list of resumable sessions (used by the tray manager).
+pub async fn fetch_sessions(
+    server: &str, ssh: bool, params: &ConnectParams,
+) -> Result<Vec<termland_protocol::SessionInfo>> {
+    let io = open_io(server, ssh, params).await?;
+    let mut framed = Framed::new(io, TermlandCodec);
+    handshake(&mut framed, params).await?;
+    framed.send(Message::SessionList(SessionList {})).await.context("send SessionList")?;
+    let resp = framed.next().await.context("closed")?.context("decode")?;
+    match resp {
+        Message::SessionListResult(r) => Ok(r.sessions),
+        other => anyhow::bail!("expected SessionListResult, got {:?}", other.message_id()),
+    }
+}
+
+/// Run a one-shot control op against the server and print the result.
+pub async fn run_control(server: &str, ssh: bool, params: ConnectParams, op: ControlOp) -> Result<()> {
+    let io = open_io(server, ssh, &params).await?;
+    let mut framed = Framed::new(io, TermlandCodec);
+    handshake(&mut framed, &params).await?;
+
+    match op {
+        ControlOp::List => {
+            framed.send(Message::SessionList(SessionList {})).await.context("send SessionList")?;
+            let resp = framed.next().await.context("closed")?.context("decode")?;
+            match resp {
+                Message::SessionListResult(r) => {
+                    if r.sessions.is_empty() {
+                        println!("No resumable sessions.");
+                    } else {
+                        println!("{:<16} {:<16} {:<11} {:>8}", "SESSION ID", "MODE", "SIZE", "AGE");
+                        for s in &r.sessions {
+                            println!(
+                                "{:<16} {:<16} {:<11} {:>8}",
+                                s.session_id, s.mode,
+                                format!("{}x{}", s.width, s.height),
+                                format_age(s.age_secs),
+                            );
+                        }
+                        println!("\nResume with:  termland-client --attach <SESSION ID> …");
+                    }
+                }
+                other => anyhow::bail!("expected SessionListResult, got {:?}", other.message_id()),
+            }
+        }
+        ControlOp::Close(id) => {
+            framed.send(Message::SessionClose(SessionClose { session_id: id.clone() }))
+                .await.context("send SessionClose")?;
+            // Server replies with a SessionEnd ack; ignore its exact contents.
+            let _ = framed.next().await;
+            println!("Closed session {id}");
+        }
+    }
+    Ok(())
+}
+
+fn format_age(secs: u64) -> String {
+    if secs < 60 { format!("{secs}s") }
+    else if secs < 3600 { format!("{}m", secs / 60) }
+    else if secs < 86400 { format!("{}h", secs / 3600) }
+    else { format!("{}d", secs / 86400) }
+}
+
+pub async fn connect(
+    server: &str, ssh: bool, params: ConnectParams,
+) -> Result<(mpsc::UnboundedReceiver<ServerEvent>, mpsc::UnboundedSender<ClientCommand>)> {
+    let (server_tx, server_rx) = mpsc::unbounded_channel();
+    let (client_tx, client_rx) = mpsc::unbounded_channel();
+
+    let io = open_io(server, ssh, &params).await?;
+    tokio::spawn(async move {
+        if let Err(e) = session_loop(io, params, server_tx, client_rx).await {
+            tracing::error!("Session error: {e}");
+        }
+    });
     Ok((server_rx, client_tx))
 }
 
@@ -173,29 +244,23 @@ struct DecodeJob {
     codec: Option<VideoCodec>,
 }
 
-async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
-    io: T, params: ConnectParams,
-    server_tx: mpsc::UnboundedSender<ServerEvent>,
-    mut client_rx: mpsc::UnboundedReceiver<ClientCommand>,
+/// Hello/HelloAck + optional PAM auth. Shared by the streaming path and the
+/// one-shot control ops.
+async fn handshake<T: AsyncRead + AsyncWrite + Unpin>(
+    framed: &mut Framed<T, TermlandCodec>,
+    params: &ConnectParams,
 ) -> Result<()> {
-    let mut framed = Framed::new(io, TermlandCodec);
-
-    // Handshake
     framed.send(Message::Hello(Hello { protocol_version: PROTOCOL_VERSION, client_name: "termland-client".into() })).await?;
     let msg = framed.next().await.context("closed")?.context("decode")?;
-    match &msg {
-        Message::HelloAck(ha) => tracing::info!("Server: {} (v{}, session {})", ha.server_name, ha.protocol_version, ha.session_id),
-        other => anyhow::bail!("expected HelloAck, got {:?}", other.message_id()),
-    }
-
-    // Handle auth if server requires it (indicated by auth_required in HelloAck)
     let auth_required = match &msg {
-        Message::HelloAck(ha) => ha.auth_required,
-        _ => false,
+        Message::HelloAck(ha) => {
+            tracing::info!("Server: {} (v{}, session {})", ha.server_name, ha.protocol_version, ha.session_id);
+            ha.auth_required
+        }
+        other => anyhow::bail!("expected HelloAck, got {:?}", other.message_id()),
     };
 
     if auth_required {
-        // Wait for AuthRequest
         let msg = framed.next().await.context("closed")?.context("decode")?;
         match msg {
             Message::AuthRequest(ar) => {
@@ -208,7 +273,6 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
         let password = params.password.clone()
             .or_else(|| std::env::var("TERMLAND_PASSWORD").ok())
             .unwrap_or_default();
-
         if password.is_empty() {
             tracing::warn!("Server requires auth but no --password provided");
         }
@@ -220,34 +284,57 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
 
         let result = framed.next().await.context("closed")?.context("decode")?;
         match result {
-            Message::AuthResult(ar) if ar.success => {
-                tracing::info!("Authenticated as '{username}'");
-            }
-            Message::AuthResult(ar) => {
-                anyhow::bail!("Authentication failed: {}", ar.message);
-            }
+            Message::AuthResult(ar) if ar.success => tracing::info!("Authenticated as '{username}'"),
+            Message::AuthResult(ar) => anyhow::bail!("Authentication failed: {}", ar.message),
             other => anyhow::bail!("expected AuthResult, got {:?}", other.message_id()),
         }
     }
+    Ok(())
+}
 
-    framed.send(Message::SessionCreate(SessionCreate {
-        mode: params.mode,
-        width: params.width,
-        height: params.height,
-        audio: params.audio,
-        quality: params.quality,
-        desktop_shell: params.desktop_shell,
-        encoder_preset: params.encoder_preset,
-        encoder_crf: params.encoder_crf,
-        encoder_extra_params: params.encoder_extra_params,
-        // If a codec was forced, advertise only it so the server must use it;
-        // otherwise advertise all (our ffmpeg decoder handles any) in preference
-        // order so the server picks the best its hardware can encode.
-        supported_codecs: match params.codec {
-            Some(c) => vec![c],
-            None => termland_protocol::VideoCodec::all_preferred(),
-        },
-    })).await?;
+async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
+    io: T, params: ConnectParams,
+    server_tx: mpsc::UnboundedSender<ServerEvent>,
+    mut client_rx: mpsc::UnboundedReceiver<ClientCommand>,
+) -> Result<()> {
+    let mut framed = Framed::new(io, TermlandCodec);
+    handshake(&mut framed, &params).await?;
+
+    // If a codec was forced, advertise only it so the server must use it;
+    // otherwise advertise all (our ffmpeg decoder handles any) in preference
+    // order so the server picks the best its hardware can encode.
+    let supported_codecs = match params.codec {
+        Some(c) => vec![c],
+        None => termland_protocol::VideoCodec::all_preferred(),
+    };
+    match &params.attach {
+        Some(id) => {
+            tracing::info!("Attaching to session {id}");
+            framed.send(Message::SessionAttach(SessionAttach {
+                session_id: id.clone(),
+                audio: params.audio,
+                quality: params.quality,
+                encoder_preset: params.encoder_preset,
+                encoder_crf: params.encoder_crf,
+                encoder_extra_params: params.encoder_extra_params,
+                supported_codecs,
+            })).await?;
+        }
+        None => {
+            framed.send(Message::SessionCreate(SessionCreate {
+                mode: params.mode,
+                width: params.width,
+                height: params.height,
+                audio: params.audio,
+                quality: params.quality,
+                desktop_shell: params.desktop_shell,
+                encoder_preset: params.encoder_preset,
+                encoder_crf: params.encoder_crf,
+                encoder_extra_params: params.encoder_extra_params,
+                supported_codecs,
+            })).await?;
+        }
+    }
     let msg = framed.next().await.context("closed")?.context("decode")?;
     let negotiated_codec = match &msg {
         Message::SessionReady(sr) => {
