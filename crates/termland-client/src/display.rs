@@ -611,9 +611,12 @@ impl ApplicationHandler for App {
                 let over_bar = self.bar_visible && !self.fullscreen
                     && self.cursor_win_y < MENUBAR_HEIGHT as f64;
                 if over_bar { return; }
+                // winit reports positive Y as scrolling up, but the Wayland axis
+                // convention the server injects uses positive = down. Negate the
+                // vertical delta so wheel direction matches the remote content.
                 let (dx, dy) = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x as f64 * 15.0, y as f64 * 15.0),
-                    winit::event::MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x as f64 * 15.0, -(y as f64) * 15.0),
+                    winit::event::MouseScrollDelta::PixelDelta(p) => (p.x, -p.y),
                 };
                 self.send_cmd(ClientCommand::MouseScroll(input::MouseScroll { dx, dy }));
             }
