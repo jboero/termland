@@ -39,14 +39,14 @@ pub enum DecoderBackend {
     HevcCuvid,
     HevcVaapi,
     HevcV4l2m2m,
-    Libx265,
-    
+    HevcSoftware,
+
     // H.264
     H264Qsv,
     H264Cuvid,
     H264Vaapi,
     H264V4l2m2m,
-    Libx264,
+    H264Software,
 }
 
 impl std::fmt::Display for DecoderBackend {
@@ -71,14 +71,14 @@ impl std::fmt::Display for DecoderBackend {
             DecoderBackend::HevcCuvid => write!(f, "NVIDIA CUVID (hevc_cuvid)"),
             DecoderBackend::HevcVaapi => write!(f, "VA-API (hevc_vaapi)"),
             DecoderBackend::HevcV4l2m2m => write!(f, "v4l2m2m (hevc_v4l2m2m)"),
-            DecoderBackend::Libx265 => write!(f, "libx265 (software)"),
+            DecoderBackend::HevcSoftware => write!(f, "hevc (software)"),
             
             // H.264
             DecoderBackend::H264Qsv => write!(f, "Intel QSV (h264_qsv)"),
             DecoderBackend::H264Cuvid => write!(f, "NVIDIA CUVID (h264_cuvid)"),
             DecoderBackend::H264Vaapi => write!(f, "VA-API (h264_vaapi)"),
             DecoderBackend::H264V4l2m2m => write!(f, "v4l2m2m (h264_v4l2m2m)"),
-            DecoderBackend::Libx264 => write!(f, "libx264 (software)"),
+            DecoderBackend::H264Software => write!(f, "h264 (software)"),
         }
     }
 }
@@ -105,14 +105,14 @@ impl DecoderBackend {
             DecoderBackend::HevcCuvid => "hevc_cuvid",
             DecoderBackend::HevcVaapi => "hevc_vaapi",
             DecoderBackend::HevcV4l2m2m => "hevc_v4l2m2m",
-            DecoderBackend::Libx265 => "libx265",
+            DecoderBackend::HevcSoftware => "hevc",
             
             // H.264
             DecoderBackend::H264Qsv => "h264_qsv",
             DecoderBackend::H264Cuvid => "h264_cuvid",
             DecoderBackend::H264Vaapi => "h264_vaapi",
             DecoderBackend::H264V4l2m2m => "h264_v4l2m2m",
-            DecoderBackend::Libx264 => "libx264",
+            DecoderBackend::H264Software => "h264",
         }
     }
 
@@ -134,13 +134,13 @@ impl DecoderBackend {
             | DecoderBackend::HevcCuvid
             | DecoderBackend::HevcVaapi
             | DecoderBackend::HevcV4l2m2m
-            | DecoderBackend::Libx265 => VideoCodec::H265,
+            | DecoderBackend::HevcSoftware => VideoCodec::H265,
 
             DecoderBackend::H264Qsv
             | DecoderBackend::H264Cuvid
             | DecoderBackend::H264Vaapi
             | DecoderBackend::H264V4l2m2m
-            | DecoderBackend::Libx264 => VideoCodec::H264,
+            | DecoderBackend::H264Software => VideoCodec::H264,
         }
     }
 }
@@ -179,8 +179,8 @@ const BACKEND_PRIORITY: &[DecoderBackend] = &[
     DecoderBackend::Dav1d,
     DecoderBackend::LibvpxVp9,
     DecoderBackend::Libvpx,
-    DecoderBackend::Libx265,
-    DecoderBackend::Libx264,
+    DecoderBackend::HevcSoftware,
+    DecoderBackend::H264Software,
 ];
 
 struct SendScaler(ffmpeg_next::software::scaling::Context);
@@ -211,10 +211,19 @@ pub struct VideoDecoder {
     /// Have we successfully decoded at least one frame? Once true, we trust
     /// this backend and won't fall back on transient errors.
     confirmed_working: bool,
+    /// Consecutive reinit failures on a confirmed backend. If a hardware
+    /// decoder breaks mid-session (e.g. a GPU driver update kills CUVID),
+    /// reinit keeps failing; once this passes a small threshold we stop
+    /// retrying the same backend and fall back to the next one (→ software).
+    reinit_failures: u32,
     /// When set (via codec negotiation), only backends decoding this codec are
     /// considered — both at init and during fallback. `None` = try any codec.
     codec_filter: Option<VideoCodec>,
 }
+
+/// After this many consecutive reinit failures on a confirmed backend, give up
+/// on it and fall back to the next decoder in the priority list.
+const MAX_REINIT_FAILURES: u32 = 2;
 
 impl VideoDecoder {
     /// Create a new video decoder, probing for the best available backend
@@ -262,6 +271,7 @@ impl VideoDecoder {
                         backend_index: idx,
                         failed_backends: failed,
                         confirmed_working: false,
+                        reinit_failures: 0,
                         codec_filter,
                     });
                 }
@@ -322,6 +332,7 @@ impl VideoDecoder {
         }
 
         // Got a real frame - this backend works!
+        self.reinit_failures = 0;
         if !self.confirmed_working {
             self.confirmed_working = true;
             tracing::info!("Decoder {} confirmed working", self.backend);
@@ -375,6 +386,33 @@ impl VideoDecoder {
     /// incoming keyframe cleanly.
     fn reinit_and_retry(&mut self, data: &[u8], reason: String) -> Result<(u32, u32, Vec<u32>), DecoderError> {
         tracing::warn!("Decoder {} hiccup ({reason}), reinitializing same backend", self.backend);
+        match self.try_reinit(data) {
+            Ok(frame) => {
+                self.reinit_failures = 0;
+                Ok(frame)
+            }
+            // Not a keyframe yet — harmless, wait for the next one.
+            Err(DecoderError::NoFrame) => Err(DecoderError::NoFrame),
+            // A fresh context still couldn't decode. If this keeps happening the
+            // backend is genuinely broken (e.g. a driver update killed CUVID),
+            // so fall back to the next decoder — ultimately software.
+            Err(e) => {
+                self.reinit_failures += 1;
+                if self.reinit_failures >= MAX_REINIT_FAILURES {
+                    tracing::warn!(
+                        "Decoder {} failed to reinitialize {} times, falling back to next backend",
+                        self.backend, self.reinit_failures
+                    );
+                    self.fallback_and_retry(data, format!("reinit exhausted: {e}"))
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// One reinitialize-and-decode attempt on the current backend.
+    fn try_reinit(&mut self, data: &[u8]) -> Result<(u32, u32, Vec<u32>), DecoderError> {
         let new_decoder = Self::open_codec(self.backend)
             .map_err(|e| DecoderError::DecodeFailed(format!("reinit {}: {e}", self.backend)))?;
         self.decoder = new_decoder;
