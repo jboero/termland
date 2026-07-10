@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.4.0
+%global version 0.4.1
 
 Name:           termland-client
 Version:        %{version}
@@ -120,6 +120,9 @@ install -Dm644 termland-client.fish %{buildroot}%{_datadir}/fish/vendor_completi
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Fri Jul 10 2026 John Boero - 0.4.1-1
+- Fix inverted vertical mouse scroll (winit up = Wayland down)
+
 * Fri Jul 10 2026 John Boero - 0.4.0-1
 - v0.4.0 release
 - Multi-codec decoding with automatic fallback: AV1, VP9, VP8, H.265/HEVC, H.264

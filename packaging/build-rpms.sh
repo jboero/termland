@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-VERSION=0.4.0
+VERSION=0.4.1
 SRCDIR="$(cd "$(dirname "$0")/.." && pwd)"
 SPECDIR="$SRCDIR/packaging"
 

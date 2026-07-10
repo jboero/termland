@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.4.0
+%global version 0.4.1
 
 Name:           termland-server
 Version:        %{version}
@@ -159,6 +159,10 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Fri Jul 10 2026 John Boero - 0.4.1-1
+- Version bump to keep server/client in lockstep (client scroll-direction fix;
+  no server-side changes)
+
 * Fri Jul 10 2026 John Boero - 0.4.0-1
 - v0.4.0 release
 - Multi-codec video with automatic fallback: AV1, VP9, VP8, H.265/HEVC, H.264
