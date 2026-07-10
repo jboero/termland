@@ -268,6 +268,7 @@ impl App {
             encoder_crf: self.args.crf,
             encoder_extra_params: self.args.svt_params.clone(),
             codec: self.args.codec.map(|c| c.to_wire()),
+            attach: self.args.attach.clone(),
         };
         match self.runtime.block_on(connect(&server, ssh, params)) {
             Ok((rx, tx)) => {

@@ -174,80 +174,210 @@ where
         tracing::info!("Client authenticated");
     }
 
-    // Wait for SessionCreate
-    let msg = framed
-        .next()
-        .await
-        .context("connection closed before SessionCreate")?
-        .context("failed to decode SessionCreate")?;
+    // Ensure the session registry directory exists.
+    let _ = crate::registry::ensure_dir();
 
-    let session_create = match msg {
-        Message::SessionCreate(sc) => {
+    // Session control loop. The client either manages sessions (list / close) or
+    // starts one — create a new persistent session, or attach to an existing one
+    // — which then streams until the client detaches (disconnects) or closes it.
+    loop {
+        let msg = match framed.next().await {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => {
+                tracing::warn!("control decode error: {e}");
+                return Ok(());
+            }
+            None => {
+                tracing::info!("Client disconnected before selecting a session");
+                return Ok(());
+            }
+        };
+
+        match msg {
+            Message::SessionList(_) => {
+                let sessions: Vec<SessionInfo> = crate::registry::list_alive()
+                    .into_iter()
+                    .map(|r| SessionInfo {
+                        session_id: r.session_id,
+                        mode: r.mode,
+                        width: r.width,
+                        height: r.height,
+                        age_secs: crate::registry::now_unix().saturating_sub(r.created_at_unix),
+                        attached: false,
+                    })
+                    .collect();
+                tracing::info!("Listing {} live session(s)", sessions.len());
+                framed
+                    .send(Message::SessionListResult(SessionListResult { sessions }))
+                    .await
+                    .context("failed to send SessionListResult")?;
+            }
+            Message::SessionClose(sc) => {
+                tracing::info!("Client requested close of session {}", sc.session_id);
+                crate::registry::close(&sc.session_id);
+                framed
+                    .send(Message::SessionEnd(SessionEnd {
+                        reason: format!("closed {}", sc.session_id),
+                    }))
+                    .await
+                    .ok();
+            }
+            Message::SessionCreate(sc) => {
+                run_session(&mut framed, SessionRequest::Create(sc)).await?;
+                return Ok(());
+            }
+            Message::SessionAttach(sa) => {
+                run_session(&mut framed, SessionRequest::Attach(sa)).await?;
+                return Ok(());
+            }
+            other => {
+                anyhow::bail!("expected a session control message, got {:?}", other.message_id());
+            }
+        }
+    }
+}
+
+/// A client's request that starts streaming: a new session or a resume.
+enum SessionRequest {
+    Create(SessionCreate),
+    Attach(SessionAttach),
+}
+
+/// Run one streaming session (freshly created or resumed) until the client
+/// detaches or closes it. On plain disconnect the compositor is left running
+/// (the session persists); on an explicit close/compositor-exit it is removed.
+async fn run_session<T>(
+    framed: &mut Framed<T, TermlandCodec>,
+    request: SessionRequest,
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    // Resolve everything the capture/stream setup needs from either request kind.
+    let (
+        session_id,
+        width,
+        height,
+        quality,
+        mode,
+        mode_desc,
+        desktop_shell,
+        encoder_preset,
+        encoder_crf,
+        encoder_extra_params,
+        supported_codecs,
+        audio,
+        start_kind,
+        is_new,
+    );
+
+    match request {
+        SessionRequest::Create(sc) => {
             tracing::info!(
-                "Session request: {}x{} mode={:?} audio={} quality={} desktop_shell={:?}",
-                sc.width,
-                sc.height,
-                sc.mode,
-                sc.audio,
-                sc.quality,
-                sc.desktop_shell
+                "Create session: {}x{} mode={:?} audio={} quality={} desktop_shell={:?}",
+                sc.width, sc.height, sc.mode, sc.audio, sc.quality, sc.desktop_shell
             );
-            sc
-        }
-        other => anyhow::bail!("expected SessionCreate, got {:?}", other.message_id()),
-    };
+            let ds = sc.desktop_shell.clone().filter(|s| !s.is_empty());
+            let ep = sc.encoder_preset.clone().filter(|s| !s.is_empty());
+            let ex = sc.encoder_extra_params.clone().filter(|s| !s.is_empty());
 
-    let width = session_create.width;
-    let height = session_create.height;
-    let quality = session_create.quality.clamp(1, 100);
-    let desktop_shell = session_create.desktop_shell.filter(|s| !s.is_empty());
-    let encoder_preset = session_create.encoder_preset.filter(|s| !s.is_empty());
-    let encoder_crf = session_create.encoder_crf;
-    let encoder_extra_params = session_create.encoder_extra_params.filter(|s| !s.is_empty());
-    // Codecs the client can decode. An empty set (unusual) means the client
-    // advertised nothing decodable; fall back to no restriction so the session
-    // can still start rather than panic.
-    let supported_codecs = if session_create.supported_codecs.is_empty() {
-        termland_protocol::VideoCodec::all_preferred()
-    } else {
-        session_create.supported_codecs.clone()
-    };
+            // SECURITY: validate client-supplied commands before any shell use.
+            if let Some(ref shell) = ds {
+                termland_compositor::validate_shell_command(shell)
+                    .map_err(|e| anyhow::anyhow!("rejected desktop_shell: {e}"))?;
+            }
+            if let termland_protocol::SessionMode::App { ref command, ref args } = sc.mode {
+                termland_compositor::validate_shell_command(command)
+                    .map_err(|e| anyhow::anyhow!("rejected app command: {e}"))?;
+                for arg in args {
+                    termland_compositor::validate_shell_command(arg)
+                        .map_err(|e| anyhow::anyhow!("rejected app arg: {e}"))?;
+                }
+            }
+            if let Some(ref preset) = ep {
+                termland_compositor::validate_shell_command(preset)
+                    .map_err(|e| anyhow::anyhow!("rejected encoder_preset: {e}"))?;
+            }
+            if let Some(ref extra) = ex {
+                termland_compositor::validate_shell_command(extra)
+                    .map_err(|e| anyhow::anyhow!("rejected encoder_extra_params: {e}"))?;
+            }
+
+            let id = crate::registry::new_session_id();
+            session_id = id.clone();
+            width = sc.width;
+            height = sc.height;
+            quality = sc.quality.clamp(1, 100);
+            mode_desc = crate::registry::describe_mode(&sc.mode);
+            mode = sc.mode.into();
+            desktop_shell = ds;
+            encoder_preset = ep;
+            encoder_crf = sc.encoder_crf;
+            encoder_extra_params = ex;
+            supported_codecs = if sc.supported_codecs.is_empty() {
+                termland_protocol::VideoCodec::all_preferred()
+            } else {
+                sc.supported_codecs
+            };
+            audio = sc.audio;
+            start_kind = StartKind::Create { log_path: crate::registry::log_path(&id) };
+            is_new = true;
+        }
+        SessionRequest::Attach(sa) => {
+            let Some(rec) = crate::registry::read(&sa.session_id).filter(crate::registry::is_live) else {
+                tracing::warn!("attach to unknown/dead session {}", sa.session_id);
+                framed
+                    .send(Message::SessionEnd(SessionEnd {
+                        reason: format!("no such session: {}", sa.session_id),
+                    }))
+                    .await
+                    .ok();
+                return Ok(());
+            };
+            tracing::info!("Attaching to session {} ({})", rec.session_id, rec.wayland_display);
+            let ep = sa.encoder_preset.clone().filter(|s| !s.is_empty());
+            let ex = sa.encoder_extra_params.clone().filter(|s| !s.is_empty());
+            if let Some(ref preset) = ep {
+                termland_compositor::validate_shell_command(preset)
+                    .map_err(|e| anyhow::anyhow!("rejected encoder_preset: {e}"))?;
+            }
+            if let Some(ref extra) = ex {
+                termland_compositor::validate_shell_command(extra)
+                    .map_err(|e| anyhow::anyhow!("rejected encoder_extra_params: {e}"))?;
+            }
+            session_id = rec.session_id.clone();
+            width = rec.width;
+            height = rec.height;
+            quality = sa.quality.clamp(1, 100);
+            mode_desc = rec.mode.clone();
+            mode = termland_compositor::SessionMode::Desktop; // unused on attach
+            desktop_shell = None;
+            encoder_preset = ep;
+            encoder_crf = sa.encoder_crf;
+            encoder_extra_params = ex;
+            supported_codecs = if sa.supported_codecs.is_empty() {
+                termland_protocol::VideoCodec::all_preferred()
+            } else {
+                sa.supported_codecs
+            };
+            audio = sa.audio;
+            start_kind = StartKind::Attach {
+                wayland_display: rec.wayland_display.clone(),
+                compositor_pid: rec.compositor_pid,
+            };
+            is_new = false;
+        }
+    }
     tracing::info!("Client supports codecs: {supported_codecs:?}");
-
-    // SECURITY: validate client-supplied commands before they reach any shell.
-    // desktop_shell and app command/args come from the untrusted client.
-    if let Some(ref shell) = desktop_shell {
-        termland_compositor::validate_shell_command(shell)
-            .map_err(|e| anyhow::anyhow!("rejected desktop_shell: {e}"))?;
-    }
-    if let termland_protocol::SessionMode::App { ref command, ref args } = session_create.mode {
-        termland_compositor::validate_shell_command(command)
-            .map_err(|e| anyhow::anyhow!("rejected app command: {e}"))?;
-        for arg in args {
-            termland_compositor::validate_shell_command(arg)
-                .map_err(|e| anyhow::anyhow!("rejected app arg: {e}"))?;
-        }
-    }
-    if let Some(ref preset) = encoder_preset {
-        termland_compositor::validate_shell_command(preset)
-            .map_err(|e| anyhow::anyhow!("rejected encoder_preset: {e}"))?;
-    }
-    if let Some(ref extra) = encoder_extra_params {
-        termland_compositor::validate_shell_command(extra)
-            .map_err(|e| anyhow::anyhow!("rejected encoder_extra_params: {e}"))?;
-    }
-
-    let mode: termland_compositor::SessionMode = session_create.mode.into();
 
     // Spawn the compositor + capture loop on a blocking thread.
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(2);
-    let (display_tx, display_rx) = tokio::sync::oneshot::channel::<String>();
+    let (display_tx, display_rx) = tokio::sync::oneshot::channel::<(String, u32)>();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     // Resize requests from the session loop → capture thread.
     let (resize_tx, resize_rx) = std::sync::mpsc::channel::<(u32, u32)>();
 
-    // Shared cursor-mode flag. Client defaults to server-side cursor rendering
-    // (overlay_cursor=true). Can be toggled at runtime via CursorMode message.
+    // Shared cursor-mode flag. Client defaults to client-side cursor rendering.
     let overlay_cursor = Arc::new(AtomicBool::new(false));
     let overlay_cursor_capture = overlay_cursor.clone();
 
@@ -255,18 +385,36 @@ where
     let capture_handle = std::thread::spawn(move || {
         capture_thread(width, height, quality, mode, desktop_shell,
                        encoder_preset, encoder_crf, encoder_extra_params,
-                       capture_codecs,
+                       capture_codecs, start_kind,
                        overlay_cursor_capture, resize_rx, frame_tx, display_tx, stop_rx);
     });
 
-    // Wait for the compositor to report its Wayland display name
-    let wayland_display = tokio::time::timeout(
-        tokio::time::Duration::from_secs(10),
+    // Wait for the compositor to report its Wayland display name + pid.
+    let (wayland_display, compositor_pid) = tokio::time::timeout(
+        tokio::time::Duration::from_secs(15),
         async { display_rx.await },
     )
     .await
     .context("timeout waiting for compositor to start")?
     .context("capture thread died before compositor started")?;
+
+    // For a freshly created session, record it in the registry so it can be
+    // listed and resumed later. Resumes reuse the existing record.
+    if is_new {
+        let rec = crate::registry::SessionRecord {
+            session_id: session_id.clone(),
+            compositor_pid,
+            wayland_display: wayland_display.clone(),
+            mode: mode_desc.clone(),
+            width,
+            height,
+            created_at_unix: crate::registry::now_unix(),
+            audio,
+        };
+        if let Err(e) = crate::registry::write(&rec) {
+            tracing::warn!("failed to write session registry record: {e}");
+        }
+    }
 
     // Spawn input injection thread connected to the same Wayland display
     let (input_tx, input_rx) = std::sync::mpsc::channel::<InputCommand>();
@@ -296,6 +444,7 @@ where
             height: first_h,
             xkb_keymap: None,
             codec: Some(first_codec),
+            session_id: session_id.clone(),
         }))
         .await
         .context("failed to send SessionReady")?;
@@ -307,7 +456,7 @@ where
     tracing::info!("  Transport: TCP");
 
     // Optionally start audio capture if the client requested it.
-    let (mut audio_rx, _audio_stop_tx, _audio_handle) = if session_create.audio {
+    let (mut audio_rx, _audio_stop_tx, _audio_handle) = if audio {
         let (atx, arx) = tokio::sync::mpsc::channel::<AudioChunk>(8);
         let (astop_tx, astop_rx) = tokio::sync::oneshot::channel::<()>();
         let sid = session_id.clone();
@@ -329,16 +478,21 @@ where
     let mut current_width = first_w;
     let mut current_height = first_h;
 
+    // How this streaming session ends. Default: the client detached (the
+    // compositor keeps running and the session stays resumable).
+    let mut outcome = SessionOutcome::Detached;
+
     // Main event loop
     loop {
         tokio::select! {
             frame = frame_rx.recv() => {
                 let Some(frame) = frame else {
-                    // Capture thread ended - compositor (cage) exited
+                    // Capture thread ended because the compositor exited.
                     tracing::info!("Compositor exited, ending session");
                     let _ = framed.send(Message::SessionEnd(SessionEnd {
                         reason: "compositor exited".into(),
                     })).await;
+                    outcome = SessionOutcome::Gone;
                     break;
                 };
 
@@ -427,6 +581,11 @@ where
                                 overlay_cursor.store(cm.include_cursor_in_frame, Ordering::Relaxed);
                                 tracing::info!("Cursor mode: {}", if cm.include_cursor_in_frame { "server-side (in frame)" } else { "client-side (local render)" });
                             }
+                            Message::SessionClose(sc) if sc.session_id == session_id || sc.session_id.is_empty() => {
+                                tracing::info!("Client closed the active session");
+                                outcome = SessionOutcome::Closed;
+                                break;
+                            }
                             _ => {}
                         }
                     }
@@ -455,8 +614,31 @@ where
         let _ = ah.join();
     }
 
-    tracing::info!("Session {session_id} ended");
+    match outcome {
+        SessionOutcome::Detached => {
+            // The compositor keeps running; the session stays resumable.
+            tracing::info!("Session {session_id} detached (compositor still running, resumable)");
+        }
+        SessionOutcome::Closed => {
+            crate::registry::close(&session_id);
+            tracing::info!("Session {session_id} closed");
+        }
+        SessionOutcome::Gone => {
+            crate::registry::remove(&session_id);
+            tracing::info!("Session {session_id} ended (compositor gone)");
+        }
+    }
     Ok(())
+}
+
+/// How a streaming session ended, deciding the fate of its compositor.
+enum SessionOutcome {
+    /// Client went away; leave the compositor running (persist, resumable).
+    Detached,
+    /// Client explicitly closed the session; terminate the compositor.
+    Closed,
+    /// The compositor exited on its own; drop the (now dead) record.
+    Gone,
 }
 
 /// Encoder tuning collected once per session from the client.
@@ -509,6 +691,14 @@ fn init_encoder(
 
 /// Capture thread: creates compositor, captures frames, sends display name back.
 #[allow(clippy::too_many_arguments)]
+/// How a capture thread obtains its compositor: spawn a fresh detached one, or
+/// attach to an already-running session's Wayland display (resume).
+enum StartKind {
+    Create { log_path: std::path::PathBuf },
+    Attach { wayland_display: String, compositor_pid: u32 },
+}
+
+#[allow(clippy::too_many_arguments)]
 fn capture_thread(
     width: u32,
     height: u32,
@@ -519,24 +709,37 @@ fn capture_thread(
     encoder_crf: Option<u8>,
     encoder_extra_params: Option<String>,
     supported_codecs: Vec<termland_protocol::VideoCodec>,
+    start_kind: StartKind,
     overlay_cursor: Arc<AtomicBool>,
     resize_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     frame_tx: tokio::sync::mpsc::Sender<CapturedFrame>,
-    display_tx: tokio::sync::oneshot::Sender<String>,
+    display_tx: tokio::sync::oneshot::Sender<(String, u32)>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    let compositor = match termland_compositor::Compositor::new(
-        termland_compositor::CompositorConfig { width, height, mode, desktop_shell },
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Failed to create compositor: {e}");
-            return;
+    let config = termland_compositor::CompositorConfig { width, height, mode, desktop_shell };
+    let (mut compositor, comp_pid) = match start_kind {
+        StartKind::Create { log_path } => {
+            match termland_compositor::Compositor::create(config, &log_path) {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::error!("Failed to create compositor: {e}");
+                    return;
+                }
+            }
+        }
+        StartKind::Attach { wayland_display, compositor_pid } => {
+            match termland_compositor::Compositor::attach(config, wayland_display) {
+                Ok(c) => (c, compositor_pid),
+                Err(e) => {
+                    tracing::error!("Failed to attach to compositor: {e}");
+                    return;
+                }
+            }
         }
     };
 
-    // Send the Wayland display name back so input thread can connect
-    let _ = display_tx.send(compositor.wayland_display().to_string());
+    // Send the Wayland display name + compositor pid back to the session task.
+    let _ = display_tx.send((compositor.wayland_display().to_string(), comp_pid));
 
     // Map quality 1-100 to bitrate. quality 100 → 15 Mbps, 50 → 7.5 Mbps, 1 → 500 kbps
     let bitrate_kbps = (quality as u32 * 150).max(500);
@@ -553,7 +756,6 @@ fn capture_thread(
     let mut encoder_codec = video_encoder.backend().codec();
     let mut encoder_dims = (width, height);
 
-    let mut compositor = compositor;
     let frame_duration = std::time::Duration::from_millis(33);
 
     loop {
@@ -562,8 +764,8 @@ fn capture_thread(
             break;
         }
 
-        if !compositor.is_alive() {
-            tracing::info!("Compositor process exited, ending capture");
+        if !crate::registry::pid_alive(comp_pid) {
+            tracing::info!("Compositor process (pid {comp_pid}) exited, ending capture");
             break;
         }
 
@@ -644,8 +846,8 @@ fn capture_thread(
                 }
             }
             Err(e) => {
-                if !compositor.is_alive() {
-                    tracing::info!("Compositor process exited, ending capture");
+                if !crate::registry::pid_alive(comp_pid) {
+                    tracing::info!("Compositor process (pid {comp_pid}) exited, ending capture");
                     break;
                 }
                 tracing::warn!("Frame capture failed: {e}");

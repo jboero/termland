@@ -1,4 +1,5 @@
 mod auth;
+mod registry;
 mod tls;
 mod transport;
 

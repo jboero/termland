@@ -25,6 +25,10 @@ pub enum MessageId {
     SessionEnd = 0x09,
     Ping = 0x0A,
     Pong = 0x0B,
+    SessionList = 0x0C,
+    SessionListResult = 0x0D,
+    SessionAttach = 0x0E,
+    SessionClose = 0x0F,
 
     // Server -> Client data
     VideoFrame = 0x20,
@@ -57,6 +61,10 @@ impl MessageId {
             0x09 => Some(Self::SessionEnd),
             0x0A => Some(Self::Ping),
             0x0B => Some(Self::Pong),
+            0x0C => Some(Self::SessionList),
+            0x0D => Some(Self::SessionListResult),
+            0x0E => Some(Self::SessionAttach),
+            0x0F => Some(Self::SessionClose),
             0x20 => Some(Self::VideoFrame),
             0x21 => Some(Self::StillFrame),
             0x22 => Some(Self::AudioChunk),
@@ -89,6 +97,10 @@ pub enum Message {
     SessionEnd(SessionEnd),
     Ping(Ping),
     Pong(Pong),
+    SessionList(SessionList),
+    SessionListResult(SessionListResult),
+    SessionAttach(SessionAttach),
+    SessionClose(SessionClose),
 
     // Server -> Client data
     VideoFrame(VideoFrame),
@@ -121,6 +133,10 @@ impl Message {
             Self::SessionEnd(_) => MessageId::SessionEnd,
             Self::Ping(_) => MessageId::Ping,
             Self::Pong(_) => MessageId::Pong,
+            Self::SessionList(_) => MessageId::SessionList,
+            Self::SessionListResult(_) => MessageId::SessionListResult,
+            Self::SessionAttach(_) => MessageId::SessionAttach,
+            Self::SessionClose(_) => MessageId::SessionClose,
             Self::VideoFrame(_) => MessageId::VideoFrame,
             Self::StillFrame(_) => MessageId::StillFrame,
             Self::AudioChunk(_) => MessageId::AudioChunk,
@@ -243,6 +259,59 @@ pub struct SessionReady {
     /// the client should fall back to auto-detecting from the frame stream.
     #[serde(default)]
     pub codec: Option<VideoCodec>,
+    /// Stable id of the (persistent) session, so the client can reattach to it
+    /// later after disconnecting. Empty for older servers with no persistence.
+    #[serde(default)]
+    pub session_id: String,
+}
+
+/// Client -> server: request the list of resumable sessions on this host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionList {}
+
+/// Server -> client: the sessions currently running and available to resume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionListResult {
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// Summary of one persistent session, for the resume list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session_id: String,
+    /// Human-readable mode description, e.g. "desktop" or "app: firefox".
+    pub mode: String,
+    pub width: u32,
+    pub height: u32,
+    /// Seconds since the session was created.
+    pub age_secs: u64,
+    /// Whether a client is currently attached and streaming.
+    pub attached: bool,
+}
+
+/// Client -> server: attach to an existing persistent session and resume its
+/// stream. The compositor keeps running; the server spins up a fresh encoder
+/// (re-negotiating the codec from `supported_codecs`) and sends a keyframe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionAttach {
+    pub session_id: String,
+    pub audio: bool,
+    #[serde(default = "default_quality")]
+    pub quality: u8,
+    #[serde(default)]
+    pub encoder_preset: Option<String>,
+    #[serde(default)]
+    pub encoder_crf: Option<u8>,
+    #[serde(default)]
+    pub encoder_extra_params: Option<String>,
+    #[serde(default = "VideoCodec::all_preferred")]
+    pub supported_codecs: Vec<VideoCodec>,
+}
+
+/// Client -> server: permanently close (terminate) a persistent session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionClose {
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

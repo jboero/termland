@@ -75,6 +75,19 @@ pub struct Args {
     #[arg(long, value_enum)]
     pub codec: Option<CodecArg>,
 
+    /// Resume an existing session by id (see --list-sessions) instead of
+    /// creating a new one. The remote apps keep running across disconnects.
+    #[arg(long, value_name = "SESSION_ID")]
+    pub attach: Option<String>,
+
+    /// List resumable sessions on the server and exit (no window).
+    #[arg(long)]
+    pub list_sessions: bool,
+
+    /// Close (terminate) a session by id and exit (no window).
+    #[arg(long, value_name = "SESSION_ID")]
+    pub close: Option<String>,
+
     /// For --mode desktop: startup command to run inside labwc.
     /// Examples: "konsole", "startplasma-wayland", "dbus-run-session sway".
     /// If omitted, the server auto-detects an available terminal.
