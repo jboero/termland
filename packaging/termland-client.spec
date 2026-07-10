@@ -12,12 +12,15 @@
 
 Name:           termland-client
 Version:        %{version}
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Termland remote desktop client — view and interact with remote Wayland sessions
 
 License:        LGPL-3.0-or-later
 URL:            https://github.com/jboero/termland
 Source0:        https://github.com/jboero/termland/archive/v%{version}/%{crate_name}-%{version}.tar.gz
+# Vendored crate dependencies, so %%build works offline (COPR/mock build roots
+# have no network). Regenerate with: packaging/make-vendor-tarball.sh
+Source1:        %{crate_name}-%{version}-vendor.tar.xz
 
 # ─── Build dependencies ──────────────────────────────────────────────────────
 # Rust toolchain
@@ -93,9 +96,20 @@ Keyboard shortcuts:
 
 %prep
 %setup -q -n %{crate_name}-%{version}
+# Unpack vendored crate deps (Source1) and point cargo at them so %%build runs
+# fully offline — COPR/mock build roots have no network access.
+tar -xf %{SOURCE1}
+mkdir -p .cargo
+cat > .cargo/config.toml <<'CARGOEOF'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+CARGOEOF
 
 %build
-cargo build --release --bin termland-client
+cargo build --release --offline --bin termland-client
 
 # Generate shell completions
 ./target/release/termland-client --completions bash > termland-client.bash
@@ -120,6 +134,9 @@ install -Dm644 termland-client.fish %{buildroot}%{_datadir}/fish/vendor_completi
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Fri Jul 10 2026 John Boero - 0.4.1-2
+- Build offline from vendored crate deps (COPR/mock build roots have no network)
+
 * Fri Jul 10 2026 John Boero - 0.4.1-1
 - Fix inverted vertical mouse scroll (winit up = Wayland down)
 

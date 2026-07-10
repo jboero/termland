@@ -12,12 +12,15 @@
 
 Name:           termland-server
 Version:        %{version}
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Termland remote desktop server — stream Wayland sessions via AV1/VP9/HEVC/H.264/Opus
 
 License:        LGPL-3.0-or-later
 URL:            https://github.com/jboero/termland
 Source0:        https://github.com/jboero/termland/archive/v%{version}/%{crate_name}-%{version}.tar.gz
+# Vendored crate dependencies, so %%build works offline (COPR/mock build roots
+# have no network). Regenerate with: packaging/make-vendor-tarball.sh
+Source1:        %{crate_name}-%{version}-vendor.tar.xz
 
 # ─── Build dependencies ──────────────────────────────────────────────────────
 # Rust toolchain (cargo, rustc)
@@ -94,9 +97,20 @@ input injection, and audio sink.
 
 %prep
 %setup -q -n %{crate_name}-%{version}
+# Unpack vendored crate deps (Source1) and point cargo at them so %%build runs
+# fully offline — COPR/mock build roots have no network access.
+tar -xf %{SOURCE1}
+mkdir -p .cargo
+cat > .cargo/config.toml <<'CARGOEOF'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+CARGOEOF
 
 %build
-cargo build --release --bin termland-server
+cargo build --release --offline --bin termland-server
 
 # Generate shell completions
 ./target/release/termland-server --completions bash > termland-server.bash
@@ -159,6 +173,9 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Fri Jul 10 2026 John Boero - 0.4.1-2
+- Build offline from vendored crate deps (COPR/mock build roots have no network)
+
 * Fri Jul 10 2026 John Boero - 0.4.1-1
 - Version bump to keep server/client in lockstep (client scroll-direction fix;
   no server-side changes)
