@@ -171,5 +171,35 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // One-shot session-management ops run without a GUI window and exit.
+    if args.list_sessions || args.close.is_some() {
+        use anyhow::Context;
+        let server = args.server.clone().context("a server address is required")?;
+        let op = match args.close.clone() {
+            Some(id) => connection::ControlOp::Close(id),
+            None => connection::ControlOp::List,
+        };
+        let params = connection::ConnectParams {
+            mode: args.session_mode(),
+            width: args.width,
+            height: args.height,
+            quality: args.quality,
+            audio: false,
+            ssh_opts: args.ssh_opt.clone(),
+            tls: args.tls || args.accept_invalid_certs,
+            accept_invalid_certs: args.accept_invalid_certs,
+            username: args.user.clone(),
+            password: args.password.clone(),
+            desktop_shell: None,
+            encoder_preset: None,
+            encoder_crf: None,
+            encoder_extra_params: None,
+            codec: None,
+            attach: None,
+        };
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(connection::run_control(&server, args.ssh, params, op));
+    }
+
     display::run(args)
 }
