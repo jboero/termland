@@ -143,6 +143,100 @@ pub fn format_rate(bytes_per_sec: u64) -> String {
     }
 }
 
+// ─── Alpha blending (framebuffer has no alpha channel; blend manually) ────
+
+/// Blend `src` (0x00RRGGBB) over `dst` at opacity `alpha` (0..=255).
+fn blend(dst: u32, src: u32, alpha: u32) -> u32 {
+    let ia = 255 - alpha;
+    let dr = (dst >> 16) & 0xff;
+    let dg = (dst >> 8) & 0xff;
+    let db = dst & 0xff;
+    let sr = (src >> 16) & 0xff;
+    let sg = (src >> 8) & 0xff;
+    let sb = src & 0xff;
+    let r = (sr * alpha + dr * ia) / 255;
+    let g = (sg * alpha + dg * ia) / 255;
+    let b = (sb * alpha + db * ia) / 255;
+    (r << 16) | (g << 8) | b
+}
+
+fn fill_rect_alpha(buf: &mut [u32], stride: usize, x: usize, y: usize, w: usize, h: usize, color: u32, alpha: u32) {
+    let h_total = buf.len() / stride.max(1);
+    for row in y..(y + h).min(h_total) {
+        let base = row * stride;
+        for px in x..(x + w).min(stride) {
+            let idx = base + px;
+            if idx < buf.len() {
+                buf[idx] = blend(buf[idx], color, alpha);
+            }
+        }
+    }
+}
+
+fn draw_rect_outline(buf: &mut [u32], stride: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
+    fill_rect(buf, stride, x, y, w, 1, color);
+    fill_rect(buf, stride, x, y + h - 1, w, 1, color);
+    fill_rect(buf, stride, x, y, 1, h, color);
+    fill_rect(buf, stride, x + w - 1, y, 1, h, color);
+}
+
+// ─── Translucent keyboard button (touch: pop up an on-screen keyboard) ────
+
+pub const KBD_BTN_SIZE: u32 = 46;
+const KBD_BTN_MARGIN: u32 = 18;
+
+/// Bottom-right rect (x, y, w, h) of the keyboard button in framebuffer pixels.
+pub fn keyboard_button_rect(fb_width: u32, fb_height: u32) -> (u32, u32, u32, u32) {
+    let s = KBD_BTN_SIZE;
+    let x = fb_width.saturating_sub(s + KBD_BTN_MARGIN);
+    let y = fb_height.saturating_sub(s + KBD_BTN_MARGIN);
+    (x, y, s, s)
+}
+
+/// Draw a translucent rounded keyboard button in the bottom-right corner.
+/// `active` = the on-screen keyboard is currently shown (highlights the button).
+pub fn draw_keyboard_button(buf: &mut [u32], fb_width: u32, fb_height: u32, active: bool) {
+    let (x, y, w, h) = keyboard_button_rect(fb_width, fb_height);
+    let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
+    let stride = fb_width as usize;
+
+    // Translucent panel + subtle border.
+    let bg_alpha = if active { 210 } else { 140 };
+    fill_rect_alpha(buf, stride, x, y, w, h, 0x1E1E2E, bg_alpha);
+    let border = if active { BAR_ON_FG } else { 0x585B70 };
+    draw_rect_outline(buf, stride, x, y, w, h, border);
+
+    // Keyboard glyph: an outlined body with a grid of keys and a spacebar.
+    let fg = if active { BAR_ON_FG } else { 0xCDD6F4 };
+    let pad = 10;
+    let (bx, by) = (x + pad, y + pad);
+    let (bw, bh) = (w - 2 * pad, h - 2 * pad);
+    draw_rect_outline(buf, stride, bx, by, bw, bh, fg);
+
+    // Two rows of little keys.
+    let key = 3usize;
+    let gap = 3usize;
+    let cols = 4;
+    let start_x = bx + 4;
+    for r in 0..2 {
+        let ky = by + 4 + r * (key + gap);
+        for c in 0..cols {
+            let kx = start_x + c * (key + gap);
+            fill_rect(buf, stride, kx, ky, key, key, fg);
+        }
+    }
+    // Spacebar.
+    let sy = by + bh - 6;
+    fill_rect(buf, stride, bx + 4, sy, bw - 8, 2, fg);
+}
+
+/// Is (x, y) (framebuffer pixels) inside the keyboard button?
+pub fn hit_test_keyboard_button(fb_width: u32, fb_height: u32, x: f64, y: f64) -> bool {
+    let (bx, by, bw, bh) = keyboard_button_rect(fb_width, fb_height);
+    let (xi, yi) = (x as i32, y as i32);
+    xi >= bx as i32 && xi < (bx + bw) as i32 && yi >= by as i32 && yi < (by + bh) as i32
+}
+
 // ─── Menubar (persistent, always visible unless fullscreen) ───────────────
 
 pub const MENUBAR_HEIGHT: u32 = 24;

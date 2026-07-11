@@ -163,6 +163,10 @@ struct App {
     /// scale the remote frame to fit the window instead of resizing the remote
     /// session (like a zoom), leaving the session resolution untouched.
     scale_modifier_held: bool,
+    /// The on-screen keyboard process, if the translucent keyboard button has
+    /// popped one up. Toggled by tapping the button (touch devices with no
+    /// physical keyboard). None = hidden.
+    osk_child: Option<std::process::Child>,
 }
 
 impl App {
@@ -184,7 +188,68 @@ impl App {
             pending_resize: None,
             last_sent_size: None,
             scale_modifier_held: false,
+            osk_child: None,
         }
+    }
+
+    /// Scale window-pixel coords to remote (frame) coords for the server.
+    fn to_frame_coords(&self, x: f64, y: f64) -> (f64, f64) {
+        if let Some(win) = &self.window {
+            let ws = win.inner_size();
+            if ws.width > 0 && ws.height > 0 && self.frame_width > 0 {
+                return (
+                    x * self.frame_width as f64 / ws.width as f64,
+                    y * self.frame_height as f64 / ws.height as f64,
+                );
+            }
+        }
+        (x, y)
+    }
+
+    /// Toggle a local on-screen keyboard. Its keystrokes land in this focused
+    /// window and are forwarded to the remote session like any other key input.
+    /// Best-effort: tries known Wayland/X OSKs (override with $TERMLAND_OSK).
+    fn toggle_osk(&mut self) {
+        // If one is running, hide it (kill). Reap first if it already exited.
+        if let Some(child) = self.osk_child.as_mut() {
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.osk_child = None;
+                tracing::info!("On-screen keyboard hidden");
+                return;
+            }
+            self.osk_child = None; // it had already exited
+        }
+
+        // Candidate OSK commands, first that launches wins. wvkbd uses the
+        // virtual-keyboard protocol so its keys reach the focused surface.
+        let candidates: Vec<Vec<String>> = match std::env::var("TERMLAND_OSK") {
+            Ok(cmd) if !cmd.trim().is_empty() => {
+                vec![cmd.split_whitespace().map(String::from).collect()]
+            }
+            _ => vec![
+                vec!["wvkbd-mobintl".into()],
+                vec!["wvkbd-mobveil".into()],
+                vec!["squeekboard".into()],
+                vec!["onboard".into()],
+            ],
+        };
+        for argv in candidates {
+            let (prog, args) = argv.split_first().unwrap();
+            match std::process::Command::new(prog).args(args).spawn() {
+                Ok(child) => {
+                    tracing::info!("On-screen keyboard shown ({prog})");
+                    self.osk_child = Some(child);
+                    return;
+                }
+                Err(e) => tracing::debug!("OSK {prog} unavailable: {e}"),
+            }
+        }
+        tracing::warn!(
+            "No on-screen keyboard found (tried wvkbd/squeekboard/onboard). \
+             Set $TERMLAND_OSK to your keyboard command."
+        );
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -414,6 +479,11 @@ impl App {
                 self.bar_hovered = None;
             }
 
+            // Translucent keyboard button, always available (corner overlay) —
+            // essential in fullscreen / on touch where the menubar is hidden.
+            overlay::draw_keyboard_button(&mut buffer, ww_nz.get(), wh_nz.get(),
+                self.osk_child.is_some());
+
             let _ = buffer.present();
         }
     }
@@ -454,6 +524,16 @@ fn keycode_to_evdev(key: KeyCode) -> Option<u32> {
         KeyCode::SuperLeft => 125, KeyCode::SuperRight => 126,
         _ => return None,
     })
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Don't leave the on-screen keyboard running after the client exits.
+        if let Some(mut child) = self.osk_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 fn mouse_button_to_linux(button: WinitMouseButton) -> u32 {
@@ -607,6 +687,18 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // The translucent keyboard button (bottom-right) is always
+                // available — tap it to pop up / hide the on-screen keyboard.
+                if state == ElementState::Pressed && button == WinitMouseButton::Left {
+                    if let Some(win) = &self.window {
+                        let sz = win.inner_size();
+                        if overlay::hit_test_keyboard_button(sz.width, sz.height, self.cursor_win_x, self.cursor_win_y) {
+                            self.toggle_osk();
+                            return;
+                        }
+                    }
+                }
+
                 // Check if the click is on a menubar item first.
                 let on_bar = self.bar_visible && !self.fullscreen
                     && self.cursor_win_y < MENUBAR_HEIGHT as f64;
@@ -643,6 +735,37 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::PixelDelta(p) => (p.x, -p.y),
                 };
                 self.send_cmd(ClientCommand::MouseScroll(input::MouseScroll { dx, dy }));
+            }
+            WindowEvent::Touch(t) => {
+                use winit::event::TouchPhase;
+                let (wx, wy) = (t.location.x, t.location.y);
+                self.cursor_win_x = wx;
+                self.cursor_win_y = wy;
+
+                // Keyboard button first: a tap on it toggles the OSK, swallowed.
+                if matches!(t.phase, TouchPhase::Started) {
+                    if let Some(win) = &self.window {
+                        let sz = win.inner_size();
+                        if overlay::hit_test_keyboard_button(sz.width, sz.height, wx, wy) {
+                            self.toggle_osk();
+                            return;
+                        }
+                    }
+                }
+
+                // Otherwise treat a single touch as a left-button pointer so the
+                // remote is usable on touchscreens: move, then press/release.
+                let (sx, sy) = self.to_frame_coords(wx, wy);
+                self.send_cmd(ClientCommand::MouseMove(input::MouseMove { x: sx, y: sy, absolute: true }));
+                match t.phase {
+                    TouchPhase::Started => self.send_cmd(ClientCommand::MouseButton(input::MouseButton {
+                        button: 0x110, state: input::ButtonState::Pressed,
+                    })),
+                    TouchPhase::Ended | TouchPhase::Cancelled => self.send_cmd(ClientCommand::MouseButton(input::MouseButton {
+                        button: 0x110, state: input::ButtonState::Released,
+                    })),
+                    TouchPhase::Moved => {}
+                }
             }
             WindowEvent::CursorEntered { .. } => {
                 self.cursor_in_window = true;
