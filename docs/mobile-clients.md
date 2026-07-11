@@ -88,6 +88,71 @@ sandboxes forbid spawning processes. Options, in recommended order:
 - **Rotation / resolution:** send device size on connect; on rotate, `SessionResize`
   or local scale. Persistence means rotate/background/reconnect just resumes.
 
+## Keyboard & text input (the hard problem)
+
+Desktop input injection sends **scancodes** (`KeyEvent` → evdev scancode →
+virtual keyboard, on a fixed xkb keymap). That's fine for physical keys, but
+mobile soft keyboards + IMEs produce **Unicode text** with autocorrect,
+prediction, emoji, and CJK composition — none of which map to fixed scancodes.
+So we need *two* input channels, and a smarter server-side injector.
+
+### Two channels
+
+1. **Committed text** (what the IME finalizes) → a new `TextInput { text: String }`
+   message (already-composed Unicode). Handles Latin+autocorrect, emoji, CJK.
+2. **Editing / navigation / shortcut keys** (Backspace, Enter, Tab, Esc, arrows,
+   Ctrl/Alt/Super combos like Ctrl+C) → the existing `KeyEvent` (scancode/keysym)
+   path. These are *not* text and must stay as key events.
+
+The mobile UI decides which channel: printable committed text → `TextInput`;
+everything else → `KeyEvent`. Because desktop targets need modifiers that phones
+lack, the UI adds an **on-screen modifier bar** (Ctrl / Alt / Super / Esc / Tab /
+arrows / Fn) — standard in mobile terminal/remote apps.
+
+### Client capture per platform
+
+- **Android:** attach a hidden view with a custom `InputConnection`.
+  `commitText()` → `TextInput`; `deleteSurroundingText`/`sendKeyEvent(KEYCODE_DEL)`
+  → Backspace `KeyEvent`; hardware keys via `onKeyDown`. Composing text
+  (`setComposingText`) shown locally; sent on commit.
+- **iOS:** implement `UIKeyInput` (MVP) then `UITextInput` (full IME) on the
+  render view. `insertText:` → `TextInput`; `deleteBackward` → Backspace;
+  hardware keyboards via `pressesBegan`/`UIPress`; marked (composing) text via
+  `UITextInput`.
+- **MVP simplification:** send only *committed* text (ignore intermediate
+  composition). Works for Latin + autocorrect-on-commit; live CJK/marked-text
+  composition is a later refinement (K3).
+
+### Server-side: injecting Unicode into Wayland
+
+This is the interesting part. Options, best first:
+
+- **Primary — Wayland input-method-v2.** Run a `zwp_input_method_v2` client in
+  the server that receives `TextInput` and **commits the UTF-8 string directly to
+  the focused surface** — literally "an IME committing text to the focused app".
+  This is the *correct* Wayland abstraction: full Unicode, no keymap hacking,
+  and the app's own text field handles it. wlroots-based labwc/cage/sway support
+  input-method-v2, so this works in our compositors.
+- **Fallback — dynamic xkb keymap (wtype-style).** For apps/surfaces that don't
+  participate in text-input (some terminals, games), synthesize a temporary xkb
+  keymap that maps spare keycodes to the exact keysyms/codepoints in the string,
+  upload it via the virtual keyboard, "press" them in order, then restore. Robust
+  but fiddly; used only when input-method-v2 isn't accepted.
+- **Editing/shortcut keys** always use the existing virtual-keyboard scancode
+  path regardless — they're real keys, not text.
+
+So the server grows a small "text injector" with two backends
+(input-method-v2 → dynamic-keymap fallback), selected per focused surface.
+
+### Keyboard phasing
+
+- **K1** — on-screen modifier bar + `KeyEvent` (works today for hardware
+  keyboards and editing keys).
+- **K2** — `TextInput` message + server input-method-v2 committer → soft-keyboard
+  Unicode text, emoji, autocorrect.
+- **K3** — live composing/marked text (CJK IME) + dynamic-keymap fallback for
+  non-text-input apps.
+
 ## Session-management UI (leans on v0.5)
 
 - Home: saved host profiles; each shows resumable sessions (`SessionList`).

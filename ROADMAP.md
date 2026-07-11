@@ -116,6 +116,9 @@ Replace TCP with QUIC for the video/audio data stream. Benefits:
 - Independent streams for video, audio, and control (no priority inversion)
 - WebTransport variant enables a future browser-based client
 
+Now designed and pulled forward alongside the mobile work — see
+[docs/quic-transport.md](docs/quic-transport.md).
+
 ## v0.5 — SHIPPED (v0.5.0): Persistent sessions + tray session manager
 
 X2Go/NX-style **detachable sessions** and a global tray manager — done and
@@ -201,11 +204,28 @@ Native touch clients for phones/tablets. Full design in
   advertises exactly the codecs the device can decode — so our negotiation "just
   works" (e.g. iOS has no VP8/VP9, so the server serves HEVC automatically).
 - **Transport:** MVP over the existing TCP+TLS listener; then an embedded
-  pure-Rust SSH subsystem (`russh`) for zero-config parity; QUIC later.
+  pure-Rust SSH subsystem (`russh`) for zero-config parity; then **QUIC**
+  (see below).
+- **Keyboard/text is the hard part** (IME, autocorrect, CJK, emoji don't map to
+  scancodes). Plan: a `TextInput` Unicode message injected server-side via
+  Wayland **input-method-v2** (with a dynamic-xkb-keymap fallback), plus the
+  existing `KeyEvent` path for editing/shortcut keys and an on-screen modifier
+  bar. Full design in [docs/mobile-clients.md](docs/mobile-clients.md).
 - **Mobile is where v0.5 persistence shines:** links drop constantly, so
   auto-detach + one-tap resume is the flagship UX.
 - Phasing: M1 core+UniFFI → M2 Android → M3 iOS → M4 (embedded SSH, audio,
   trackpad, AV1-where-HW, QUIC).
+
+### QUIC transport (pulled forward for mobile)
+
+Full design in [docs/quic-transport.md](docs/quic-transport.md). QUIC gives
+**connection migration** (survive Wi-Fi↔cellular), **0-RTT resume**, and
+**no head-of-line blocking** across video/audio/input — exactly what lossy,
+roaming mobile links need, and it pairs with v0.5 resume. `quinn` (pure-Rust)
+on both server and the mobile core. Phasing: Q1 = QUIC as a drop-in single-stream
+byte transport (small, low-risk, already gets migration + 0-RTT); Q2 = split
+video/audio onto their own streams/datagrams for HOL-free A/V. Desktop WAN users
+benefit for free.
 
 ## v0.3 / stretch
 
