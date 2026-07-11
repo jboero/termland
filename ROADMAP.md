@@ -189,6 +189,24 @@ and, if ever wanted, a richer cxx-qt UI (the ksni tray covers the core need).
 2. Control-plane messages (B) — small, unblocks the UI.
 3. Tray + manager (C) — build on the working attach/resume flow.
 
+## Mobile clients (Android + iOS)
+
+Native touch clients for phones/tablets. Full design in
+[docs/mobile-clients.md](docs/mobile-clients.md). Highlights:
+
+- **Shared Rust core** (`termland-mobile-core`, exposed via UniFFI → Kotlin +
+  Swift) reuses `termland-protocol`, codec negotiation, and v0.5 session control.
+  It does protocol + negotiation + packet routing; **it does not bundle FFmpeg**.
+- **Platform hardware decode:** Android MediaCodec, iOS VideoToolbox. Each client
+  advertises exactly the codecs the device can decode — so our negotiation "just
+  works" (e.g. iOS has no VP8/VP9, so the server serves HEVC automatically).
+- **Transport:** MVP over the existing TCP+TLS listener; then an embedded
+  pure-Rust SSH subsystem (`russh`) for zero-config parity; QUIC later.
+- **Mobile is where v0.5 persistence shines:** links drop constantly, so
+  auto-detach + one-tap resume is the flagship UX.
+- Phasing: M1 core+UniFFI → M2 Android → M3 iOS → M4 (embedded SSH, audio,
+  trackpad, AV1-where-HW, QUIC).
+
 ## v0.3 / stretch
 
 - Clipboard sync (plain text first, then images)
