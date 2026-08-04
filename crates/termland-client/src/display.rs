@@ -11,7 +11,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, Raw
 
 use crate::Args;
 use crate::connection::{ClientCommand, ConnectParams, ServerEvent, connect};
-use crate::overlay::{self, BarItem, BarLayout, MenuState, MENUBAR_HEIGHT};
+use crate::overlay::{self, BarItem, BarLayout, MenuState, RemoteCursor, MENUBAR_HEIGHT};
 use termland_protocol::input;
 use winit::window::Fullscreen;
 
@@ -141,6 +141,14 @@ struct App {
     cursor_win_y: f64,
     /// Whether the cursor is currently inside the window.
     cursor_in_window: bool,
+    /// Latest cursor bitmap received from the server (client-side-cursor
+    /// mode). Position is NOT taken from this - see `RemoteCursor`'s doc
+    /// comment - only the image/hotspot/visibility. Starts empty (before the
+    /// first `CursorUpdate` arrives, e.g. right after connect, or if the
+    /// server's compositor doesn't support cursor capture at all), in which
+    /// case render() falls back to the generic placeholder so the cursor is
+    /// never simply invisible.
+    remote_cursor: RemoteCursor,
     /// Latest reported network data rate in bytes/sec.
     data_rate: u64,
     /// Track last-set title so we don't spam set_title on every redraw.
@@ -179,6 +187,7 @@ impl App {
             menu: MenuState::new(),
             cursor_win_x: 0.0, cursor_win_y: 0.0,
             cursor_in_window: false,
+            remote_cursor: RemoteCursor::default(),
             data_rate: 0,
             last_title: String::new(),
             bar_layout: None,
@@ -365,6 +374,16 @@ impl App {
                 ServerEvent::DataRate { bytes_per_sec } => {
                     self.data_rate = bytes_per_sec;
                 }
+                ServerEvent::CursorUpdate(cu) => {
+                    self.remote_cursor = RemoteCursor {
+                        hotspot_x: cu.hotspot_x,
+                        hotspot_y: cu.hotspot_y,
+                        width: cu.width,
+                        height: cu.height,
+                        visible: cu.visible,
+                        rgba: cu.image_rgba,
+                    };
+                }
                 ServerEvent::Pong(_) => {}
                 ServerEvent::Disconnected => {
                     tracing::info!("Session ended");
@@ -459,8 +478,16 @@ impl App {
             let over_bar = self.bar_visible && !self.fullscreen
                 && self.cursor_win_y < MENUBAR_HEIGHT as f64;
             if self.menu.client_cursor && self.cursor_in_window && !over_bar {
-                overlay::draw_local_cursor(&mut buffer, ww_nz.get(), wh_nz.get(),
-                    self.cursor_win_x, self.cursor_win_y);
+                if self.remote_cursor.is_empty() {
+                    // No real cursor bitmap yet (just connected, or the
+                    // server's compositor couldn't capture one) - never show
+                    // nothing at all.
+                    overlay::draw_local_cursor(&mut buffer, ww_nz.get(), wh_nz.get(),
+                        self.cursor_win_x, self.cursor_win_y);
+                } else {
+                    overlay::draw_remote_cursor(&mut buffer, ww_nz.get(), wh_nz.get(),
+                        self.cursor_win_x, self.cursor_win_y, &self.remote_cursor);
+                }
             }
 
             // Menubar (toggle with F10, also hidden in fullscreen)

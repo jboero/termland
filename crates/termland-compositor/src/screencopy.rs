@@ -375,14 +375,21 @@ impl ScreenCapturer {
 }
 
 /// Create a wl_shm pool and buffer for frame capture.
-fn create_shm_buffer(
+///
+/// Generic over the Dispatch state `D` so [`crate::cursor_capture`] (a
+/// separate Wayland client with its own state type) can reuse this instead of
+/// duplicating the memfd/pool/buffer dance.
+pub(crate) fn create_shm_buffer<D>(
     shm: &wl_shm::WlShm,
     width: u32,
     height: u32,
     stride: u32,
     format: u32,
-    qh: &QueueHandle<CaptureState>,
-) -> Result<(wl_shm_pool::WlShmPool, wl_buffer::WlBuffer, OwnedFd), CaptureError> {
+    qh: &QueueHandle<D>,
+) -> Result<(wl_shm_pool::WlShmPool, wl_buffer::WlBuffer, OwnedFd), CaptureError>
+where
+    D: Dispatch<wl_shm_pool::WlShmPool, ()> + Dispatch<wl_buffer::WlBuffer, ()> + 'static,
+{
     let size = (stride * height) as i32;
 
     // Create a memfd for the shared memory
@@ -399,7 +406,7 @@ fn create_shm_buffer(
 }
 
 /// Create an anonymous shared memory fd.
-fn create_memfd(size: usize) -> Result<OwnedFd, CaptureError> {
+pub(crate) fn create_memfd(size: usize) -> Result<OwnedFd, CaptureError> {
     use nix::sys::memfd;
     use nix::unistd;
 
@@ -416,7 +423,7 @@ fn create_memfd(size: usize) -> Result<OwnedFd, CaptureError> {
 }
 
 /// Read from the shm fd and convert to RGBA.
-fn read_shm_to_rgba(
+pub(crate) fn read_shm_to_rgba(
     fd: &OwnedFd,
     size: usize,
     width: u32,

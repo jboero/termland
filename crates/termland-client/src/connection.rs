@@ -14,6 +14,12 @@ pub enum ServerEvent {
     Frame { width: u32, height: u32, pixels: Vec<u32> },
     /// Periodic data rate update in bytes/sec (measured over the last ~1s).
     DataRate { bytes_per_sec: u64 },
+    /// The server's compositor cursor bitmap changed. Only sent while we're
+    /// in client-side-cursor mode (see `SetCursorInFrame`); tells the display
+    /// layer what shape to actually draw instead of the generic placeholder.
+    /// Carries no position - see the note on `RemoteCursor` in display.rs for
+    /// why position stays purely locally-tracked.
+    CursorUpdate(CursorUpdate),
     #[allow(dead_code)]
     Pong(Pong),
     Disconnected,
@@ -431,6 +437,10 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                         if let Some(ref atx) = audio_tx {
                             let _ = atx.send(AudioJob { data: ac.data });
                         }
+                    }
+                    Some(Ok(Message::CursorUpdate(cu))) => {
+                        bytes_since_report += cu.image_rgba.len() as u64;
+                        let _ = server_tx.send(ServerEvent::CursorUpdate(cu));
                     }
                     Some(Ok(Message::ClipboardData(cp))) => {
                         tracing::debug!("Clipboard received ({} bytes)", cp.data.len());

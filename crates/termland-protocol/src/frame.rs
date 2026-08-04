@@ -166,6 +166,44 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_cursor_update() {
+        // Non-trivial hotspot/dimensions and a non-empty image, since the
+        // whole point of this message is carrying an actual cursor bitmap
+        // (not just position) from server to client.
+        let msg = Message::CursorUpdate(crate::CursorUpdate {
+            x: 640,
+            y: 360,
+            hotspot_x: 3,
+            hotspot_y: 1,
+            width: 16,
+            height: 16,
+            visible: true,
+            image_rgba: [0u8, 128, 255, 255].repeat(16 * 16),
+        });
+
+        let mut codec = TermlandCodec;
+        let mut buf = BytesMut::new();
+
+        Encoder::encode(&mut codec, msg, &mut buf).unwrap();
+        assert_eq!(buf[2], crate::MessageId::CursorUpdate as u8);
+
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        match decoded {
+            Message::CursorUpdate(cu) => {
+                assert_eq!(cu.x, 640);
+                assert_eq!(cu.y, 360);
+                assert_eq!(cu.hotspot_x, 3);
+                assert_eq!(cu.hotspot_y, 1);
+                assert_eq!(cu.width, 16);
+                assert_eq!(cu.height, 16);
+                assert!(cu.visible);
+                assert_eq!(cu.image_rgba.len(), 16 * 16 * 4);
+            }
+            other => panic!("expected CursorUpdate, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn partial_read() {
         let msg = Message::Ping(crate::Ping { timestamp_us: 42 });
 

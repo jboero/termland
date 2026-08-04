@@ -105,6 +105,75 @@ const CURSOR_SPRITE: &[&str] = &[
     "......##........",
 ];
 
+/// The server's actual compositor cursor bitmap, as last received via
+/// `Message::CursorUpdate`. Image-only: no position. The server does report
+/// a position on the wire (the protocol message carries x/y), but display.rs
+/// deliberately ignores it and keeps rendering at the locally-tracked mouse
+/// position instead - see the comment where this is consumed for why
+/// (round-tripping position through the server would add exactly the input
+/// latency client-side-cursor mode exists to avoid).
+#[derive(Clone, Default)]
+pub struct RemoteCursor {
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub visible: bool,
+    /// RGBA8 pixels, `width * height * 4` bytes, with a real per-pixel alpha
+    /// channel (unlike the video frame path, cursor bitmaps are mostly
+    /// transparent around a small opaque glyph).
+    pub rgba: Vec<u8>,
+}
+
+impl RemoteCursor {
+    /// A cursor update carries no usable image yet (e.g. right after
+    /// connect, or the server couldn't capture one this round).
+    pub fn is_empty(&self) -> bool {
+        self.rgba.is_empty() || self.width == 0 || self.height == 0
+    }
+}
+
+/// Draw the server's real cursor bitmap at the locally-tracked pointer
+/// position `(x, y)` (window pixels), offset by its hotspot so the same
+/// point of the image sits under the pointer as it would on the remote.
+/// Alpha-blends since cursor bitmaps have real transparency, unlike the
+/// opaque video frame.
+pub fn draw_remote_cursor(buf: &mut [u32], fb_width: u32, fb_height: u32, x: f64, y: f64, cursor: &RemoteCursor) {
+    if !cursor.visible || cursor.is_empty() {
+        return;
+    }
+    let stride = fb_width as usize;
+    let top_left_x = x as i32 - cursor.hotspot_x;
+    let top_left_y = y as i32 - cursor.hotspot_y;
+
+    for row in 0..cursor.height as usize {
+        let py = top_left_y + row as i32;
+        if py < 0 || py >= fb_height as i32 {
+            continue;
+        }
+        for col in 0..cursor.width as usize {
+            let px = top_left_x + col as i32;
+            if px < 0 || px >= fb_width as i32 {
+                continue;
+            }
+            let src_off = (row * cursor.width as usize + col) * 4;
+            let Some(chunk) = cursor.rgba.get(src_off..src_off + 4) else {
+                continue;
+            };
+            let (r, g, b, a) = (chunk[0], chunk[1], chunk[2], chunk[3]);
+            if a == 0 {
+                continue;
+            }
+            let idx = py as usize * stride + px as usize;
+            if idx >= buf.len() {
+                continue;
+            }
+            let src = (r as u32) << 16 | (g as u32) << 8 | b as u32;
+            buf[idx] = if a == 255 { src } else { blend(buf[idx], src, a as u32) };
+        }
+    }
+}
+
 pub fn draw_local_cursor(buf: &mut [u32], fb_width: u32, fb_height: u32, x: f64, y: f64) {
     let stride = fb_width as usize;
     let cx = x as i32;

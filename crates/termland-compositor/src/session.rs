@@ -2,6 +2,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::backend::{self, detect_desktop_shell};
+use crate::cursor_capture::{CursorCapture, CursorCapturer};
 use crate::output_resize::OutputResizer;
 use crate::screencopy::ScreenCapturer;
 
@@ -59,6 +60,12 @@ pub struct Compositor {
     /// change the headless output's size at runtime. Optional because older
     /// compositors may not advertise the protocol.
     resizer: Option<OutputResizer>,
+    /// Separate Wayland client driving ext-image-copy-capture-v1's pointer
+    /// cursor session, used for client-side-cursor mode (see
+    /// `capture_cursor`). Optional because it's a staging protocol older
+    /// compositors don't advertise; when absent, callers should fall back to
+    /// not sending cursor shape updates at all.
+    cursor_capturer: Option<CursorCapturer>,
     /// Name of the compositor backend for logging.
     backend_name: &'static str,
 }
@@ -129,11 +136,27 @@ impl Compositor {
             }
         }
 
+        // Optional: connect the pointer cursor capture session. Same
+        // "degrade, don't fail the whole session" treatment as the resizer -
+        // ext-image-copy-capture-v1 is a staging protocol many compositors
+        // (and older wlroots versions) don't implement yet.
+        let cursor_capturer = match CursorCapturer::connect(&wayland_display) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(
+                    "Cursor shape capture unavailable ({e}) - client-side cursor \
+                     mode will show a generic placeholder instead of the real shape"
+                );
+                None
+            }
+        };
+
         Ok(Self {
             config,
             wayland_display,
             capturer: Some(capturer),
             resizer,
+            cursor_capturer,
             backend_name,
         })
     }
@@ -148,6 +171,25 @@ impl Compositor {
 
         capturer
             .capture_frame(overlay_cursor)
+            .map_err(|e| CompositorError::CaptureError(e.to_string()))
+    }
+
+    /// Capture the current pointer cursor bitmap (image + hotspot +
+    /// visibility), independent of the video frame. Used for client-side
+    /// cursor rendering: see `CursorModeMsg` in termland-protocol for why
+    /// that mode exists and what it needs this for.
+    ///
+    /// Returns an error if cursor capture isn't available on this compositor
+    /// (see the `cursor_capturer` field doc) - callers should treat that as
+    /// "no shape update this round", not a fatal condition.
+    pub fn capture_cursor(&mut self) -> Result<CursorCapture, CompositorError> {
+        let capturer = self
+            .cursor_capturer
+            .as_mut()
+            .ok_or_else(|| CompositorError::CaptureError("cursor capturer not available".into()))?;
+
+        capturer
+            .capture_cursor()
             .map_err(|e| CompositorError::CaptureError(e.to_string()))
     }
 

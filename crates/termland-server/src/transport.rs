@@ -489,6 +489,24 @@ where
         (Some(crx), Some(cstop_tx), Some(h))
     };
 
+    // Spawn cursor-shape watch thread. It only actually captures/sends while
+    // the client is in client-side-cursor mode (overlay_cursor == false) -
+    // when overlay_cursor is true the cursor is already baked into the video
+    // frame by screencopy, so sending it again here would be redundant
+    // bandwidth. The thread itself always runs so it can react immediately
+    // when the client flips CursorMode mid-session.
+    let overlay_cursor_watch = overlay_cursor.clone();
+    let (mut cursor_rx, _cursor_stop_tx, _cursor_handle) = {
+        let (ctx, crx) = tokio::sync::mpsc::channel::<CursorUpdate>(4);
+        let (cstop_tx, cstop_rx) = tokio::sync::oneshot::channel::<()>();
+        let cursor_display = wayland_display.clone();
+        let h = std::thread::spawn(move || {
+            cursor_watch_thread(&cursor_display, ctx, cstop_rx, overlay_cursor_watch);
+        });
+        tracing::info!("  Cursor shape sync: client-side-cursor mode only (ext-image-copy-capture-v1)");
+        (Some(crx), Some(cstop_tx), Some(h))
+    };
+
     // Send the first frame
     let first_msg = frame_to_message(&first_frame);
     framed.send(first_msg).await.context("failed to send first frame")?;
@@ -557,6 +575,20 @@ where
                 if let Some(payload) = clip {
                     if let Err(e) = framed.send(Message::ClipboardData(payload)).await {
                         tracing::error!("Failed to send clipboard: {e}");
+                        break;
+                    }
+                }
+            }
+
+            cursor = async {
+                match cursor_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(update) = cursor {
+                    if let Err(e) = framed.send(Message::CursorUpdate(update)).await {
+                        tracing::error!("Failed to send cursor update: {e}");
                         break;
                     }
                 }
@@ -662,12 +694,18 @@ where
     if let Some(cstop) = _clip_stop_tx {
         let _ = cstop.send(());
     }
+    if let Some(cstop) = _cursor_stop_tx {
+        let _ = cstop.send(());
+    }
     let _ = capture_handle.join();
     let _ = input_handle.join();
     if let Some(ah) = _audio_handle {
         let _ = ah.join();
     }
     if let Some(ch) = _clip_handle {
+        let _ = ch.join();
+    }
+    if let Some(ch) = _cursor_handle {
         let _ = ch.join();
     }
 
@@ -1168,6 +1206,150 @@ fn clipboard_watch_thread(
     }
 
     tracing::info!("Clipboard watch thread exiting");
+}
+
+/// Poll interval for cursor shape capture while client-side-cursor mode is
+/// active. Much faster than the clipboard's 500ms poll (cursor shape changes
+/// need to feel immediate - hovering onto a text field or a window edge)
+/// but still far cheaper than doing it every video frame.
+const CURSOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Idle interval used while overlay_cursor is true (server-side/in-frame
+/// cursor mode), so this thread isn't busy-looping doing nothing useful.
+const CURSOR_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Hash a captured cursor's shape (dimensions, hotspot, visibility, pixels)
+/// so [`cursor_watch_thread`] can tell "same cursor as last time" from
+/// "actually changed" without resending the bitmap on every poll. Mirrors the
+/// clipboard watch thread's hash-and-compare pattern above.
+fn cursor_hash(width: u32, height: u32, hotspot_x: i32, hotspot_y: i32, visible: bool, rgba: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut h);
+    height.hash(&mut h);
+    hotspot_x.hash(&mut h);
+    hotspot_y.hash(&mut h);
+    visible.hash(&mut h);
+    rgba.hash(&mut h);
+    h.finish()
+}
+
+/// Cursor-shape watch thread: connects a dedicated ext-image-copy-capture-v1
+/// pointer cursor session on the session's Wayland display and, while the
+/// client wants client-side cursor rendering (`overlay_cursor == false`),
+/// polls it and forwards changes as `Message::CursorUpdate` (diffed by hash,
+/// same principle as `clipboard_watch_thread`). When `overlay_cursor == true`
+/// the cursor is already baked into the video frame by screencopy, so this
+/// just idles instead of capturing - sending it too would be redundant
+/// bandwidth for a cursor the client isn't even drawing itself.
+///
+/// If the compositor doesn't support the (staging) protocol this needs, the
+/// connect fails once, we log it, and return - the client keeps whatever
+/// generic placeholder it draws locally instead of a real shape.
+fn cursor_watch_thread(
+    wayland_display: &str,
+    cursor_tx: tokio::sync::mpsc::Sender<CursorUpdate>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    overlay_cursor: Arc<AtomicBool>,
+) {
+    let mut capturer = match termland_compositor::CursorCapturer::connect(wayland_display) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "Cursor shape capture unavailable ({e}) - client-side cursor \
+                 mode will fall back to its generic placeholder"
+            );
+            return;
+        }
+    };
+
+    tracing::info!("Cursor shape watch started on {wayland_display}");
+
+    let mut last_hash: u64 = 0;
+
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+
+        if overlay_cursor.load(Ordering::Relaxed) {
+            std::thread::sleep(CURSOR_IDLE_INTERVAL);
+            continue;
+        }
+
+        match capturer.capture_cursor() {
+            Ok(c) => {
+                let hash = cursor_hash(c.width, c.height, c.hotspot_x, c.hotspot_y, c.visible, &c.rgba);
+                if hash != last_hash {
+                    last_hash = hash;
+                    let update = CursorUpdate {
+                        x: c.x,
+                        y: c.y,
+                        hotspot_x: c.hotspot_x,
+                        hotspot_y: c.hotspot_y,
+                        width: c.width,
+                        height: c.height,
+                        visible: c.visible,
+                        image_rgba: c.rgba,
+                    };
+                    if cursor_tx.blocking_send(update).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Cursor capture failed: {e}");
+            }
+        }
+
+        std::thread::sleep(CURSOR_POLL_INTERVAL);
+    }
+
+    tracing::info!("Cursor shape watch thread exiting");
+}
+
+#[cfg(test)]
+mod cursor_hash_tests {
+    use super::cursor_hash;
+
+    #[test]
+    fn identical_inputs_hash_equal() {
+        let rgba = vec![10u8, 20, 30, 255, 40, 50, 60, 255];
+        let a = cursor_hash(2, 1, 0, 0, true, &rgba);
+        let b = cursor_hash(2, 1, 0, 0, true, &rgba);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn pixel_change_changes_hash() {
+        let a = cursor_hash(2, 1, 0, 0, true, &[10, 20, 30, 255, 40, 50, 60, 255]);
+        let b = cursor_hash(2, 1, 0, 0, true, &[10, 20, 30, 255, 40, 50, 61, 255]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hotspot_change_changes_hash() {
+        let rgba = vec![1u8, 2, 3, 255];
+        let a = cursor_hash(1, 1, 0, 0, true, &rgba);
+        let b = cursor_hash(1, 1, 3, 5, true, &rgba);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn visibility_change_changes_hash() {
+        let rgba = vec![1u8, 2, 3, 255];
+        let a = cursor_hash(1, 1, 0, 0, true, &rgba);
+        let b = cursor_hash(1, 1, 0, 0, false, &rgba);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn size_change_changes_hash() {
+        let rgba = vec![1u8, 2, 3, 255, 4, 5, 6, 255];
+        let a = cursor_hash(2, 1, 0, 0, true, &rgba);
+        let b = cursor_hash(1, 2, 0, 0, true, &rgba);
+        assert_ne!(a, b);
+    }
 }
 
 /// Set the remote session's clipboard via wl-copy.
