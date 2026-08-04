@@ -29,6 +29,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-native-certs = { workspace = true }
 
+# Pure-Rust SSH client for the embedded `Transport::Ssh` variant (mobile
+# sandboxes can't spawn the `ssh` binary the desktop client uses). Same
+# reasoning as the rustls block above: `ring` instead of the default
+# `aws-lc-rs` so nothing in this crate's own dependency graph needs
+# cmake/nasm/a C compiler on the NDK cross-compile host. `rsa` is kept for
+# host-key algorithm coverage even though this crate only ever does password
+# auth today; `russh` as of 0.62 folds key handling into `russh::keys`
+# directly, so there is no separate `russh-keys` crate to add.
+russh = { version = "0.62.5", default-features = false, features = ["ring", "flate2", "rsa"] }
+
 [dev-dependencies]
 bytes = { workspace = true }
 

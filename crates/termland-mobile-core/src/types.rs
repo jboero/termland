@@ -50,6 +50,19 @@ pub struct ServerProfile {
     pub accept_invalid_certs: bool,
     pub username: Option<String>,
     pub password: Option<String>,
+    /// Route through an embedded SSH `termland` subsystem channel (see
+    /// `Transport::Ssh`) instead of dialing `port` directly. Takes priority
+    /// over `use_tls` when both are set.
+    ///
+    /// NOTE: this is a new field added after the Android app's first release
+    /// against this record. UniFFI's `#[uniffi(default = false)]` gives
+    /// existing generated bindings a default, so `ServerProfile(...)` call
+    /// sites that predate SSH support keep compiling — but the Kotlin/Swift
+    /// bindings still need regenerating from this crate to see the field at
+    /// all. Flagging per the "frozen contract" rule: this is the one field
+    /// added in this change.
+    #[uniffi(default = false)]
+    pub use_ssh: bool,
 }
 
 /// One resumable session on the server, for the session-list screen.

@@ -391,4 +391,71 @@ mod tests {
         client.disconnect();
         assert!(!client.is_connected());
     }
+
+    fn profile() -> ServerProfile {
+        ServerProfile {
+            host: "example.test".into(),
+            port: 7867,
+            use_tls: false,
+            accept_invalid_certs: false,
+            username: None,
+            password: None,
+            use_ssh: false,
+        }
+    }
+
+    /// `Transport::for_profile` is the only place a `ServerProfile` gets
+    /// turned into a transport choice; a wrong priority here would silently
+    /// send SSH-configured profiles over plain TCP or vice versa.
+    #[test]
+    fn transport_selection_prioritizes_ssh_over_tls_over_tcp() {
+        use crate::transport::Transport;
+
+        assert!(matches!(Transport::for_profile(&profile()), Transport::Tcp));
+
+        let tls = ServerProfile { use_tls: true, ..profile() };
+        assert!(matches!(Transport::for_profile(&tls), Transport::Tls { accept_invalid_certs: false }));
+
+        let ssh = ServerProfile { use_ssh: true, ..profile() };
+        assert!(matches!(Transport::for_profile(&ssh), Transport::Ssh { .. }));
+
+        // use_ssh wins even if use_tls is also set: SSH tunnels the whole
+        // connection, so a leftover TLS flag from switching modes in the UI
+        // must not be able to downgrade or conflict with it.
+        let both = ServerProfile { use_ssh: true, use_tls: true, ..profile() };
+        assert!(matches!(Transport::for_profile(&both), Transport::Ssh { .. }));
+    }
+
+    /// SSH auth credentials come straight from the profile's existing
+    /// username/password fields (no separate SSH-specific fields), and must
+    /// tolerate an absent password rather than panicking or auth-ing with a
+    /// stale value.
+    #[test]
+    fn ssh_transport_takes_username_and_password_from_profile() {
+        use crate::transport::Transport;
+
+        let p = ServerProfile {
+            use_ssh: true,
+            username: Some("alice".into()),
+            password: Some("hunter2".into()),
+            ..profile()
+        };
+        match Transport::for_profile(&p) {
+            Transport::Ssh { username, password } => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, "hunter2");
+            }
+            _ => panic!("expected Transport::Ssh"),
+        }
+
+        // No password set: must default to empty, not panic.
+        let no_pw = ServerProfile { use_ssh: true, username: Some("bob".into()), ..profile() };
+        match Transport::for_profile(&no_pw) {
+            Transport::Ssh { username, password } => {
+                assert_eq!(username, "bob");
+                assert_eq!(password, "");
+            }
+            _ => panic!("expected Transport::Ssh"),
+        }
+    }
 }
