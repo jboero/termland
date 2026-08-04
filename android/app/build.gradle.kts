@@ -69,6 +69,17 @@ fun cargoEnv(): Map<String, String> {
     return buildMap {
         put("PATH", "$home/.cargo/bin:" + System.getenv("PATH"))
         put("CARGO_TARGET_DIR", cargoTargetDir.absolutePath)
+        // Pin explicitly: once the workspace's `rust-version = "1.85"` is
+        // satisfied by more than one installed toolchain (both rustup's
+        // default nightly and, once anything auto-installs it, a matching
+        // stable release), toolchain selection has been observed to differ
+        // between separate `cargo`/`cargo ndk` invocations sharing this same
+        // CARGO_TARGET_DIR — producing "compiled by an incompatible version
+        // of rustc" (E0514) from artifacts left by the other toolchain. There
+        // is exactly one toolchain here with all three Android std targets
+        // verified installed (nightly); pin to it so builds are
+        // reproducible regardless of what else rustup has lying around.
+        put("RUSTUP_TOOLCHAIN", "nightly")
         if (sdk != null) put("ANDROID_HOME", sdk)
         if (ndk != null) put("ANDROID_NDK_HOME", ndk)
     }
