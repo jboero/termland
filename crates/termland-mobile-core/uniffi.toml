@@ -1,0 +1,7 @@
+[bindings.kotlin]
+package_name = "dev.termland.core"
+cdylib_name = "termland_mobile_core"
+
+[bindings.swift]
+module_name = "TermlandCore"
+cdylib_name = "termland_mobile_core"

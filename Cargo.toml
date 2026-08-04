@@ -5,6 +5,7 @@ members = [
     "crates/termland-compositor",
     "crates/termland-server",
     "crates/termland-client",
+    "crates/termland-mobile-core",
 ]
 resolver = "2"
 
@@ -48,3 +49,4 @@ opus = "0.3"
 cpal = "0.15"
 libpulse-binding = "2"
 libpulse-simple-binding = "2"
+uniffi = "0.29"

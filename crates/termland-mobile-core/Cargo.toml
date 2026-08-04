@@ -1,0 +1,38 @@
+[package]
+name = "termland-mobile-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Termland protocol/transport core for mobile clients, exposed via UniFFI"
+
+[lib]
+name = "termland_mobile_core"
+# cdylib for the Android/iOS loader, lib so the bindgen binary and tests can
+# link the same crate.
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+termland-protocol = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = "0.3"
+tracing = { workspace = true }
+thiserror = { workspace = true }
+uniffi = { workspace = true, features = ["cli"] }
+
+# `ring` rather than the default aws-lc-rs: it cross-compiles to the Android and
+# iOS targets without cmake/nasm on the build host. The provider is passed
+# explicitly to ClientConfig so feature unification inside the workspace (the
+# desktop client pulls in aws-lc-rs) can never change which one we use.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+
+[[bin]]
+# `cargo run --bin uniffi-bindgen -- generate --library <.so> --language kotlin`
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"

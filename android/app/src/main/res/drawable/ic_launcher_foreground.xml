@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive-icon foreground: 108x108 canvas, art kept inside the central 72x72
+     safe zone. A terminal prompt chevron plus cursor: "a remote shell/desktop". -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- screen outline -->
+    <path
+        android:pathData="M26,32 L82,32 A4,4 0 0 1 86,36 L86,72 A4,4 0 0 1 82,76 L26,76 A4,4 0 0 1 22,72 L22,36 A4,4 0 0 1 26,32 Z"
+        android:strokeColor="#4DB6AC"
+        android:strokeWidth="4"
+        android:fillColor="#00000000" />
+    <!-- prompt chevron -->
+    <path
+        android:pathData="M34,46 L44,54 L34,62"
+        android:strokeColor="#80CBC4"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+    <!-- cursor -->
+    <path
+        android:pathData="M52,62 L72,62"
+        android:strokeColor="#80CBC4"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000" />
+</vector>
