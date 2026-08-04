@@ -57,6 +57,7 @@ class SessionViewModel(app: Application) : AndroidViewModel(app) {
     val firstFrame: StateFlow<Boolean> = _firstFrame.asStateFlow()
 
     private var decoder: VideoDecoder? = null
+    private var audioPlayer: AudioPlayer? = null
     private var profile: HostProfile? = null
 
     /** Session we last streamed, so a resume knows what to attach to. */
@@ -91,6 +92,18 @@ class SessionViewModel(app: Application) : AndroidViewModel(app) {
         _firstFrame.value = false
     }
 
+    /**
+     * Symmetric with [releaseDecoder]/[attachDecoder] except it needs no
+     * Surface, so it is (re)built directly in [connect] rather than waiting
+     * on a view-lifecycle callback. Only started when the profile actually
+     * asked for audio (SessionParams.audio) — no point spinning up a decoder
+     * and AudioTrack that will never receive a packet.
+     */
+    private fun releaseAudioPlayer() {
+        audioPlayer?.release()
+        audioPlayer = null
+    }
+
     // -----------------------------------------------------------------------
     // Connect / attach / detach
     // -----------------------------------------------------------------------
@@ -100,6 +113,11 @@ class SessionViewModel(app: Application) : AndroidViewModel(app) {
         if (_state.value is SessionState.Connecting) return
         _state.value = SessionState.Connecting
         _firstFrame.value = false
+
+        releaseAudioPlayer()
+        if (p.audio) {
+            audioPlayer = AudioPlayer(onFatal = { msg -> Log.w(TAG, "audio: $msg") })
+        }
 
         viewModelScope.launch(Dispatchers.IO) {
             // connect_new/attach are documented blocking (they return once
@@ -133,6 +151,7 @@ class SessionViewModel(app: Application) : AndroidViewModel(app) {
             runCatching { Core.client.disconnect() }
         }
         releaseDecoder()
+        releaseAudioPlayer()
         _state.value = SessionState.Detached(lastSessionId, reason)
     }
 
@@ -193,8 +212,13 @@ class SessionViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         override fun onAudioPacket(data: ByteArray) {
-            // M4 (AudioTrack). Dropping silently is correct for now: the core only
-            // sends these when the profile asked for audio.
+            // Called on a Rust worker thread that must not block: feed() only
+            // enqueues, the audio codec thread does the decode + AudioTrack write.
+            // audioPlayer is null whenever the profile didn't ask for audio, so
+            // this is a no-op drop in that case (the core still only sends these
+            // when SessionParams.audio was set, but a stale/racing packet costs
+            // nothing to ignore).
+            audioPlayer?.feed(data)
         }
 
         override fun onClipboard(mimeType: String, data: ByteArray) {
@@ -214,6 +238,7 @@ class SessionViewModel(app: Application) : AndroidViewModel(app) {
             // The remote session survives; offer a resume rather than an error.
             _state.value = SessionState.Detached(lastSessionId, reason)
             releaseDecoder()
+            releaseAudioPlayer()
         }
 
         override fun onError(message: String) {
@@ -223,6 +248,7 @@ class SessionViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         releaseDecoder()
+        releaseAudioPlayer()
         // viewModelScope is already cancelled here, so use a bare thread. Still a
         // detach, not a close: the session outlives the app.
         Thread { runCatching { Core.client.disconnect() } }.start()
