@@ -84,6 +84,9 @@ enum CapturedFrame {
 /// Input commands sent to the input injection thread.
 enum InputCommand {
     Key { scancode: u32, pressed: bool },
+    /// Already-composed Unicode from a soft keyboard / IME. Injected via a
+    /// temporary xkb keymap rather than scancodes.
+    Text(String),
     PointerMove { x: f64, y: f64, width: u32, height: u32 },
     PointerButton { button: u32, pressed: bool },
     Scroll { dx: f64, dy: f64 },
@@ -586,6 +589,10 @@ where
                                     pressed,
                                 });
                             }
+                            Message::TextInput(ti) => {
+                                tracing::debug!("Text received: {} chars", ti.text.chars().count());
+                                let _ = input_tx.send(InputCommand::Text(ti.text));
+                            }
                             Message::MouseMove(mm) => {
                                 let _ = input_tx.send(InputCommand::PointerMove {
                                     x: mm.x,
@@ -938,6 +945,12 @@ fn input_thread(
             InputCommand::Key { scancode, pressed } => {
                 tracing::debug!("Input thread: injecting key scancode={scancode} pressed={pressed}");
                 injector.key(scancode, pressed);
+            }
+            InputCommand::Text(text) => {
+                tracing::debug!("Input thread: injecting text ({} chars)", text.chars().count());
+                if let Err(e) = injector.text(&text) {
+                    tracing::error!("Text injection failed: {e}");
+                }
             }
             InputCommand::PointerMove { x, y, width, height } => {
                 injector.pointer_motion_absolute(x, y, width, height);

@@ -45,6 +45,7 @@ pub enum MessageId {
     ClipboardSend = 0x44,
     QualityHint = 0x45,
     CursorMode = 0x46,
+    TextInput = 0x47,
 }
 
 impl MessageId {
@@ -77,6 +78,7 @@ impl MessageId {
             0x44 => Some(Self::ClipboardSend),
             0x45 => Some(Self::QualityHint),
             0x46 => Some(Self::CursorMode),
+            0x47 => Some(Self::TextInput),
             _ => None,
         }
     }
@@ -117,6 +119,7 @@ pub enum Message {
     ClipboardSend(ClipboardPayload),
     QualityHint(QualityHintMsg),
     CursorMode(CursorModeMsg),
+    TextInput(TextInput),
 }
 
 impl Message {
@@ -149,6 +152,7 @@ impl Message {
             Self::ClipboardSend(_) => MessageId::ClipboardSend,
             Self::QualityHint(_) => MessageId::QualityHint,
             Self::CursorMode(_) => MessageId::CursorMode,
+            Self::TextInput(_) => MessageId::TextInput,
         }
     }
 
@@ -447,6 +451,20 @@ pub struct QualityHintMsg {
     pub max_fps: u8,
     pub max_bitrate_kbps: u32,
     pub prefer_lossless: bool,
+}
+
+/// Client -> server: already-composed Unicode text, as finalized by a soft
+/// keyboard or IME (autocorrect result, emoji, CJK commit).
+///
+/// This is a separate channel from `KeyEvent` on purpose: `KeyEvent` carries an
+/// evdev scancode that only has meaning against the server's fixed xkb keymap,
+/// so it cannot express codepoints outside that layout. Text arriving here has
+/// no scancode at all and is injected by synthesizing a temporary keymap
+/// server-side. Editing and shortcut keys (Backspace, Enter, arrows, Ctrl+C)
+/// are *not* text and must keep using `KeyEvent`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextInput {
+    pub text: String,
 }
 
 /// Tell the server whether to include the compositor cursor in the video stream.

@@ -119,6 +119,26 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_text_input() {
+        // Mixed BMP, astral-plane (emoji) and CJK content, since the whole point
+        // of this message is codepoints the scancode path cannot express.
+        let text = "héllo 世界 🎉";
+        let msg = Message::TextInput(crate::TextInput { text: text.into() });
+
+        let mut codec = TermlandCodec;
+        let mut buf = BytesMut::new();
+
+        Encoder::encode(&mut codec, msg, &mut buf).unwrap();
+        assert_eq!(buf[2], crate::MessageId::TextInput as u8);
+
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        match decoded {
+            Message::TextInput(ti) => assert_eq!(ti.text, text),
+            other => panic!("expected TextInput, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn roundtrip_video_frame() {
         let msg = Message::VideoFrame(crate::VideoFrame {
             timestamp_us: 12345,
