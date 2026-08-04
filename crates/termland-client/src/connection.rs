@@ -22,7 +22,25 @@ pub enum ServerEvent {
     CursorUpdate(CursorUpdate),
     #[allow(dead_code)]
     Pong(Pong),
-    Disconnected,
+    /// The server explicitly ended the session: it sent us a `SessionEnd`
+    /// message (its compositor exited, or someone closed the session via
+    /// `--close`/another client). This is final - the session is genuinely
+    /// gone, so the display layer should show `reason` and exit rather than
+    /// retry. Contrast with `Reconnecting`: a `SessionEnd` we *receive* is
+    /// always server-initiated, since our own clean-exit path
+    /// (`ClientCommand::Disconnect`) sends one but never turns it back into
+    /// this event for ourselves.
+    SessionEnded { reason: String },
+    /// The connection dropped unexpectedly - a protocol decode error, or a
+    /// bare EOF with no `SessionEnd` from the server first. No one told us
+    /// the session is over, so per this project's persistent-session design
+    /// (see termland-server's `SessionOutcome::Detached`) the server-side
+    /// compositor is very likely still alive. `connection.rs` is retrying
+    /// with backoff in the background and will reattach to the same
+    /// session; `attempt` is the 1-based attempt about to be made. The
+    /// display layer should show a "Reconnecting..." status and keep
+    /// showing the last frame rather than exiting.
+    Reconnecting { attempt: u32 },
 }
 
 /// Opus packet for the audio playback thread.
@@ -74,6 +92,11 @@ pub struct ConnectParams {
     pub codec: Option<termland_protocol::VideoCodec>,
     /// Resume an existing session by id instead of creating a new one.
     pub attach: Option<String>,
+    /// Auto-retry with backoff and reattach to the same session on an
+    /// unexpected connection drop (see `ServerEvent::Reconnecting`). On by
+    /// default; `--no-reconnect` turns this off for scripted/tested use
+    /// where retrying forever against a dead server isn't wanted.
+    pub reconnect: bool,
 }
 
 /// Any bidirectional byte stream we can run the protocol over (SSH pipe, TCP,
@@ -207,12 +230,99 @@ pub async fn connect(
     let (client_tx, client_rx) = mpsc::unbounded_channel();
 
     let io = open_io(server, ssh, &params).await?;
+    let server = server.to_string();
     tokio::spawn(async move {
-        if let Err(e) = session_loop(io, params, server_tx, client_rx).await {
-            tracing::error!("Session error: {e}");
-        }
+        run_with_reconnect(server, ssh, params, io, server_tx, client_rx).await;
     });
     Ok((server_rx, client_tx))
+}
+
+/// Capped exponential backoff for reconnect attempts: 1s, 2s, 4s, 8s, then
+/// held at 30s for every attempt after. `attempt` is the 1-based attempt
+/// about to be made (so `backoff_delay(1) == 1s`, the delay *before* the
+/// first retry, matching a human's expectation of "try again shortly").
+fn backoff_delay(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(5); // 2^5 = 32, already past the 30s cap
+    let secs = 1u64 << shift;
+    std::time::Duration::from_secs(secs.min(30))
+}
+
+/// Owns the connect -> stream -> (on unexpected drop) retry-with-backoff
+/// loop for the lifetime of the client session. Runs entirely in the
+/// background task spawned by `connect()`, so neither `connect()`'s
+/// signature nor how `display.rs` calls it needs to change - the display
+/// layer only ever sees the `ServerEvent`s this loop emits.
+///
+/// The crux of this whole function is the distinction `session_loop`
+/// reports back via `LoopExit`: a `Message::SessionEnd` we *receive* means
+/// the server itself ended the session (its compositor exited, or someone
+/// closed it via `--close`) - that's final, never retry. Anything else that
+/// ends the stream unexpectedly (a decode error, or a bare EOF with no
+/// `SessionEnd` first) is just the network connection dying; the
+/// server-side compositor keeps running across an ordinary disconnect (see
+/// termland-server's `SessionOutcome::Detached`), so reattaching to the
+/// same session id is very likely to succeed.
+async fn run_with_reconnect(
+    server: String, ssh: bool, mut params: ConnectParams, mut io: Box<dyn Io>,
+    server_tx: mpsc::UnboundedSender<ServerEvent>,
+    mut client_rx: mpsc::UnboundedReceiver<ClientCommand>,
+) {
+    // Session id from the last SessionReady we saw, so a reconnect resumes
+    // THIS session instead of accidentally creating a new one.
+    let mut session_id: Option<String> = None;
+
+    loop {
+        let outcome = session_loop(io, params.clone(), server_tx.clone(), &mut client_rx, &mut session_id).await;
+
+        match outcome {
+            Ok(LoopExit::ClientQuit) => return,
+            Ok(LoopExit::SessionEnded { reason }) => {
+                tracing::info!("Session ended by server: {reason}");
+                let _ = server_tx.send(ServerEvent::SessionEnded { reason });
+                return;
+            }
+            Ok(LoopExit::ConnectionLost) => {
+                tracing::warn!("Connection lost unexpectedly");
+            }
+            Err(e) => {
+                tracing::warn!("Connection error: {e:#}");
+            }
+        }
+
+        if !params.reconnect {
+            let _ = server_tx.send(ServerEvent::SessionEnded {
+                reason: "connection lost (reconnect disabled)".into(),
+            });
+            return;
+        }
+
+        if let Some(id) = &session_id {
+            params.attach = Some(id.clone());
+        }
+
+        // Drop input queued while we were connected: it's stale by the time
+        // we reconnect (keystrokes/mouse moves aimed at a session that
+        // wasn't there to receive them), and replaying it on reattach could
+        // e.g. leave a key looking stuck down.
+        while client_rx.try_recv().is_ok() {}
+
+        let mut attempt: u32 = 0;
+        io = loop {
+            attempt += 1;
+            let _ = server_tx.send(ServerEvent::Reconnecting { attempt });
+            let delay = backoff_delay(attempt);
+            tracing::info!("Reconnecting to {server} in {delay:?} (attempt {attempt})...");
+            tokio::time::sleep(delay).await;
+
+            match open_io(&server, ssh, &params).await {
+                Ok(io) => {
+                    tracing::info!("Reconnected on attempt {attempt}");
+                    break io;
+                }
+                Err(e) => tracing::warn!("Reconnect attempt {attempt} failed: {e:#}"),
+            }
+        };
+    }
 }
 
 /// Dummy certificate verifier for --accept-invalid-certs (self-signed servers).
@@ -300,11 +410,27 @@ async fn handshake<T: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Why `session_loop` returned - lets the caller (`run_with_reconnect`)
+/// decide whether to retry. See its doc comment for the reasoning behind
+/// the distinction.
+enum LoopExit {
+    /// `ClientCommand::Disconnect` (the user quit / closed the window). Our
+    /// own clean exit - never retry.
+    ClientQuit,
+    /// The server sent us `Message::SessionEnd`: it decided the session is
+    /// over. Never retry - carries the server's reason for logging/UI.
+    SessionEnded { reason: String },
+    /// The stream ended with no `SessionEnd` first - a decode error or a
+    /// bare EOF. The connection just dropped; retry.
+    ConnectionLost,
+}
+
 async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
     io: T, params: ConnectParams,
     server_tx: mpsc::UnboundedSender<ServerEvent>,
-    mut client_rx: mpsc::UnboundedReceiver<ClientCommand>,
-) -> Result<()> {
+    client_rx: &mut mpsc::UnboundedReceiver<ClientCommand>,
+    session_id: &mut Option<String>,
+) -> Result<LoopExit> {
     let mut framed = Framed::new(io, TermlandCodec);
     handshake(&mut framed, &params).await?;
 
@@ -350,6 +476,9 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                 Some(c) => tracing::info!("Session ready: {}x{} codec={c}", sr.width, sr.height),
                 None => tracing::info!("Session ready: {}x{} (codec unannounced, will auto-detect)", sr.width, sr.height),
             }
+            if !sr.session_id.is_empty() {
+                *session_id = Some(sr.session_id.clone());
+            }
             let _ = server_tx.send(ServerEvent::SessionReady(sr.clone()));
             sr.codec
         }
@@ -387,7 +516,7 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
             match client_rx.try_recv() {
                 Ok(ClientCommand::Disconnect) => {
                     let _ = framed.send(Message::SessionEnd(SessionEnd { reason: "client disconnect".into() })).await;
-                    return Ok(());
+                    return Ok(LoopExit::ClientQuit);
                 }
                 Ok(ClientCommand::Resize(w, h)) => { let _ = framed.send(Message::SessionResize(SessionResize { width: w, height: h })).await; }
                 Ok(ClientCommand::KeyEvent(ke)) => { let _ = framed.send(Message::KeyEvent(ke)).await; }
@@ -459,19 +588,26 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                     Some(Ok(Message::SessionEnd(se))) => {
-                        tracing::info!("Session ended: {}", se.reason);
-                        let _ = server_tx.send(ServerEvent::Disconnected);
-                        break;
+                        // Received FROM the server (our own clean exit takes
+                        // the ClientCommand::Disconnect path above and never
+                        // loops back around to read this) - the server
+                        // decided the session is over. Final, don't retry.
+                        return Ok(LoopExit::SessionEnded { reason: se.reason });
                     }
                     Some(Ok(_)) => {}
-                    Some(Err(e)) => { tracing::error!("Protocol: {e}"); let _ = server_tx.send(ServerEvent::Disconnected); break; }
-                    None => { tracing::info!("Disconnected"); let _ = server_tx.send(ServerEvent::Disconnected); break; }
+                    Some(Err(e)) => {
+                        tracing::error!("Protocol: {e}");
+                        return Ok(LoopExit::ConnectionLost);
+                    }
+                    None => {
+                        tracing::info!("Connection closed (EOF)");
+                        return Ok(LoopExit::ConnectionLost);
+                    }
                 }
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}
         }
     }
-    Ok(())
 }
 
 /// Audio playback thread: decodes Opus packets and writes PCM to cpal output.
@@ -599,4 +735,30 @@ fn decode_thread(
     }
 
     tracing::info!("Decode thread exiting ({count} frames decoded)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backoff_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn backoff_schedule_doubles_then_caps() {
+        assert_eq!(backoff_delay(1), Duration::from_secs(1));
+        assert_eq!(backoff_delay(2), Duration::from_secs(2));
+        assert_eq!(backoff_delay(3), Duration::from_secs(4));
+        assert_eq!(backoff_delay(4), Duration::from_secs(8));
+        assert_eq!(backoff_delay(5), Duration::from_secs(16));
+        assert_eq!(backoff_delay(6), Duration::from_secs(30));
+        assert_eq!(backoff_delay(7), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn backoff_stays_capped_for_many_attempts() {
+        // Retrying "indefinitely" per the design must never overflow or
+        // exceed the cap, however large `attempt` gets.
+        for attempt in [10u32, 100, 1_000, u32::MAX] {
+            assert_eq!(backoff_delay(attempt), Duration::from_secs(30));
+        }
+    }
 }

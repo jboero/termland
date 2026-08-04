@@ -175,6 +175,16 @@ struct App {
     /// popped one up. Toggled by tapping the button (touch devices with no
     /// physical keyboard). None = hidden.
     osk_child: Option<std::process::Child>,
+    /// Stable id of the active session, from the last `SessionReady`. Kept
+    /// around for logging/title purposes - the actual reattach-on-reconnect
+    /// logic lives entirely in connection.rs's background task, which
+    /// tracks its own copy independently.
+    session_id: Option<String>,
+    /// `Some(attempt)` while connection.rs is retrying a dropped connection
+    /// in the background (see `ServerEvent::Reconnecting`). `None` when
+    /// connected normally. Drives the "Reconnecting..." banner in render()
+    /// and is cleared on the next `SessionReady` (a successful reattach).
+    reconnecting: Option<u32>,
 }
 
 impl App {
@@ -198,6 +208,8 @@ impl App {
             last_sent_size: None,
             scale_modifier_held: false,
             osk_child: None,
+            session_id: None,
+            reconnecting: None,
         }
     }
 
@@ -343,6 +355,7 @@ impl App {
             encoder_extra_params: self.args.svt_params.clone(),
             codec: self.args.codec.map(|c| c.to_wire()),
             attach: self.args.attach.clone(),
+            reconnect: !self.args.no_reconnect,
         };
         match self.runtime.block_on(connect(&server, ssh, params)) {
             Ok((rx, tx)) => {
@@ -364,7 +377,18 @@ impl App {
                     self.frame_width = sr.width;
                     self.frame_height = sr.height;
                     self.frame_buffer = vec![0; (sr.width * sr.height) as usize];
-                    tracing::info!("Session ready: {}x{}", sr.width, sr.height);
+                    if !sr.session_id.is_empty() {
+                        self.session_id = Some(sr.session_id.clone());
+                    }
+                    if self.reconnecting.take().is_some() {
+                        // This SessionReady followed a Reconnecting banner:
+                        // connection.rs's background retry loop just
+                        // reattached to the same session. Clear the banner
+                        // and resume normally.
+                        tracing::info!("Reconnected - session resumed: {}x{}", sr.width, sr.height);
+                    } else {
+                        tracing::info!("Session ready: {}x{}", sr.width, sr.height);
+                    }
                 }
                 ServerEvent::Frame { width, height, pixels } => {
                     self.frame_width = width;
@@ -385,9 +409,22 @@ impl App {
                     };
                 }
                 ServerEvent::Pong(_) => {}
-                ServerEvent::Disconnected => {
-                    tracing::info!("Session ended");
+                ServerEvent::SessionEnded { reason } => {
+                    // The server itself ended the session - genuinely over,
+                    // no retry happened (or reconnect was disabled). Exit,
+                    // making the server's reason clear in the log.
+                    tracing::info!("Session ended: {reason}");
                     self.should_exit = true;
+                }
+                ServerEvent::Reconnecting { attempt } => {
+                    // Connection dropped unexpectedly; connection.rs is
+                    // retrying in the background. Do NOT exit - keep the
+                    // window open showing the last frame with a status
+                    // banner (see render()) until either a SessionReady
+                    // (reattached) or a SessionEnded (gave up / server says
+                    // it's over) arrives.
+                    tracing::info!("Reconnecting... (attempt {attempt})");
+                    self.reconnecting = Some(attempt);
                 }
             }
         }
@@ -411,7 +448,9 @@ impl App {
     /// Update the window title based on current flags.
     fn update_title(&mut self) {
         let Some(win) = &self.window else { return; };
-        let title = if self.menu.show_data_rate {
+        let title = if let Some(attempt) = self.reconnecting {
+            format!("Termland  [Reconnecting... attempt {attempt}]")
+        } else if self.menu.show_data_rate {
             format!("Termland  [{}]", overlay::format_rate(self.data_rate))
         } else {
             "Termland".to_string()
@@ -504,6 +543,13 @@ impl App {
             } else {
                 self.bar_layout = None;
                 self.bar_hovered = None;
+            }
+
+            // Reconnect status banner: drawn over the frozen last frame
+            // (never blanked to black) while connection.rs retries a
+            // dropped connection in the background. See ServerEvent::Reconnecting.
+            if let Some(attempt) = self.reconnecting {
+                overlay::draw_reconnect_banner(&mut buffer, ww_nz.get(), wh_nz.get(), attempt);
             }
 
             // Translucent keyboard button, always available (corner overlay) —

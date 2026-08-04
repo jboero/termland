@@ -306,6 +306,41 @@ pub fn hit_test_keyboard_button(fb_width: u32, fb_height: u32, x: f64, y: f64) -
     xi >= bx as i32 && xi < (bx + bw) as i32 && yi >= by as i32 && yi < (by + bh) as i32
 }
 
+// ─── Reconnect banner ──────────────────────────────────────────────────────
+// Drawn by display.rs while connection.rs's background task is retrying a
+// dropped connection. Deliberately reuses draw_text/fill_rect_alpha/
+// draw_rect_outline rather than adding a new UI subsystem, following the
+// same "small overlay drawn straight into the framebuffer" style as the
+// menubar and keyboard button above.
+
+const RECONNECT_BG: u32 = 0x181825; // matches BAR_BG
+const RECONNECT_FG: u32 = 0xF9E2AF; // amber - distinct from the menubar's green "on" color, reads as "caution"
+
+/// Draw a small status banner near the top-center of the window while a
+/// dropped connection is being retried. Callers should draw this over
+/// whatever's already in `buf` (the last frame received before the drop)
+/// rather than clearing first - a reconnect should never look like a crash
+/// to black.
+pub fn draw_reconnect_banner(buf: &mut [u32], fb_width: u32, fb_height: u32, attempt: u32) {
+    let text = format!(" Reconnecting... (attempt {attempt}) ");
+    let char_w = 8 * 2;
+    let text_w = text.chars().count() * char_w;
+    let pad = 8usize;
+    let h = 28usize;
+    let w = text_w + pad * 2;
+    let x = (fb_width as usize).saturating_sub(w) / 2;
+    // Sit just below the menubar strip (which may or may not be visible)
+    // and clear of the corner keyboard button.
+    let y = (MENUBAR_HEIGHT as usize) + 12;
+    let stride = fb_width as usize;
+
+    fill_rect_alpha(buf, stride, x, y, w, h, RECONNECT_BG, 220);
+    draw_rect_outline(buf, stride, x, y, w, h, RECONNECT_FG);
+    draw_text(buf, stride, x + pad, y + (h - 16) / 2, &text, RECONNECT_FG);
+
+    let _ = fb_height;
+}
+
 // ─── Menubar (persistent, always visible unless fullscreen) ───────────────
 
 pub const MENUBAR_HEIGHT: u32 = 24;

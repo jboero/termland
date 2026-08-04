@@ -83,6 +83,16 @@ pub struct Args {
     #[arg(long, value_name = "SESSION_ID")]
     pub attach: Option<String>,
 
+    /// Disable automatic reconnect on an unexpected connection drop. By
+    /// default, if the connection to the server drops without the server
+    /// explicitly ending the session (e.g. a network blip, or the server
+    /// process itself restarting), the client retries with backoff and
+    /// reattaches to the same session. Pass this for scripted/tested use
+    /// where retrying forever against a server that's never coming back
+    /// isn't wanted.
+    #[arg(long)]
+    pub no_reconnect: bool,
+
     /// List resumable sessions on the server and exit (no window).
     #[arg(long)]
     pub list_sessions: bool,
@@ -214,6 +224,10 @@ fn main() -> Result<()> {
             encoder_extra_params: None,
             codec: None,
             attach: None,
+            // Irrelevant here: these are one-shot control ops / the tray's
+            // session-list polling, not the streaming session_loop that
+            // reconnect logic lives in.
+            reconnect: true,
         };
 
         if args.tray {

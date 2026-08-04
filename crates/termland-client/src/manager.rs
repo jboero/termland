@@ -499,6 +499,10 @@ fn connect_params_for_profile(p: &Profile) -> ConnectParams {
         encoder_extra_params: None,
         codec: p.codec.as_deref().and_then(codec_from_name),
         attach: None,
+        // Irrelevant here too: this ConnectParams is only ever used for
+        // fetch_sessions (session-list polling), not the streaming
+        // session_loop.
+        reconnect: true,
     }
 }
 
