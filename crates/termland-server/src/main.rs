@@ -1,4 +1,5 @@
 mod auth;
+mod quic;
 mod registry;
 mod tls;
 mod transport;
@@ -41,6 +42,20 @@ struct Args {
     /// Uses the "termland" PAM service, falling back to "login".
     #[arg(long)]
     auth: bool,
+
+    /// Also listen for QUIC (UDP) connections, alongside the TCP listener
+    /// (Q1: QUIC as a drop-in byte transport, see docs/quic-transport.md).
+    /// Purely additive — the TCP listener keeps running unchanged. QUIC
+    /// always requires TLS 1.3, so this reuses --tls-cert/--tls-key (or
+    /// auto-generates a self-signed cert, same as --tls) regardless of
+    /// whether --tls itself was also passed for the TCP side.
+    #[arg(long)]
+    quic: bool,
+
+    /// UDP port for the QUIC listener. Defaults to the same number as
+    /// --port — that's fine, they're different protocols/sockets.
+    #[arg(long)]
+    quic_port: Option<u16>,
 
     /// Generate shell completion script and exit.
     /// Usage: termland-server --completions bash > /etc/bash_completion.d/termland-server
@@ -127,13 +142,27 @@ async fn main() -> Result<()> {
         };
 
         tracing::info!(
-            "Starting TCP listener on {}:{} (TLS: {}, Auth: {})",
+            "Starting TCP listener on {}:{} (TLS: {}, Auth: {}, QUIC: {})",
             args.bind, args.port,
             if use_tls { "enabled" } else { "disabled" },
             if args.auth { "PAM" } else { "none" },
+            if args.quic { "enabled" } else { "disabled" },
         );
 
-        transport::run_tcp_listener(&args.bind, args.port, acceptor, args.auth).await?;
+        if args.quic {
+            let quic_port = args.quic_port.unwrap_or(args.port);
+            let tcp_fut = transport::run_tcp_listener(&args.bind, args.port, acceptor, args.auth);
+            let quic_fut = quic::run_quic_listener(
+                &args.bind,
+                quic_port,
+                args.tls_cert.as_deref().map(std::path::Path::new),
+                args.tls_key.as_deref().map(std::path::Path::new),
+                args.auth,
+            );
+            tokio::try_join!(tcp_fut, quic_fut)?;
+        } else {
+            transport::run_tcp_listener(&args.bind, args.port, acceptor, args.auth).await?;
+        }
     }
 
     Ok(())

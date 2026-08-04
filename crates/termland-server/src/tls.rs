@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
 fn config_dir() -> PathBuf {
@@ -19,14 +20,31 @@ fn dirs_or_default(name: &str) -> PathBuf {
 fn default_cert_path() -> PathBuf { config_dir().join("cert.pem") }
 fn default_key_path() -> PathBuf { config_dir().join("key.pem") }
 
-/// Load or generate a TLS server configuration.
+/// The crypto backend both the TCP+TLS acceptor and the QUIC listener
+/// (`crate::quic`) build their rustls configs against. Selected explicitly
+/// (rather than relying on rustls's "exactly one provider feature enabled"
+/// auto-detection) because a full-workspace build unifies this crate's
+/// `aws-lc-rs`-default `rustls` dependency with `termland-mobile-core`'s
+/// explicit `ring` pin, leaving *both* compiled in — at which point
+/// `ServerConfig::builder()`'s implicit provider lookup is ambiguous and
+/// panics at runtime. `builder_with_provider` sidesteps that entirely.
+/// `aws-lc-rs` is picked to match what `termland-client` already uses
+/// explicitly for its certificate verifier.
+fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
+/// Load (or generate, if missing) the server's TLS certificate + private key,
+/// parsed and ready to hand to an rustls `ServerConfig`. Shared by the
+/// TCP+TLS acceptor below and `crate::quic`'s QUIC listener so there is one
+/// place that knows how to find/create the cert, not two.
 ///
 /// If `cert_path`/`key_path` are provided, loads those. Otherwise looks in
 /// `~/.config/termland/` and auto-generates a self-signed cert if missing.
-pub fn build_tls_acceptor(
+pub fn load_or_generate_cert(
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
-) -> Result<TlsAcceptor> {
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let cert_path = cert_path.map(PathBuf::from).unwrap_or_else(default_cert_path);
     let key_path = key_path.map(PathBuf::from).unwrap_or_else(default_key_path);
 
@@ -49,13 +67,42 @@ pub fn build_tls_acceptor(
         .context("parsing private key PEM")?
         .context("no private key found in PEM")?;
 
-    let config = ServerConfig::builder()
+    tracing::info!("TLS configured with {}", cert_path.display());
+    Ok((certs, key))
+}
+
+/// Load or generate a TLS server configuration for the TCP+TLS acceptor.
+pub fn build_tls_acceptor(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+) -> Result<TlsAcceptor> {
+    let (certs, key) = load_or_generate_cert(cert_path, key_path)?;
+
+    let config = ServerConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .context("unsupported TLS protocol versions")?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("building TLS server config")?;
 
-    tracing::info!("TLS configured with {}", cert_path.display());
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Build a plain rustls `ServerConfig` (not yet wrapped for QUIC) using the
+/// same cert loading and crypto provider as `build_tls_acceptor`. Used by
+/// `crate::quic` to construct quinn's `ServerConfig` around.
+pub fn build_rustls_server_config(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+) -> Result<ServerConfig> {
+    let (certs, key) = load_or_generate_cert(cert_path, key_path)?;
+
+    ServerConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .context("unsupported TLS protocol versions")?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("building TLS server config")
 }
 
 fn generate_self_signed(cert_path: &Path, key_path: &Path) -> Result<()> {

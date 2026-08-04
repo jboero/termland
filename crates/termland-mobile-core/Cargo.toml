@@ -39,6 +39,13 @@ rustls-native-certs = { workspace = true }
 # directly, so there is no separate `russh-keys` crate to add.
 russh = { version = "0.62.5", default-features = false, features = ["ring", "flate2", "rsa"] }
 
+# QUIC client transport (Q1, see docs/quic-transport.md and
+# crates/termland-server/src/quic.rs for the server side). `rustls-ring`
+# rather than the workspace default `rustls-aws-lc-rs`: same cross-compile
+# reasoning as the rustls block above, and it must match the crypto provider
+# `tls_config()` below pins for this crate's rustls usage.
+quinn = { workspace = true, features = ["rustls-ring"] }
+
 [dev-dependencies]
 bytes = { workspace = true }
 

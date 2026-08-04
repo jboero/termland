@@ -94,8 +94,11 @@ enum InputCommand {
 }
 
 /// Handle a single client session over any AsyncRead+AsyncWrite transport.
+/// `pub(crate)` so `crate::quic`'s listener (a sibling entry point, not a
+/// fork of this logic) can reuse it as-is for QUIC streams, exactly like
+/// `run_tcp_listener` below does for TCP/TLS sockets.
 #[allow(clippy::too_many_lines)]
-async fn handle_session<T>(io: T, require_auth: bool) -> Result<()>
+pub(crate) async fn handle_session<T>(io: T, require_auth: bool) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {

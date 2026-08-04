@@ -50,3 +50,11 @@ cpal = "0.15"
 libpulse-binding = "2"
 libpulse-simple-binding = "2"
 uniffi = "0.29"
+
+# QUIC (Q1: drop-in single-stream byte transport, see docs/quic-transport.md).
+# Pure-Rust, tokio-based, wraps rustls 0.23 - matches the TLS stack already
+# used by the TCP+TLS path. Each crate pins the rustls crypto backend that
+# matches its existing choice (see the per-crate Cargo.toml comments) rather
+# than pulling in quinn's default feature set, to avoid ambiguous
+# process-level CryptoProvider selection when the workspace is built together.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio"] }

@@ -401,6 +401,7 @@ mod tests {
             username: None,
             password: None,
             use_ssh: false,
+            use_quic: false,
         }
     }
 
@@ -424,6 +425,24 @@ mod tests {
         // must not be able to downgrade or conflict with it.
         let both = ServerProfile { use_ssh: true, use_tls: true, ..profile() };
         assert!(matches!(Transport::for_profile(&both), Transport::Ssh { .. }));
+    }
+
+    /// Same priority check as above, for `use_quic`: it must win over
+    /// `use_tls` (QUIC replaces the TCP+TLS socket outright, so a leftover
+    /// TLS flag must not fight it) but lose to `use_ssh` (an SSH tunnel is a
+    /// different connection mechanism entirely, not a peer of QUIC/TLS).
+    #[test]
+    fn transport_selection_prioritizes_quic_over_tls_but_not_over_ssh() {
+        use crate::transport::Transport;
+
+        let quic = ServerProfile { use_quic: true, ..profile() };
+        assert!(matches!(Transport::for_profile(&quic), Transport::Quic { accept_invalid_certs: false }));
+
+        let quic_and_tls = ServerProfile { use_quic: true, use_tls: true, ..profile() };
+        assert!(matches!(Transport::for_profile(&quic_and_tls), Transport::Quic { .. }));
+
+        let quic_and_ssh = ServerProfile { use_quic: true, use_ssh: true, ..profile() };
+        assert!(matches!(Transport::for_profile(&quic_and_ssh), Transport::Ssh { .. }));
     }
 
     /// SSH auth credentials come straight from the profile's existing

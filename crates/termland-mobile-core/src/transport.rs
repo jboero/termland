@@ -26,7 +26,23 @@ pub enum Transport {
     /// `SshHostKeyPolicy` for the host-key posture and the module-level
     /// followup note on key-based auth.
     Ssh { username: String, password: String },
+    /// Q1 of the QUIC transport plan (`docs/quic-transport.md`): the entire
+    /// protocol carried unmodified over a single bidirectional QUIC stream,
+    /// dialed with `quinn` instead of a plain/TLS `TcpStream`. Exists for the
+    /// same reason the design doc pulled QUIC forward to accompany the
+    /// mobile milestone rather than treating it as a desktop-only stretch
+    /// goal: connection migration and fast reconnect matter most on a phone
+    /// roaming between Wi-Fi and cellular. `accept_invalid_certs` mirrors
+    /// `Transport::Tls`'s field of the same name/meaning — QUIC always
+    /// requires TLS 1.3, so the same self-signed-cert-on-a-LAN tradeoff
+    /// applies.
+    Quic { accept_invalid_certs: bool },
 }
+
+/// ALPN identifier for the termland QUIC transport. Must match the server's
+/// (`crates/termland-server/src/quic.rs`) exactly — QUIC's handshake uses
+/// ALPN to select a protocol and refuses to proceed on a mismatch.
+const QUIC_ALPN: &[u8] = b"termland/1";
 
 impl Transport {
     pub fn for_profile(profile: &ServerProfile) -> Self {
@@ -35,6 +51,11 @@ impl Transport {
                 username: profile.username.clone().unwrap_or_default(),
                 password: profile.password.clone().unwrap_or_default(),
             }
+        } else if profile.use_quic {
+            // Takes priority over use_tls: QUIC replaces the TCP+TLS socket
+            // outright rather than layering on it, so a leftover TLS flag
+            // from switching modes in the UI must not fight it.
+            Transport::Quic { accept_invalid_certs: profile.accept_invalid_certs }
         } else if profile.use_tls {
             Transport::Tls { accept_invalid_certs: profile.accept_invalid_certs }
         } else {
@@ -43,6 +64,14 @@ impl Transport {
     }
 
     pub async fn connect(&self, host: &str, port: u16) -> Result<Box<dyn Io>> {
+        // QUIC is UDP-based, not a TCP socket wrapped in something else like
+        // Tls/Ssh below are — it needs its own connection path entirely, so
+        // it branches off before the shared `TcpStream::connect` the other
+        // three variants all build on.
+        if let Transport::Quic { accept_invalid_certs } = self {
+            return connect_quic(host, port, *accept_invalid_certs).await;
+        }
+
         let addr = format!("{host}:{port}");
         let stream = TcpStream::connect(&addr)
             .await
@@ -131,7 +160,97 @@ impl Transport {
                 // (dropping it closes the connection). Bundle both together.
                 Ok(Box::new(SshIo { stream: channel.into_stream(), _handle: handle }))
             }
+            Transport::Quic { .. } => {
+                unreachable!("Transport::Quic returns early above, before the TCP connect")
+            }
         }
+    }
+}
+
+/// Dials a QUIC connection with `quinn`, completes the TLS 1.3 handshake,
+/// and opens the single bidirectional stream Q1's client contract requires
+/// (mirrors `crates/termland-server/src/quic.rs`'s `accept_bi()` on the
+/// server side — see that module's doc comment for the full Q1/Q2 rationale).
+async fn connect_quic(host: &str, port: u16, accept_invalid_certs: bool) -> Result<Box<dyn Io>> {
+    let addr_str = format!("{host}:{port}");
+    let addr = tokio::net::lookup_host(&addr_str)
+        .await
+        .map_err(|e| TermlandError::connect(format!("resolving {addr_str}: {e}")))?
+        .next()
+        .ok_or_else(|| TermlandError::connect(format!("no addresses found for {addr_str}")))?;
+
+    // Bind an ephemeral local UDP socket; the server address/port is chosen
+    // per-connection via `endpoint.connect`, not at bind time.
+    let local_bind = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let mut endpoint = quinn::Endpoint::client(local_bind.parse().unwrap())
+        .map_err(|e| TermlandError::connect(format!("failed to open local QUIC/UDP socket: {e}")))?;
+    endpoint.set_default_client_config(quic_client_config(accept_invalid_certs)?);
+
+    let connecting = endpoint
+        .connect(addr, host)
+        .map_err(|e| TermlandError::connect(format!("{addr_str}: {e}")))?;
+    let connection = connecting
+        .await
+        .map_err(|e| TermlandError::connect(format!("QUIC handshake with {addr_str} failed: {e}")))?;
+    tracing::info!("Connected to {addr_str} (QUIC), handshake complete");
+
+    // Q1: exactly one bidi stream carries the whole session, opened
+    // immediately — the server is waiting on `accept_bi()` for it.
+    let (send, recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| TermlandError::connect(format!("failed to open QUIC stream: {e}")))?;
+
+    Ok(Box::new(QuicIo {
+        io: tokio::io::join(recv, send),
+        _connection: connection,
+        _endpoint: endpoint,
+    }))
+}
+
+/// Builds quinn's `ClientConfig` by reusing `tls_config` (the same
+/// accept-invalid-certs-or-native-roots logic `Transport::Tls` already uses)
+/// and layering QUIC's mandatory ALPN + the `QuicClientConfig` wrapper on top.
+fn quic_client_config(accept_invalid_certs: bool) -> Result<quinn::ClientConfig> {
+    let mut crypto = tls_config(accept_invalid_certs)?;
+    crypto.alpn_protocols = vec![QUIC_ALPN.to_vec()];
+
+    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+        .map_err(|e| TermlandError::tls(format!("rustls config not usable for QUIC: {e}")))?;
+
+    Ok(quinn::ClientConfig::new(Arc::new(quic_crypto)))
+}
+
+/// Adapts a QUIC bidi stream's separate `RecvStream`/`SendStream` halves into
+/// the plain `AsyncRead + AsyncWrite` the session loop expects (via
+/// `tokio::io::join`, the same combinator `run_subsystem` uses for
+/// stdin/stdout on the server side), while keeping the `Connection` and
+/// `Endpoint` alive for as long as the stream is held — same rationale as
+/// `SshIo` bundling in its SSH `Handle` below: dropping either would tear
+/// down the connection out from under the stream.
+struct QuicIo {
+    io: tokio::io::Join<quinn::RecvStream, quinn::SendStream>,
+    _connection: quinn::Connection,
+    _endpoint: quinn::Endpoint,
+}
+
+impl AsyncRead for QuicIo {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for QuicIo {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
     }
 }
 

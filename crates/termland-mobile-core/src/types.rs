@@ -63,6 +63,21 @@ pub struct ServerProfile {
     /// added in this change.
     #[uniffi(default = false)]
     pub use_ssh: bool,
+    /// Dial over QUIC/UDP (`Transport::Quic`) instead of a plain/TLS TCP
+    /// socket — Q1 of the QUIC transport plan (see
+    /// `docs/quic-transport.md`), the whole protocol carried unmodified over
+    /// one QUIC stream. Reuses `accept_invalid_certs` for the same
+    /// self-signed-cert-on-a-LAN posture as `use_tls`, since QUIC always
+    /// requires TLS 1.3. Takes priority over `use_tls` (not over `use_ssh` —
+    /// mobile sandboxes can't spawn `ssh`, but SSH itself stays a plain TCP
+    /// tunnel underneath either way, so the two aren't a meaningful pairing).
+    ///
+    /// NOTE: same frozen-contract situation as `use_ssh` above — this is the
+    /// one new field added in this change. `#[uniffi(default = false)]` keeps
+    /// existing generated `ServerProfile(...)` call sites compiling; the
+    /// Kotlin/Swift bindings still need regenerating to see it.
+    #[uniffi(default = false)]
+    pub use_quic: bool,
 }
 
 /// One resumable session on the server, for the session-list screen.
