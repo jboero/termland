@@ -1,8 +1,13 @@
 # QUIC transport — design
 
-Status: **plan**. Benefits desktop over WAN, but the motivation is mobile:
+Status: **Q1 shipped** (drop-in single-stream transport, server `--quic`/
+`--quic-port` + mobile core `Transport::Quic`). **Q2 (split planes) not
+started.** Benefits desktop over WAN, but the motivation is mobile:
 lossy/roaming links, background/foreground churn, fast resume. Pairs directly
-with v0.5 session persistence.
+with v0.5 session persistence. Verified with a real integration test
+(spawns the actual server, opens a real QUIC connection + bidi stream, sends
+`Hello`, receives `HelloAck`) plus an independent manual client run — not
+just "the code compiles."
 
 ## Why QUIC (vs the TCP/SSH transports today)
 

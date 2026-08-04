@@ -1,6 +1,28 @@
 # Termland mobile clients (Android + iOS) — design
 
-Status: **plan** (not started). Target: a milestone after v0.5.
+Status: **M1 (core) + M2 (Android app) shipped.** iOS (M3) not started.
+This doc is kept as the design reference; see [ROADMAP.md](../ROADMAP.md)'s
+"Mobile clients" section for what's actually built and verified. Known
+deviations from the original plan below:
+
+- **Keyboard/text input** shipped as a **dynamic-xkb-keymap** injector
+  (`crates/termland-compositor/src/input.rs`) instead of Wayland
+  input-method-v2 — it works against every surface (including terminals and
+  games that don't participate in text-input) and needed no compositor IME
+  support, unlike input-method-v2 which the "Server-side" section below
+  originally proposed as primary.
+- **Transport priority shipped as:** embedded SSH (`russh`) → QUIC → TLS →
+  plain TCP, i.e. SSH and QUIC arrived together rather than SSH-then-QUIC as
+  phased below.
+- **`termland-mobile-core`'s `ServerProfile`** gained two boolean fields
+  since M1, `use_ssh` and `use_quic`, each `#[uniffi(default = false)]` so
+  bindings generated before their addition keep compiling.
+- Audio (M4) is a documented no-op on the Android side: the core delivers
+  `onAudioPacket`, the Kotlin `AudioTrack` player isn't wired up yet.
+- Nothing here has been run against a real device or emulator — verification
+  so far is build/compile/unit-test level plus a real assembled APK with
+  both native-lib ABIs inspected, not an actual tablet talking to an actual
+  server.
 
 Goal: a native-feeling touch client for phones/tablets that connects to a
 Termland server, resumes persistent sessions, and decodes video on the device's

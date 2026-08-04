@@ -183,7 +183,7 @@ termland/
     termland-client/      winit window, softbuffer renderer, decode + playback
 ```
 
-**Wire protocol**: length-delimited binary framing (`[Magic "TL"][MsgID][Length][CBOR]`) carrying control messages (handshake, auth, session lifecycle, resize, ping) and data messages (AV1 video, Opus audio, cursor, clipboard, input events).
+**Wire protocol**: length-delimited binary framing (`[Magic "TL"][MsgID][Length][CBOR]`) carrying control messages (handshake, auth, session lifecycle, resize, ping) and data messages (AV1 video, Opus audio, cursor image, clipboard, key/pointer input, Unicode text input). Runs over TCP, TLS, an embedded SSH subsystem channel, or QUIC (Q1: single-stream drop-in).
 
 **Encoder pipeline**: compositor buffer capture via wlr-screencopy-unstable-v1, RGBA-to-YUV conversion respecting ffmpeg's 32-byte row alignment, hardware encoder probing at startup with automatic fallback.
 
@@ -205,13 +205,21 @@ The client RPM installs:
 
 ## Roadmap
 
-- [ ] Qt6 client with native menubar and session manager
-- [ ] Clipboard sync (protocol messages defined, implementation pending)
-- [ ] QUIC/WebTransport for UDP video stream
+- [x] Clipboard sync (plain text, bidirectional)
+- [x] Cursor shape sync (real cursor bitmap, not a placeholder)
+- [x] QUIC transport (Q1: drop-in single-stream; Q2 plane-splitting pending)
+- [x] Native Android client (termland-mobile-core + Kotlin/Compose app;
+      see [docs/mobile-clients.md](docs/mobile-clients.md))
+- [x] Embedded SSH transport (`russh`) for the mobile client
+- [ ] Qt6 desktop client with native menubar and session manager
+- [ ] iOS client
 - [ ] Per-session privilege separation (fork + setuid after PAM auth)
-- [ ] Audio bitrate configuration
+- [ ] Audio bitrate configuration; Android audio playback (core delivers
+      packets, Kotlin-side AudioTrack player not yet wired up)
 - [ ] Multi-monitor support
 - [ ] Web client (WebCodecs + WebTransport)
+
+See [ROADMAP.md](ROADMAP.md) for the full detail behind each item.
 
 ## License
 

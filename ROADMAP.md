@@ -2,7 +2,8 @@
 
 Termland is a Rust-based multi-tenant Wayland remote-desktop server and
 client, streaming AV1-encoded video from a headless wlroots compositor
-over TCP (today) or SSH (tomorrow).
+over TCP, TLS, SSH, or QUIC. A native Android client (thin-client focus:
+physical keyboard + mouse on a tablet) ships alongside the desktop client.
 
 This file tracks what's done, what's in progress, and what needs to
 happen before the project is suitable for outside use.
@@ -38,6 +39,11 @@ happen before the project is suitable for outside use.
 - ✅ Configurable encoder tuning (--preset / --crf / --svt-params)
 - ✅ Multi-session server (many clients → many independent compositor
   instances in one `termland-server`)
+- ✅ Bidirectional clipboard sync, real cursor-shape sync, session
+  observability CLI (`--list-sessions`/`--close-session`)
+- ✅ Embedded SSH (`russh`) and QUIC (Q1) transports, on both the desktop
+  server and the Android core
+- ✅ Native Android client (M1 core + M2 app) — see "Mobile clients" below
 
 ## v0.2 — SHIPPED (v0.3.1)
 
@@ -192,48 +198,93 @@ and, if ever wanted, a richer cxx-qt UI (the ksni tray covers the core need).
 2. Control-plane messages (B) — small, unblocks the UI.
 3. Tray + manager (C) — build on the working attach/resume flow.
 
-## Mobile clients (Android + iOS)
+## Mobile clients — Android SHIPPED (M1 + M2), iOS not started
 
 Native touch clients for phones/tablets. Full design in
-[docs/mobile-clients.md](docs/mobile-clients.md). Highlights:
+[docs/mobile-clients.md](docs/mobile-clients.md); this section tracks what's
+actually built.
 
-- **Shared Rust core** (`termland-mobile-core`, exposed via UniFFI → Kotlin +
-  Swift) reuses `termland-protocol`, codec negotiation, and v0.5 session control.
-  It does protocol + negotiation + packet routing; **it does not bundle FFmpeg**.
-- **Platform hardware decode:** Android MediaCodec, iOS VideoToolbox. Each client
-  advertises exactly the codecs the device can decode — so our negotiation "just
-  works" (e.g. iOS has no VP8/VP9, so the server serves HEVC automatically).
-- **Transport:** MVP over the existing TCP+TLS listener; then an embedded
-  pure-Rust SSH subsystem (`russh`) for zero-config parity; then **QUIC**
-  (see below).
-- **Keyboard/text is the hard part** (IME, autocorrect, CJK, emoji don't map to
-  scancodes). Plan: a `TextInput` Unicode message injected server-side via
-  Wayland **input-method-v2** (with a dynamic-xkb-keymap fallback), plus the
-  existing `KeyEvent` path for editing/shortcut keys and an on-screen modifier
-  bar. Full design in [docs/mobile-clients.md](docs/mobile-clients.md).
-- **Mobile is where v0.5 persistence shines:** links drop constantly, so
-  auto-detach + one-tap resume is the flagship UX.
-- Phasing: M1 core+UniFFI → M2 Android → M3 iOS → M4 (embedded SSH, audio,
-  trackpad, AV1-where-HW, QUIC).
+- ✅ **M1 — shared Rust core** (`termland-mobile-core`, exposed via UniFFI →
+  Kotlin) reuses `termland-protocol`, codec negotiation, and v0.5 session
+  control as-is. Does protocol + negotiation + packet routing;
+  **does not bundle FFmpeg** — video decode is MediaCodec, entirely on the
+  Kotlin side.
+- ✅ **M2 — Android app**: Kotlin + Jetpack Compose. Profile/session screen
+  (DataStore-backed, lists resumable v0.5 sessions with resume/new/close),
+  `SurfaceView` + MediaCodec decoding straight to the `Surface`, codec
+  capability probed via `MediaCodecList` at startup and passed as
+  `supported_codecs` so negotiation picks correctly per device. Primary use
+  case (per the project's own aim) is a tablet as a thin client with a
+  physical keyboard and mouse: real `onKeyDown`/`onKeyUp` → evdev
+  scancode/keysym mapping (Ctrl+C, Alt+Tab etc. reach the remote), real
+  `onGenericMotionEvent` mouse handling (hover motion, button state → evdev
+  `BTN_*`, scroll axes) plus pointer capture for a relative/trackpad mode.
+  Touch (tap/long-press/drag/two-finger-scroll) and an on-screen modifier bar
+  cover the secondary touch-only case. A soft-keyboard IME path commits
+  Unicode text via `TextInput` rather than synthesizing scancodes.
+  `./gradlew assembleDebug` cross-compiles the core for arm64-v8a + x86_64 via
+  cargo-ndk and generates the Kotlin bindings automatically — verified
+  building a real APK, not just compiling.
+- ✅ **Transport, in priority order:** embedded SSH (`russh`, pure-Rust — the
+  in-process equivalent of the desktop client's `ssh -s host termland`, since
+  mobile sandboxes forbid spawning the `ssh` binary) → **QUIC** (see below) →
+  TCP+TLS → plain TCP.
+- ✅ **Keyboard/text**, the hard part (IME, autocorrect, CJK, emoji don't map
+  to scancodes): shipped as a **dynamic-xkb-keymap** approach rather than the
+  originally-planned input-method-v2 — it works against every surface
+  including terminals/games that don't participate in text-input, needs no
+  compositor IME support, and reuses the virtual-keyboard path already in
+  place. `TextInput` (Unicode) alongside the existing `KeyEvent` path
+  (editing/shortcut keys) plus an on-screen modifier bar. Verified against
+  real libxkbcommon, not just "it compiles."
+- ✅ **v0.5 persistence UX**: resumable-session list is the app's home screen,
+  per the "mobile links drop constantly" rationale this was built for.
+- Android audio playback (AudioTrack) is a documented no-op stub — the core
+  already delivers `onAudioPacket`, only the Kotlin-side player is
+  unimplemented. iOS (M3) has not been started.
+- Not runtime-verified: no device or emulator was available while building
+  this. Everything above is confirmed at the build/compile/unit-test level
+  (including two independent live QUIC handshake proofs — see below — and a
+  real assembled APK with both native-lib ABIs inspected), not by an actual
+  tablet talking to an actual server.
 
-### QUIC transport (pulled forward for mobile)
+### QUIC transport — Q1 SHIPPED, Q2 not started
 
 Full design in [docs/quic-transport.md](docs/quic-transport.md). QUIC gives
 **connection migration** (survive Wi-Fi↔cellular), **0-RTT resume**, and
 **no head-of-line blocking** across video/audio/input — exactly what lossy,
 roaming mobile links need, and it pairs with v0.5 resume. `quinn` (pure-Rust)
-on both server and the mobile core. Phasing: Q1 = QUIC as a drop-in single-stream
-byte transport (small, low-risk, already gets migration + 0-RTT); Q2 = split
-video/audio onto their own streams/datagrams for HOL-free A/V. Desktop WAN users
-benefit for free.
+on both server (`--quic`/`--quic-port`, alongside the existing TCP listener)
+and the mobile core (`Transport::Quic`).
+
+- ✅ **Q1 — drop-in single-stream transport.** The entire existing protocol
+  over one QUIC bidi stream; `handle_session` was already generic over any
+  `AsyncRead + AsyncWrite`, so nothing downstream changed. Verified with a
+  real integration test (spawns the actual server binary, opens a real QUIC
+  connection, sends `Hello`, gets back a real `HelloAck`) plus a second,
+  independent manual client against a running `--quic` server.
+- Not started: **Q2 — split the planes** onto their own streams/datagrams for
+  HOL-free A/V.
+- Along the way, fixed a real pre-existing bug: `--tls` could panic at
+  runtime (`Could not automatically determine the process-level
+  CryptoProvider`) once a full workspace build unified two crates'
+  differing rustls crypto-provider choices. Now pinned explicitly.
 
 ## v0.3 / stretch
 
-- Clipboard sync (plain text first, then images)
+- ✅ **Clipboard sync** (plain text) — bidirectional via `wl-copy`/`wl-paste`
+  subprocesses on both ends, hash-diffed to avoid echo loops. Images/files
+  remain open.
+- ✅ **Cursor shape sync** — the server captures the real compositor cursor
+  bitmap (`ext-image-copy-capture-v1`'s pointer cursor session, not a
+  semantic shape name — that negotiation is internal to labwc and isn't
+  observable externally) and forwards it via the `CursorUpdate` message
+  (defined from the start, previously unwired). Client-side-cursor mode now
+  renders the real remote cursor instead of a generic placeholder dot.
+- ✅ **Foreground session observability** — `termland-server --list-sessions`
+  / `--close-session <id>` read/signal the v0.5 registry directly (no
+  network round-trip, no running server process required).
 - File transfer (clipboard paste of files, or drag-and-drop)
-- Cursor shape sync — server tracks the compositor's active cursor
-  shape (hover, text, wait, resize) and forwards it to the client so
-  client-side cursor rendering matches what the remote would show
 - Taskbar / window list protocol — plasmashell's task manager widget
   can't see labwc windows because labwc doesn't speak `org_kde_plasma
   _window_management`. Options: launch waybar alongside plasmashell
@@ -241,8 +292,6 @@ benefit for free.
 - SDDM / greetd integration — proper login screen + session selection
   for multi-user deployments
 - Seamless reconnect — drop/reconnect without losing the session
-- Foreground session observability — list active sessions from the
-  server CLI, kick/disconnect from the CLI
 - Native Windows / macOS clients — currently Linux only; the server
   is Wayland-specific by design but the client can be cross-platform
 
