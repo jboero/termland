@@ -45,6 +45,6 @@ pub fn launch_detached(
     tracing::info!("cage created socket: {wayland_display}");
     wait_socket_ready(&wayland_display, &runtime_dir);
 
-    Ok(DetachedBackend { pid, wayland_display })
+    Ok(DetachedBackend { pid, wayland_display, runtime_dir })
 }
 

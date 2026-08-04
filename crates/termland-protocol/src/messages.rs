@@ -36,6 +36,10 @@ pub enum MessageId {
     AudioChunk = 0x22,
     CursorUpdate = 0x23,
     ClipboardData = 0x24,
+    /// Files copied on the server side's clipboard (a `text/uri-list`), sent
+    /// whole so the client can paste them as real files. See
+    /// [`FileTransferPayload`] for the MVP size/chunking limitation.
+    FileTransferData = 0x25,
 
     // Client -> Server data
     KeyEvent = 0x40,
@@ -46,6 +50,9 @@ pub enum MessageId {
     QualityHint = 0x45,
     CursorMode = 0x46,
     TextInput = 0x47,
+    /// Files copied on the client side's clipboard, sent to the server. See
+    /// [`FileTransferPayload`] for the MVP size/chunking limitation.
+    FileTransferSend = 0x48,
 }
 
 impl MessageId {
@@ -71,6 +78,7 @@ impl MessageId {
             0x22 => Some(Self::AudioChunk),
             0x23 => Some(Self::CursorUpdate),
             0x24 => Some(Self::ClipboardData),
+            0x25 => Some(Self::FileTransferData),
             0x40 => Some(Self::KeyEvent),
             0x41 => Some(Self::MouseMove),
             0x42 => Some(Self::MouseButton),
@@ -79,6 +87,7 @@ impl MessageId {
             0x45 => Some(Self::QualityHint),
             0x46 => Some(Self::CursorMode),
             0x47 => Some(Self::TextInput),
+            0x48 => Some(Self::FileTransferSend),
             _ => None,
         }
     }
@@ -110,6 +119,7 @@ pub enum Message {
     AudioChunk(AudioChunk),
     CursorUpdate(CursorUpdate),
     ClipboardData(ClipboardPayload),
+    FileTransferData(FileTransferPayload),
 
     // Client -> Server input
     KeyEvent(super::input::KeyEvent),
@@ -120,6 +130,7 @@ pub enum Message {
     QualityHint(QualityHintMsg),
     CursorMode(CursorModeMsg),
     TextInput(TextInput),
+    FileTransferSend(FileTransferPayload),
 }
 
 impl Message {
@@ -145,6 +156,7 @@ impl Message {
             Self::AudioChunk(_) => MessageId::AudioChunk,
             Self::CursorUpdate(_) => MessageId::CursorUpdate,
             Self::ClipboardData(_) => MessageId::ClipboardData,
+            Self::FileTransferData(_) => MessageId::FileTransferData,
             Self::KeyEvent(_) => MessageId::KeyEvent,
             Self::MouseMove(_) => MessageId::MouseMove,
             Self::MouseButton(_) => MessageId::MouseButton,
@@ -153,6 +165,7 @@ impl Message {
             Self::QualityHint(_) => MessageId::QualityHint,
             Self::CursorMode(_) => MessageId::CursorMode,
             Self::TextInput(_) => MessageId::TextInput,
+            Self::FileTransferSend(_) => MessageId::FileTransferSend,
         }
     }
 
@@ -444,6 +457,48 @@ pub struct ClipboardPayload {
     pub mime_type: String,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
+}
+
+/// Maximum total size (sum of all file contents) for one clipboard file-paste
+/// transfer ([`FileTransferPayload`]).
+///
+/// This is a deliberate MVP limitation, not an oversight. The wire protocol
+/// caps a single message at `MAX_PAYLOAD_SIZE` (16 MiB - see `frame.rs`), and
+/// this first pass sends an entire file-list clipboard as **one** message
+/// with no chunking across multiple messages. 12 MiB leaves headroom under
+/// that 16 MiB frame cap for CBOR/framing overhead (struct tags, per-file
+/// name strings, byte-array length prefixes) so a transfer that is under
+/// *this* cap doesn't still blow the wire limit once serialized.
+///
+/// This comfortably covers the realistic use case it closes - clipboard-paste
+/// of a few documents/images - not multi-gigabyte transfers, which would need
+/// real chunking across multiple messages (future work, not attempted here).
+pub const MAX_FILE_TRANSFER_BYTES: u64 = 12 * 1024 * 1024;
+
+/// One file being transferred as part of a clipboard file-paste.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// Basename only (no directory components). The receiving side must
+    /// sanitize this before using it in a filesystem write - it arrives
+    /// as attacker-controllable data from the other end of the connection.
+    /// See `termland_protocol::clipboard_files::sanitize_filename`.
+    pub name: String,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+/// Clipboard file-paste payload: the files a desktop "Copy" action put on one
+/// side's clipboard (as a `text/uri-list`), read into memory and sent whole
+/// to the other side so a `Ctrl+V` there can paste them as real files.
+///
+/// MVP limitation: total size across all files is capped at
+/// [`MAX_FILE_TRANSFER_BYTES`] and sent as a single wire message with no
+/// chunking - see that constant's doc comment for the reasoning. A clipboard
+/// file-list whose total size exceeds the cap is rejected (logged, not sent)
+/// by the sending side rather than truncated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransferPayload {
+    pub files: Vec<FileEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

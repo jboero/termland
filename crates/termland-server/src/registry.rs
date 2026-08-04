@@ -35,12 +35,24 @@ pub struct SessionRecord {
     /// another authenticated user's session just because they can guess or
     /// enumerate its id.
     pub owner: Option<String>,
+    /// The compositor's actual `XDG_RUNTIME_DIR` at creation time (see
+    /// `termland_compositor::backend::DetachedBackend`'s doc comment). Under
+    /// session isolation this is the target user's `/run/user/<uid>`, which
+    /// differs from the server process's own — every later connection to
+    /// this compositor's Wayland socket (screen capture, output resize,
+    /// cursor capture on resume, and the wl-copy/wl-paste-based clipboard/
+    /// file-transfer subprocesses) needs this value. Stored rather than
+    /// recomputed on attach/resume, so a fresh connection process doesn't
+    /// need to re-derive it (which would require re-resolving `owner` via
+    /// `getpwnam_r` again) and can't drift from what was actually used when
+    /// the compositor was created.
+    pub runtime_dir: String,
 }
 
 impl SessionRecord {
     fn to_kv(&self) -> String {
         format!(
-            "session_id={}\ncompositor_pid={}\nwayland_display={}\nmode={}\nwidth={}\nheight={}\ncreated_at_unix={}\naudio={}\nowner={}\n",
+            "session_id={}\ncompositor_pid={}\nwayland_display={}\nmode={}\nwidth={}\nheight={}\ncreated_at_unix={}\naudio={}\nowner={}\nruntime_dir={}\n",
             self.session_id,
             self.compositor_pid,
             self.wayland_display,
@@ -50,6 +62,7 @@ impl SessionRecord {
             self.created_at_unix,
             self.audio,
             self.owner.as_deref().unwrap_or(""),
+            self.runtime_dir,
         )
     }
 
@@ -69,6 +82,12 @@ impl SessionRecord {
         // predates ownership tracking and can't actually belong to a
         // different authenticated user under the new code).
         let mut owner: Option<String> = None;
+        // Absent on records written before this field existed too. Such a
+        // record was necessarily created before session isolation carried a
+        // per-session runtime dir at all, so the server's own default
+        // (matching the pre-fix behavior every caller implicitly assumed) is
+        // the correct fallback, not an arbitrary guess.
+        let mut runtime_dir: Option<String> = None;
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k {
@@ -81,6 +100,7 @@ impl SessionRecord {
                 "created_at_unix" => created_at_unix = v.parse().ok(),
                 "audio" => audio = v == "true",
                 "owner" => owner = if v.is_empty() { None } else { Some(v.to_string()) },
+                "runtime_dir" => runtime_dir = if v.is_empty() { None } else { Some(v.to_string()) },
                 _ => {}
             }
         }
@@ -94,6 +114,7 @@ impl SessionRecord {
             created_at_unix: created_at_unix?,
             audio,
             owner,
+            runtime_dir: runtime_dir.unwrap_or_else(|| self::runtime_dir().to_string_lossy().into_owned()),
         })
     }
 }
@@ -117,6 +138,35 @@ pub fn ensure_dir() -> std::io::Result<()> {
 /// Logfile the detached compositor writes stdout/stderr to.
 pub fn log_path(id: &str) -> PathBuf {
     base_dir().join("logs").join(format!("{id}.log"))
+}
+
+/// `$XDG_RUNTIME_DIR/termland/clipboard-files/<session_id>` - scratch
+/// directory for files received via clipboard file-paste
+/// (`Message::FileTransferSend`) for one session. Mirrors `base_dir()`'s
+/// convention of using this server process's `XDG_RUNTIME_DIR` as
+/// scratch/state storage (same as session records and compositor logs).
+///
+/// Note this is the *server process's* runtime dir, not necessarily the
+/// session's isolated user's: the clipboard watch/receive threads run at the
+/// server process's own privilege level (see `transport.rs`'s
+/// `clipboard_watch_thread`/incoming `FileTransferSend` handling), not
+/// dropped into the session's target user the way the compositor itself is
+/// under `--auth` session isolation.
+///
+/// Cleanup: `clipboard_files_cleanup` below removes this directory when a
+/// session ends (see `transport.rs::run_session`'s `SessionOutcome`
+/// handling). Even if that's skipped (process killed, etc.), it lives under
+/// `XDG_RUNTIME_DIR`, which is conventionally tmpfs and cleared on
+/// reboot/logout - a fallback, not a strict guarantee.
+pub fn clipboard_files_dir(session_id: &str) -> PathBuf {
+    runtime_dir().join("termland").join("clipboard-files").join(session_id)
+}
+
+/// Remove a session's clipboard-files scratch directory (see
+/// `clipboard_files_dir`). Best-effort: errors (already gone, etc.) are
+/// ignored, matching `remove()`'s style for session records above.
+pub fn clipboard_files_cleanup(session_id: &str) {
+    let _ = std::fs::remove_dir_all(clipboard_files_dir(session_id));
 }
 
 fn record_path(id: &str) -> PathBuf {

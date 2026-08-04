@@ -55,6 +55,11 @@ impl From<termland_protocol::SessionMode> for SessionMode {
 pub struct Compositor {
     config: CompositorConfig,
     wayland_display: String,
+    /// This compositor's actual `XDG_RUNTIME_DIR` - see
+    /// `backend::DetachedBackend`'s doc comment for why this can differ from
+    /// the server process's own under session isolation, and must be used
+    /// for every later Wayland connection to this compositor.
+    runtime_dir: std::path::PathBuf,
     capturer: Option<ScreenCapturer>,
     /// Separate Wayland client that drives zwlr_output_manager_v1 so we can
     /// change the headless output's size at runtime. Optional because older
@@ -82,29 +87,36 @@ impl Compositor {
     /// as the server's own user. This must come from server-side auth state,
     /// never from client-supplied session-create parameters.
     pub fn create(config: CompositorConfig, log_path: &Path, run_as: Option<&str>) -> Result<(Self, u32), CompositorError> {
-        let (pid, wayland_display, backend_name) = match &config.mode {
+        let (pid, wayland_display, backend_name, runtime_dir) = match &config.mode {
             SessionMode::Desktop => {
                 let shell = config.desktop_shell
                     .clone()
                     .unwrap_or_else(detect_desktop_shell);
                 tracing::info!("Desktop shell: {shell}");
                 let d = backend::labwc::launch_detached(config.width, config.height, &shell, log_path, run_as)?;
-                (d.pid, d.wayland_display, "labwc")
+                (d.pid, d.wayland_display, "labwc", d.runtime_dir)
             }
             SessionMode::App { command, args } => {
                 let d = backend::cage::launch_detached(config.width, config.height, command, args, log_path, run_as)?;
-                (d.pid, d.wayland_display, "cage")
+                (d.pid, d.wayland_display, "cage", d.runtime_dir)
             }
         };
-        let comp = Self::connect(config, wayland_display, backend_name)?;
+        let comp = Self::connect(config, wayland_display, backend_name, runtime_dir)?;
         Ok((comp, pid))
     }
 
     /// Attach to an ALREADY-RUNNING compositor by its Wayland display name
     /// (session resume). Does not spawn anything; just connects a fresh
     /// capturer/resizer and re-asserts the output size.
-    pub fn attach(config: CompositorConfig, wayland_display: String) -> Result<Self, CompositorError> {
-        Self::connect(config, wayland_display, "compositor")
+    ///
+    /// `runtime_dir` must be the SAME runtime dir the compositor was
+    /// actually created with (see `DetachedBackend`'s doc comment) - callers
+    /// get this from the session registry record (`registry::SessionRecord
+    /// ::runtime_dir` in termland-server), not by recomputing it, since a
+    /// fresh connection process has no other way to know whether the
+    /// original session was isolated into a target user or not.
+    pub fn attach(config: CompositorConfig, wayland_display: String, runtime_dir: std::path::PathBuf) -> Result<Self, CompositorError> {
+        Self::connect(config, wayland_display, "compositor", runtime_dir)
     }
 
     /// Connect the screen capturer + output resizer to a running compositor.
@@ -112,8 +124,9 @@ impl Compositor {
         config: CompositorConfig,
         wayland_display: String,
         backend_name: &'static str,
+        runtime_dir: std::path::PathBuf,
     ) -> Result<Self, CompositorError> {
-        let capturer = ScreenCapturer::connect(&wayland_display)
+        let capturer = ScreenCapturer::connect(&wayland_display, &runtime_dir)
             .map_err(|e| CompositorError::WaylandError(format!("connect to {backend_name}: {e}")))?;
 
         tracing::info!("Screen capturer connected to {backend_name} ({wayland_display})");
@@ -121,7 +134,7 @@ impl Compositor {
         // Optional: connect a second Wayland client for output management.
         // If the protocol isn't available (older compositors), sessions still
         // work - they just can't be resized after startup.
-        let mut resizer = match OutputResizer::connect(&wayland_display) {
+        let mut resizer = match OutputResizer::connect(&wayland_display, &runtime_dir) {
             Ok(r) => Some(r),
             Err(e) => {
                 tracing::warn!("OutputResizer unavailable ({e}) - remote resize disabled");
@@ -147,7 +160,7 @@ impl Compositor {
         // "degrade, don't fail the whole session" treatment as the resizer -
         // ext-image-copy-capture-v1 is a staging protocol many compositors
         // (and older wlroots versions) don't implement yet.
-        let cursor_capturer = match CursorCapturer::connect(&wayland_display) {
+        let cursor_capturer = match CursorCapturer::connect(&wayland_display, &runtime_dir) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(
@@ -161,6 +174,7 @@ impl Compositor {
         Ok(Self {
             config,
             wayland_display,
+            runtime_dir,
             capturer: Some(capturer),
             resizer,
             cursor_capturer,
@@ -210,6 +224,15 @@ impl Compositor {
 
     pub fn wayland_display(&self) -> &str {
         &self.wayland_display
+    }
+
+    /// This compositor's actual `XDG_RUNTIME_DIR` (see the field's own doc
+    /// comment). Callers that spawn their own subprocesses or connections
+    /// against this compositor's Wayland socket - `termland-server`'s
+    /// clipboard/cursor watch threads and the session registry record -
+    /// must use this, not their own process's `XDG_RUNTIME_DIR`.
+    pub fn runtime_dir(&self) -> &std::path::Path {
+        &self.runtime_dir
     }
 
     pub fn backend_name(&self) -> &'static str {

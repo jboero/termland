@@ -241,10 +241,15 @@ pub struct ScreenCapturer {
 
 impl ScreenCapturer {
     /// Connect to the given Wayland display and bind screencopy globals.
-    pub fn connect(display_name: &str) -> Result<Self, CaptureError> {
-        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-            .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid()));
-        let socket_path = std::path::Path::new(&runtime_dir).join(display_name);
+    ///
+    /// `runtime_dir` must be the compositor's ACTUAL `XDG_RUNTIME_DIR` (see
+    /// `backend::DetachedBackend`'s doc comment) - under session isolation
+    /// this is the target user's `/run/user/<uid>`, which is not necessarily
+    /// this (server) process's own. Reading `XDG_RUNTIME_DIR` from our own
+    /// environment here would silently connect to (or fail to find) the
+    /// wrong socket for an isolated session.
+    pub fn connect(display_name: &str, runtime_dir: &std::path::Path) -> Result<Self, CaptureError> {
+        let socket_path = runtime_dir.join(display_name);
 
         let stream = std::os::unix::net::UnixStream::connect(&socket_path)
             .map_err(|e| CaptureError::Connect(format!("{}: {e}", socket_path.display())))?;

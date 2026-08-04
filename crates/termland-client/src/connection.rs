@@ -60,6 +60,11 @@ pub enum ClientCommand {
     SetCursorInFrame(bool),
     /// Send clipboard content to the remote session.
     ClipboardSend { mime_type: String, data: Vec<u8> },
+    /// Send files copied on the local clipboard (a `text/uri-list`) to the
+    /// remote session, so a paste there gets the real files. See
+    /// `termland_protocol::FileTransferPayload`'s doc comment for the MVP
+    /// size-cap/no-chunking limitation.
+    FileTransferSend(FileTransferPayload),
     Disconnect,
 }
 
@@ -534,6 +539,9 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                         data,
                     })).await;
                 }
+                Ok(ClientCommand::FileTransferSend(payload)) => {
+                    let _ = framed.send(Message::FileTransferSend(payload)).await;
+                }
                 Err(_) => break,
             }
         }
@@ -586,6 +594,12 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                             }
                             let _ = child.wait();
                         }
+                    }
+                    Some(Ok(Message::FileTransferData(payload))) => {
+                        // Server sent us files copied on its (remote) clipboard -
+                        // write them locally and point our own clipboard at them
+                        // so a Ctrl+V in a local app pastes the real files.
+                        std::thread::spawn(move || receive_file_transfer(payload));
                     }
                     Some(Ok(Message::SessionEnd(se))) => {
                         // Received FROM the server (our own clean exit takes
@@ -735,6 +749,192 @@ fn decode_thread(
     }
 
     tracing::info!("Decode thread exiting ({count} frames decoded)");
+}
+
+/// Check the local clipboard for a `text/uri-list` (files copied via a
+/// desktop file manager's "Copy" action) and, if present and within the size
+/// cap, send the files to the server as `ClientCommand::FileTransferSend`.
+///
+/// Called from `display.rs`'s focus-gained handler, on the same background
+/// thread as (and right after) the existing plain-text clipboard read - kept
+/// here rather than in `display.rs` so the file-reading/size-cap logic lives
+/// next to its server-side mirror (`termland-server`'s
+/// `read_files_from_uri_list`/`clipboard_watch_thread`) instead of split
+/// across crates.
+pub fn send_clipboard_file_transfer(tx: &mpsc::UnboundedSender<ClientCommand>) {
+    let has_uri_list = std::process::Command::new("wl-paste")
+        .arg("--list-types")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == "text/uri-list")
+        })
+        .unwrap_or(false);
+    if !has_uri_list {
+        return;
+    }
+
+    let uri_output = match std::process::Command::new("wl-paste")
+        .args(["--type", "text/uri-list", "--no-newline"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
+        _ => return,
+    };
+
+    let text = String::from_utf8_lossy(&uri_output);
+    let paths = parse_uri_list(&text);
+    if paths.is_empty() {
+        return;
+    }
+
+    let mut files = Vec::new();
+    let mut total: u64 = 0;
+    for path in &paths {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("clipboard file transfer: skipping unreadable {}: {e}", path.display());
+                continue;
+            }
+        };
+        total += data.len() as u64;
+        if total > MAX_FILE_TRANSFER_BYTES {
+            tracing::warn!(
+                "clipboard file transfer: total size of {} file(s) exceeds the {} MiB cap, not sending",
+                paths.len(),
+                MAX_FILE_TRANSFER_BYTES / (1024 * 1024),
+            );
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        files.push(FileEntry { name, data });
+    }
+
+    if !files.is_empty() {
+        tracing::debug!("Clipboard file list changed ({} file(s)), sending to server", files.len());
+        let _ = tx.send(ClientCommand::FileTransferSend(FileTransferPayload { files }));
+    }
+}
+
+/// `$XDG_CACHE_HOME/termland/clipboard-files` (falling back to
+/// `~/.cache/termland/clipboard-files`, then `std::env::temp_dir()/termland-clipboard-files`
+/// if `$HOME` isn't set either). Scratch storage for files received via
+/// clipboard file-paste (`Message::FileTransferData`) - ephemeral by
+/// convention (cache dir / temp dir), not explicitly cleaned up by this
+/// process; a long-running client could accumulate files here across many
+/// pastes, same tradeoff the server makes for its own runtime-dir scratch
+/// space (see `registry::clipboard_files_dir`'s doc comment).
+///
+/// This crate deliberately doesn't depend on the `dirs` crate for XDG
+/// lookups - see `profile.rs`'s local `mod dirs` for the existing precedent
+/// (a ~10-line lookup doesn't justify the dependency); this mirrors that
+/// convention for `XDG_CACHE_HOME` instead of `XDG_CONFIG_HOME`.
+fn client_clipboard_files_dir() -> std::path::PathBuf {
+    let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")));
+    match cache_dir {
+        Some(d) => d.join("termland").join("clipboard-files"),
+        None => std::env::temp_dir().join("termland-clipboard-files"),
+    }
+}
+
+/// A short, time-keyed subdirectory name for one clipboard file transfer -
+/// just needs to be unique across successive transfers in this process, not
+/// globally unique or unguessable. Mirrors the server's
+/// `transport::transfer_subdir_name` (same reasoning: a fresh subdir per
+/// transfer avoids a later paste's filenames overwriting an earlier paste's
+/// files while the local clipboard might still reference the earlier ones).
+fn transfer_subdir_name() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+/// Handle an inbound `Message::FileTransferData` from the server: write the
+/// files into a fresh subdirectory under `client_clipboard_files_dir()` and
+/// point the local clipboard at them via `wl-copy --type text/uri-list`, so a
+/// `Ctrl+V` in a local app pastes the real files the server sent.
+fn receive_file_transfer(payload: FileTransferPayload) {
+    if payload.files.is_empty() {
+        return;
+    }
+
+    // Defense in depth: the server is expected to enforce
+    // MAX_FILE_TRANSFER_BYTES before sending, but re-check here rather than
+    // trust the wire.
+    let total: u64 = payload.files.iter().map(|f| f.data.len() as u64).sum();
+    if total > termland_protocol::MAX_FILE_TRANSFER_BYTES {
+        tracing::warn!(
+            "rejecting FileTransferData: {} bytes exceeds the {} MiB cap",
+            total,
+            termland_protocol::MAX_FILE_TRANSFER_BYTES / (1024 * 1024),
+        );
+        return;
+    }
+
+    let dir = client_clipboard_files_dir().join(transfer_subdir_name());
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("clipboard file transfer: failed to create scratch dir {}: {e}", dir.display());
+        return;
+    }
+
+    let mut written_paths = Vec::new();
+    for entry in &payload.files {
+        // SECURITY: entry.name arrives from the server over the wire - see
+        // the identical reasoning in termland-server's receive_file_transfer.
+        // Only a bare basename is ever accepted; anything else is dropped.
+        let Some(safe_name) = termland_protocol::sanitize_filename(&entry.name) else {
+            tracing::warn!("clipboard file transfer: rejecting unsafe filename {:?}", entry.name);
+            continue;
+        };
+        let path = dir.join(&safe_name);
+        if let Err(e) = std::fs::write(&path, &entry.data) {
+            tracing::warn!("clipboard file transfer: failed to write {}: {e}", path.display());
+            continue;
+        }
+        written_paths.push(path);
+    }
+
+    if written_paths.is_empty() {
+        tracing::warn!("clipboard file transfer: no files were written (all rejected/failed)");
+        return;
+    }
+
+    let uri_list = termland_protocol::build_uri_list(&written_paths);
+    use std::io::Write;
+    let mut child = match std::process::Command::new("wl-copy")
+        .args(["--type", "text/uri-list"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("clipboard file transfer: wl-copy failed: {e}");
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(uri_list.as_bytes());
+    }
+    let _ = child.wait();
+
+    tracing::info!(
+        "Clipboard file transfer: wrote {} file(s) to {} and set local clipboard",
+        written_paths.len(),
+        dir.display()
+    );
 }
 
 #[cfg(test)]

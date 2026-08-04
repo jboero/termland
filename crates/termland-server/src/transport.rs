@@ -459,6 +459,7 @@ where
             start_kind = StartKind::Attach {
                 wayland_display: rec.wayland_display.clone(),
                 compositor_pid: rec.compositor_pid,
+                runtime_dir: rec.runtime_dir.clone(),
             };
             is_new = false;
         }
@@ -467,7 +468,7 @@ where
 
     // Spawn the compositor + capture loop on a blocking thread.
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(2);
-    let (display_tx, display_rx) = tokio::sync::oneshot::channel::<(String, u32)>();
+    let (display_tx, display_rx) = tokio::sync::oneshot::channel::<(String, u32, std::path::PathBuf)>();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     // Resize requests from the session loop → capture thread.
     let (resize_tx, resize_rx) = std::sync::mpsc::channel::<(u32, u32)>();
@@ -487,14 +488,17 @@ where
                        overlay_cursor_capture, resize_rx, frame_tx, display_tx, stop_rx);
     });
 
-    // Wait for the compositor to report its Wayland display name + pid.
-    let (wayland_display, compositor_pid) = tokio::time::timeout(
+    // Wait for the compositor to report its Wayland display name, pid, and
+    // actual runtime dir (see `registry::SessionRecord::runtime_dir`'s doc
+    // comment for why the last one can't just be assumed).
+    let (wayland_display, compositor_pid, compositor_runtime_dir) = tokio::time::timeout(
         tokio::time::Duration::from_secs(15),
         async { display_rx.await },
     )
     .await
     .context("timeout waiting for compositor to start")?
     .context("capture thread died before compositor started")?;
+    let compositor_runtime_dir = compositor_runtime_dir.to_string_lossy().into_owned();
 
     // For a freshly created session, record it in the registry so it can be
     // listed and resumed later. Resumes reuse the existing record.
@@ -509,6 +513,7 @@ where
             created_at_unix: crate::registry::now_unix(),
             audio,
             owner: record_owner,
+            runtime_dir: compositor_runtime_dir.clone(),
         };
         if let Err(e) = crate::registry::write(&rec) {
             tracing::warn!("failed to write session registry record: {e}");
@@ -518,8 +523,9 @@ where
     // Spawn input injection thread connected to the same Wayland display
     let (input_tx, input_rx) = std::sync::mpsc::channel::<InputCommand>();
     let input_display = wayland_display.clone();
+    let input_runtime_dir = compositor_runtime_dir.clone();
     let input_handle = std::thread::spawn(move || {
-        input_thread(&input_display, width, height, input_rx);
+        input_thread(&input_display, &input_runtime_dir, width, height, input_rx);
     });
 
     // Wait for first frame
@@ -568,20 +574,24 @@ where
         tracing::info!("  Audio encoder: disabled (client did not request audio)");
         (None, None, None)
     };
-    // Shared hash: tracks content set by the client so the watch thread
-    // doesn't echo it back.
+    // Shared hashes: track content set by the client so the watch thread
+    // doesn't echo it back. Separate trackers for plain text and file-list
+    // (text/uri-list) content since they're independent clipboard mime types.
     let client_clip_hash = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let client_clip_hash_watch = client_clip_hash.clone();
+    let client_clip_uri_hash = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let client_clip_uri_hash_watch = client_clip_uri_hash.clone();
 
     // Spawn clipboard watch thread
     let (mut clip_rx, _clip_stop_tx, _clip_handle) = {
-        let (ctx, crx) = tokio::sync::mpsc::channel::<ClipboardPayload>(4);
+        let (ctx, crx) = tokio::sync::mpsc::channel::<ClipboardEvent>(4);
         let (cstop_tx, cstop_rx) = tokio::sync::oneshot::channel::<()>();
         let clip_display = wayland_display.clone();
+        let clip_runtime_dir = compositor_runtime_dir.clone();
         let h = std::thread::spawn(move || {
-            clipboard_watch_thread(&clip_display, ctx, cstop_rx, client_clip_hash_watch);
+            clipboard_watch_thread(&clip_display, &clip_runtime_dir, ctx, cstop_rx, client_clip_hash_watch, client_clip_uri_hash_watch);
         });
-        tracing::info!("  Clipboard: bidirectional via wl-clipboard");
+        tracing::info!("  Clipboard: bidirectional via wl-clipboard (text + file paste)");
         (Some(crx), Some(cstop_tx), Some(h))
     };
 
@@ -596,8 +606,9 @@ where
         let (ctx, crx) = tokio::sync::mpsc::channel::<CursorUpdate>(4);
         let (cstop_tx, cstop_rx) = tokio::sync::oneshot::channel::<()>();
         let cursor_display = wayland_display.clone();
+        let cursor_runtime_dir = compositor_runtime_dir.clone();
         let h = std::thread::spawn(move || {
-            cursor_watch_thread(&cursor_display, ctx, cstop_rx, overlay_cursor_watch);
+            cursor_watch_thread(&cursor_display, &cursor_runtime_dir, ctx, cstop_rx, overlay_cursor_watch);
         });
         tracing::info!("  Cursor shape sync: client-side-cursor mode only (ext-image-copy-capture-v1)");
         (Some(crx), Some(cstop_tx), Some(h))
@@ -668,8 +679,12 @@ where
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(payload) = clip {
-                    if let Err(e) = framed.send(Message::ClipboardData(payload)).await {
+                if let Some(event) = clip {
+                    let msg = match event {
+                        ClipboardEvent::Text(payload) => Message::ClipboardData(payload),
+                        ClipboardEvent::Files(payload) => Message::FileTransferData(payload),
+                    };
+                    if let Err(e) = framed.send(msg).await {
                         tracing::error!("Failed to send clipboard: {e}");
                         break;
                     }
@@ -753,16 +768,25 @@ where
                             }
                             Message::ClipboardSend(cp) => {
                                 // Record hash so watch thread doesn't echo it back
-                                let hash = {
-                                    use std::hash::{Hash, Hasher};
-                                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                                    cp.data.hash(&mut h);
-                                    h.finish()
-                                };
+                                let hash = hash_bytes(&cp.data);
                                 client_clip_hash.store(hash, Ordering::Relaxed);
                                 let wd = wayland_display.clone();
+                                let rd = compositor_runtime_dir.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    set_remote_clipboard(&wd, &cp.data, &cp.mime_type);
+                                    set_remote_clipboard(&wd, &rd, &cp.data, &cp.mime_type);
+                                });
+                            }
+                            Message::FileTransferSend(payload) => {
+                                // Client copied files locally and is sending them to us -
+                                // write them into this session's scratch dir and point the
+                                // remote (server-side) desktop clipboard at them, so a
+                                // Ctrl+V inside the remote session pastes the real files.
+                                let wd = wayland_display.clone();
+                                let rd = compositor_runtime_dir.clone();
+                                let sid = session_id.clone();
+                                let uri_hash_flag = client_clip_uri_hash.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    receive_file_transfer(&sid, &wd, &rd, payload, &uri_hash_flag);
                                 });
                             }
                             _ => {}
@@ -808,14 +832,20 @@ where
     match outcome {
         SessionOutcome::Detached => {
             // The compositor keeps running; the session stays resumable.
+            // Deliberately do NOT clean up clipboard_files_dir here: the
+            // remote desktop's clipboard may still hold a text/uri-list
+            // pointing at those scratch files (pasted later, well after
+            // detach) - only clean up once the session is actually gone.
             tracing::info!("Session {session_id} detached (compositor still running, resumable)");
         }
         SessionOutcome::Closed => {
             crate::registry::close(&session_id);
+            crate::registry::clipboard_files_cleanup(&session_id);
             tracing::info!("Session {session_id} closed");
         }
         SessionOutcome::Gone => {
             crate::registry::remove(&session_id);
+            crate::registry::clipboard_files_cleanup(&session_id);
             tracing::info!("Session {session_id} ended (compositor gone)");
         }
     }
@@ -886,7 +916,7 @@ fn init_encoder(
 /// attach to an already-running session's Wayland display (resume).
 enum StartKind {
     Create { log_path: std::path::PathBuf },
-    Attach { wayland_display: String, compositor_pid: u32 },
+    Attach { wayland_display: String, compositor_pid: u32, runtime_dir: String },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -910,7 +940,7 @@ fn capture_thread(
     overlay_cursor: Arc<AtomicBool>,
     resize_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     frame_tx: tokio::sync::mpsc::Sender<CapturedFrame>,
-    display_tx: tokio::sync::oneshot::Sender<(String, u32)>,
+    display_tx: tokio::sync::oneshot::Sender<(String, u32, std::path::PathBuf)>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     let config = termland_compositor::CompositorConfig { width, height, mode, desktop_shell };
@@ -924,8 +954,8 @@ fn capture_thread(
                 }
             }
         }
-        StartKind::Attach { wayland_display, compositor_pid } => {
-            match termland_compositor::Compositor::attach(config, wayland_display) {
+        StartKind::Attach { wayland_display, compositor_pid, runtime_dir } => {
+            match termland_compositor::Compositor::attach(config, wayland_display, std::path::PathBuf::from(runtime_dir)) {
                 Ok(c) => (c, compositor_pid),
                 Err(e) => {
                     tracing::error!("Failed to attach to compositor: {e}");
@@ -935,8 +965,14 @@ fn capture_thread(
         }
     };
 
-    // Send the Wayland display name + compositor pid back to the session task.
-    let _ = display_tx.send((compositor.wayland_display().to_string(), comp_pid));
+    // Send the Wayland display name + compositor pid + actual runtime dir
+    // back to the session task (see registry::SessionRecord::runtime_dir's
+    // doc comment for why the caller can't just assume its own).
+    let _ = display_tx.send((
+        compositor.wayland_display().to_string(),
+        comp_pid,
+        compositor.runtime_dir().to_path_buf(),
+    ));
 
     // Map quality 1-100 to bitrate. quality 100 → 15 Mbps, 50 → 7.5 Mbps, 1 → 500 kbps
     let bitrate_kbps = (quality as u32 * 150).max(500);
@@ -1063,6 +1099,8 @@ fn capture_thread(
 /// Input injection thread: receives input commands and injects them into cage.
 fn input_thread(
     display_name: &str,
+    // See clipboard_watch_thread's `runtime_dir` doc comment.
+    runtime_dir: &str,
     _width: u32,
     _height: u32,
     rx: std::sync::mpsc::Receiver<InputCommand>,
@@ -1070,7 +1108,8 @@ fn input_thread(
     // Give cage a moment to be fully ready for another client connection
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    let mut injector = match termland_compositor::InputInjector::connect(display_name) {
+    let runtime_path = std::path::Path::new(runtime_dir);
+    let mut injector = match termland_compositor::InputInjector::connect(display_name, runtime_path) {
         Ok(i) => i,
         Err(e) => {
             tracing::error!("Failed to create input injector: {e}");
@@ -1232,13 +1271,43 @@ fn cleanup_null_sink(module_id: Option<&str>) {
     }
 }
 
+/// What the clipboard watch thread forwards to the session loop: either
+/// plain-text clipboard content (unchanged, existing behavior) or a batch of
+/// files read from a `text/uri-list` clipboard entry (new). Kept as one
+/// channel/enum rather than two channels so the session loop's `select!`
+/// doesn't need a third branch just for this.
+enum ClipboardEvent {
+    Text(ClipboardPayload),
+    Files(FileTransferPayload),
+}
+
+/// Hash arbitrary bytes with the same (non-cryptographic, "detect content
+/// changed" only) hasher used throughout this file's watch threads.
+fn hash_bytes(data: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    h.finish()
+}
+
 /// Clipboard poll thread: periodically runs `wl-paste` on the session's
-/// Wayland display and sends clipboard changes to the client.
+/// Wayland display and sends clipboard changes to the client. Polls two
+/// independent clipboard mime types each cycle - `text/plain` (original
+/// behavior) and `text/uri-list` (clipboard file-paste, new) - each with its
+/// own hash-diff so neither one's presence/absence affects the other.
 fn clipboard_watch_thread(
     wayland_display: &str,
-    clip_tx: tokio::sync::mpsc::Sender<ClipboardPayload>,
+    // The compositor's ACTUAL runtime dir - see
+    // registry::SessionRecord::runtime_dir's doc comment. Every wl-paste/
+    // wl-copy invocation in this function must set this explicitly rather
+    // than inheriting this (server) process's own XDG_RUNTIME_DIR, or an
+    // isolated session's clipboard subprocess would look for the Wayland
+    // socket in the wrong directory and simply never find it.
+    runtime_dir: &str,
+    clip_tx: tokio::sync::mpsc::Sender<ClipboardEvent>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     client_set_hash: Arc<std::sync::atomic::AtomicU64>,
+    client_set_uri_hash: Arc<std::sync::atomic::AtomicU64>,
 ) {
     // Verify wl-paste is available
     if std::process::Command::new("wl-paste")
@@ -1255,6 +1324,7 @@ fn clipboard_watch_thread(
     tracing::info!("Clipboard watch started on {wayland_display}");
 
     let mut last_hash: u64 = 0;
+    let mut last_uri_hash: u64 = 0;
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -1263,51 +1333,272 @@ fn clipboard_watch_thread(
 
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // Run wl-paste to get current clipboard contents
+        // --- text/plain path (unchanged from before file-transfer support) ---
         let output = match std::process::Command::new("wl-paste")
             .arg("--no-newline")
             .env("WAYLAND_DISPLAY", wayland_display)
+            .env("XDG_RUNTIME_DIR", runtime_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .output()
         {
             Ok(o) if o.status.success() => o.stdout,
-            _ => continue,
+            _ => Vec::new(),
         };
 
-        if output.is_empty() {
-            continue;
-        }
-
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            output.hash(&mut h);
-            h.finish()
-        };
-
-        if hash == last_hash {
-            continue;
-        }
-        // Skip content that was set by the client (avoid echo loop)
-        if hash == client_set_hash.load(std::sync::atomic::Ordering::Relaxed) {
-            last_hash = hash;
-            continue;
-        }
-        {
-            last_hash = hash;
-            tracing::debug!("Clipboard changed ({} bytes), sending to client", output.len());
-            let payload = ClipboardPayload {
-                mime_type: "text/plain".into(),
-                data: output,
-            };
-            if clip_tx.blocking_send(payload).is_err() {
-                break;
+        if !output.is_empty() {
+            let hash = hash_bytes(&output);
+            if hash != last_hash {
+                // Skip content that was set by the client (avoid echo loop)
+                if hash == client_set_hash.load(std::sync::atomic::Ordering::Relaxed) {
+                    last_hash = hash;
+                } else {
+                    last_hash = hash;
+                    tracing::debug!("Clipboard changed ({} bytes), sending to client", output.len());
+                    let payload = ClipboardPayload {
+                        mime_type: "text/plain".into(),
+                        data: output,
+                    };
+                    if clip_tx.blocking_send(ClipboardEvent::Text(payload)).is_err() {
+                        break;
+                    }
+                }
             }
+        }
+
+        // --- text/uri-list path (clipboard file-paste) ---
+        // Only bother invoking `wl-paste --type text/uri-list` at all when
+        // that mime type is actually on the clipboard right now - most
+        // clipboard changes are plain text, and a file-manager "Copy" is
+        // comparatively rare, so this avoids a second subprocess spawn every
+        // 500ms in the common case.
+        if clipboard_has_uri_list(wayland_display, runtime_dir) {
+            let uri_output = std::process::Command::new("wl-paste")
+                .args(["--type", "text/uri-list", "--no-newline"])
+                .env("WAYLAND_DISPLAY", wayland_display)
+                .env("XDG_RUNTIME_DIR", runtime_dir)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| o.stdout);
+
+            if let Some(uri_bytes) = uri_output.filter(|b| !b.is_empty()) {
+                let hash = hash_bytes(&uri_bytes);
+                if hash != last_uri_hash {
+                    if hash == client_set_uri_hash.load(std::sync::atomic::Ordering::Relaxed) {
+                        last_uri_hash = hash;
+                    } else {
+                        last_uri_hash = hash;
+                        let text = String::from_utf8_lossy(&uri_bytes);
+                        match read_files_from_uri_list(&text) {
+                            Some(payload) => {
+                                tracing::debug!(
+                                    "Clipboard file list changed ({} file(s)), sending to client",
+                                    payload.files.len()
+                                );
+                                if clip_tx.blocking_send(ClipboardEvent::Files(payload)).is_err() {
+                                    break;
+                                }
+                            }
+                            None => {
+                                // Either no readable files or the batch was
+                                // over the size cap (already logged inside
+                                // read_files_from_uri_list) - nothing to send.
+                            }
+                        }
+                    }
+                }
+            }
+        } else if last_uri_hash != 0 {
+            // The uri-list entry disappeared (clipboard replaced with
+            // something else) - reset so a later re-copy of the same file
+            // set is detected as "changed" again instead of being treated
+            // as a no-op repeat of stale state.
+            last_uri_hash = 0;
         }
     }
 
     tracing::info!("Clipboard watch thread exiting");
+}
+
+/// Does the session's clipboard currently offer a `text/uri-list` entry?
+/// Cheap presence check via `wl-paste --list-types`, used to skip the (more
+/// expensive, potentially large) `wl-paste --type text/uri-list` read on
+/// every poll cycle when there's nothing to read.
+fn clipboard_has_uri_list(wayland_display: &str, runtime_dir: &str) -> bool {
+    let output = std::process::Command::new("wl-paste")
+        .arg("--list-types")
+        .env("WAYLAND_DISPLAY", wayland_display)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == "text/uri-list")
+        }
+        _ => false,
+    }
+}
+
+/// Read the files listed in a `text/uri-list` clipboard payload from the
+/// local filesystem and build a [`FileTransferPayload`], subject to
+/// [`termland_protocol::MAX_FILE_TRANSFER_BYTES`].
+///
+/// - A `file://` entry whose file can't be read (permissions, deleted since
+///   the clipboard was set, a non-regular-file path, etc.) is skipped with a
+///   warning - one bad file in the selection shouldn't sink an otherwise-good
+///   batch.
+/// - If the *total* size of the successfully-read files would exceed the
+///   cap, the whole batch is rejected (clear warning, nothing returned)
+///   rather than silently truncated - see `MAX_FILE_TRANSFER_BYTES`'s doc
+///   comment for why this MVP doesn't chunk large transfers across messages.
+fn read_files_from_uri_list(text: &str) -> Option<FileTransferPayload> {
+    let paths = termland_protocol::parse_uri_list(text);
+    if paths.is_empty() {
+        return None;
+    }
+
+    let mut files = Vec::new();
+    let mut total: u64 = 0;
+    for path in &paths {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("clipboard file transfer: skipping unreadable {}: {e}", path.display());
+                continue;
+            }
+        };
+        total += data.len() as u64;
+        if total > termland_protocol::MAX_FILE_TRANSFER_BYTES {
+            tracing::warn!(
+                "clipboard file transfer: total size of {} file(s) exceeds the {} MiB cap, rejecting the whole batch",
+                paths.len(),
+                termland_protocol::MAX_FILE_TRANSFER_BYTES / (1024 * 1024),
+            );
+            return None;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        files.push(FileEntry { name, data });
+    }
+
+    if files.is_empty() { None } else { Some(FileTransferPayload { files }) }
+}
+
+/// A short, time-keyed directory name for one clipboard file transfer's
+/// scratch subdirectory (see `receive_file_transfer`) - just needs to be
+/// unique across successive transfers within a session, not globally unique
+/// or unguessable.
+fn transfer_subdir_name() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+/// Handle an inbound `Message::FileTransferSend` from the client: write the
+/// files into this session's scratch directory
+/// (`registry::clipboard_files_dir`) and point the remote (server-side)
+/// desktop's clipboard at them via `wl-copy --type text/uri-list`, so a
+/// `Ctrl+V` inside the remote session pastes the real files.
+///
+/// `uri_hash_flag` is set to the hash of the exact bytes handed to
+/// `wl-copy`'s stdin so `clipboard_watch_thread` recognizes this as
+/// self-set content and doesn't immediately echo it back to the client as if
+/// it were a fresh local clipboard change.
+fn receive_file_transfer(
+    session_id: &str,
+    wayland_display: &str,
+    // See clipboard_watch_thread's `runtime_dir` doc comment.
+    runtime_dir: &str,
+    payload: FileTransferPayload,
+    uri_hash_flag: &Arc<std::sync::atomic::AtomicU64>,
+) {
+    if payload.files.is_empty() {
+        return;
+    }
+
+    // Defense in depth: the sender is expected to enforce
+    // MAX_FILE_TRANSFER_BYTES before sending, but a modified/misbehaving
+    // client could send more - re-check here rather than trust the wire.
+    let total: u64 = payload.files.iter().map(|f| f.data.len() as u64).sum();
+    if total > termland_protocol::MAX_FILE_TRANSFER_BYTES {
+        tracing::warn!(
+            "rejecting FileTransferSend: {} bytes exceeds the {} MiB cap",
+            total,
+            termland_protocol::MAX_FILE_TRANSFER_BYTES / (1024 * 1024),
+        );
+        return;
+    }
+
+    // A fresh subdirectory per transfer (keyed by time) rather than writing
+    // straight into the session's clipboard_files_dir - otherwise a second
+    // paste reusing a filename from an earlier one would overwrite it while
+    // the remote clipboard might still reference the earlier path.
+    let dir = crate::registry::clipboard_files_dir(session_id).join(transfer_subdir_name());
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("clipboard file transfer: failed to create scratch dir {}: {e}", dir.display());
+        return;
+    }
+
+    let mut written_paths = Vec::new();
+    for entry in &payload.files {
+        // SECURITY: entry.name arrives from the client over the wire - a
+        // malicious or buggy client could send "../../etc/passwd" or an
+        // absolute path aiming to write outside `dir`. sanitize_filename
+        // only ever accepts a bare basename; anything else is dropped (with
+        // a warning) rather than partially rewritten.
+        let Some(safe_name) = termland_protocol::sanitize_filename(&entry.name) else {
+            tracing::warn!("clipboard file transfer: rejecting unsafe filename {:?}", entry.name);
+            continue;
+        };
+        let path = dir.join(&safe_name);
+        if let Err(e) = std::fs::write(&path, &entry.data) {
+            tracing::warn!("clipboard file transfer: failed to write {}: {e}", path.display());
+            continue;
+        }
+        written_paths.push(path);
+    }
+
+    if written_paths.is_empty() {
+        tracing::warn!("clipboard file transfer: no files were written (all rejected/failed)");
+        return;
+    }
+
+    let uri_list = termland_protocol::build_uri_list(&written_paths);
+    uri_hash_flag.store(hash_bytes(uri_list.as_bytes()), Ordering::Relaxed);
+
+    use std::io::Write;
+    let mut child = match std::process::Command::new("wl-copy")
+        .args(["--type", "text/uri-list"])
+        .env("WAYLAND_DISPLAY", wayland_display)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("clipboard file transfer: wl-copy failed: {e}");
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(uri_list.as_bytes());
+    }
+    let _ = child.wait();
+
+    tracing::info!(
+        "Clipboard file transfer: wrote {} file(s) to {} and set remote clipboard",
+        written_paths.len(),
+        dir.display()
+    );
 }
 
 /// Poll interval for cursor shape capture while client-side-cursor mode is
@@ -1350,11 +1641,17 @@ fn cursor_hash(width: u32, height: u32, hotspot_x: i32, hotspot_y: i32, visible:
 /// generic placeholder it draws locally instead of a real shape.
 fn cursor_watch_thread(
     wayland_display: &str,
+    // See clipboard_watch_thread's `runtime_dir` doc comment - this thread
+    // opens its OWN independent Wayland connection (separate from the one
+    // `Compositor` itself holds), so it needs the compositor's actual
+    // runtime dir passed in explicitly too.
+    runtime_dir: &str,
     cursor_tx: tokio::sync::mpsc::Sender<CursorUpdate>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     overlay_cursor: Arc<AtomicBool>,
 ) {
-    let mut capturer = match termland_compositor::CursorCapturer::connect(wayland_display) {
+    let runtime_path = std::path::Path::new(runtime_dir);
+    let mut capturer = match termland_compositor::CursorCapturer::connect(wayland_display, runtime_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
@@ -1489,7 +1786,7 @@ mod cursor_hash_tests {
 }
 
 /// Set the remote session's clipboard via wl-copy.
-fn set_remote_clipboard(wayland_display: &str, data: &[u8], mime_type: &str) {
+fn set_remote_clipboard(wayland_display: &str, runtime_dir: &str, data: &[u8], mime_type: &str) {
     use std::io::Write;
 
     let mime_arg = if mime_type.is_empty() { "text/plain" } else { mime_type };
@@ -1497,6 +1794,7 @@ fn set_remote_clipboard(wayland_display: &str, data: &[u8], mime_type: &str) {
     let mut child = match std::process::Command::new("wl-copy")
         .args(["--type", mime_arg])
         .env("WAYLAND_DISPLAY", wayland_display)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

@@ -126,10 +126,15 @@ pub struct InputInjector {
 
 impl InputInjector {
     /// Connect to the given Wayland display and set up virtual input devices.
-    pub fn connect(display_name: &str) -> Result<Self, InputError> {
-        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-            .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid()));
-        let socket_path = std::path::Path::new(&runtime_dir).join(display_name);
+    ///
+    /// `runtime_dir`: see `screencopy::ScreenCapturer::connect`'s doc
+    /// comment - must be the compositor's actual runtime dir, not
+    /// necessarily this process's own. Getting this wrong here specifically
+    /// means keyboard/mouse input injection silently fails for an isolated
+    /// session - the single most critical of all these Wayland connections,
+    /// since a session with video but no input is useless.
+    pub fn connect(display_name: &str, runtime_dir: &std::path::Path) -> Result<Self, InputError> {
+        let socket_path = runtime_dir.join(display_name);
 
         let stream = std::os::unix::net::UnixStream::connect(&socket_path)
             .map_err(|e| InputError::Connect(format!("{}: {e}", socket_path.display())))?;

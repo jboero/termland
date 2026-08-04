@@ -674,6 +674,7 @@ impl ApplicationHandler for App {
                                     });
                                 }
                             }
+                            crate::connection::send_clipboard_file_transfer(&tx);
                         });
                     }
                 }

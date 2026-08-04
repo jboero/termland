@@ -204,6 +204,69 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_file_transfer() {
+        // Two files with a mix of plain and unicode/space-containing names,
+        // since name-handling (not just byte-blob transport) is the whole
+        // point of this message over the older single-blob ClipboardPayload.
+        let msg = Message::FileTransferSend(crate::FileTransferPayload {
+            files: vec![
+                crate::FileEntry {
+                    name: "report.pdf".into(),
+                    data: vec![0x25, 0x50, 0x44, 0x46], // "%PDF"
+                },
+                crate::FileEntry {
+                    name: "üñïçødé notes.txt".into(),
+                    data: b"hello world".to_vec(),
+                },
+            ],
+        });
+
+        let mut codec = TermlandCodec;
+        let mut buf = BytesMut::new();
+
+        Encoder::encode(&mut codec, msg, &mut buf).unwrap();
+        assert_eq!(buf[2], crate::MessageId::FileTransferSend as u8);
+
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        match decoded {
+            Message::FileTransferSend(ft) => {
+                assert_eq!(ft.files.len(), 2);
+                assert_eq!(ft.files[0].name, "report.pdf");
+                assert_eq!(ft.files[0].data, vec![0x25, 0x50, 0x44, 0x46]);
+                assert_eq!(ft.files[1].name, "üñïçødé notes.txt");
+                assert_eq!(ft.files[1].data, b"hello world".to_vec());
+            }
+            other => panic!("expected FileTransferSend, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn roundtrip_file_transfer_data_server_to_client() {
+        // Same payload shape, but the server->client message id
+        // (FileTransferData) - verifies both directions get distinct ids
+        // and both decode correctly, mirroring ClipboardData/ClipboardSend.
+        let msg = Message::FileTransferData(crate::FileTransferPayload {
+            files: vec![crate::FileEntry { name: "a.txt".into(), data: vec![1, 2, 3] }],
+        });
+
+        let mut codec = TermlandCodec;
+        let mut buf = BytesMut::new();
+
+        Encoder::encode(&mut codec, msg, &mut buf).unwrap();
+        assert_eq!(buf[2], crate::MessageId::FileTransferData as u8);
+
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        match decoded {
+            Message::FileTransferData(ft) => {
+                assert_eq!(ft.files.len(), 1);
+                assert_eq!(ft.files[0].name, "a.txt");
+                assert_eq!(ft.files[0].data, vec![1, 2, 3]);
+            }
+            other => panic!("expected FileTransferData, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn partial_read() {
         let msg = Message::Ping(crate::Ping { timestamp_us: 42 });
 

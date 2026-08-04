@@ -13,6 +13,17 @@ use crate::session::CompositorError;
 pub struct DetachedBackend {
     pub pid: u32,
     pub wayland_display: String,
+    /// The `XDG_RUNTIME_DIR` this compositor was actually started with -
+    /// **not necessarily this (server) process's own**. Under session
+    /// isolation (`run_as: Some`) the compositor runs with the target user's
+    /// `/run/user/<uid>`, which differs from whatever the server process
+    /// itself inherited. Every later Wayland connection to this compositor
+    /// - screen capture, output resize, cursor capture, and the
+    /// wl-copy/wl-paste-based clipboard/file-transfer subprocesses in
+    /// `termland-server` - MUST use this value, not read `XDG_RUNTIME_DIR`
+    /// from their own environment, or they will simply fail to find the
+    /// socket for an isolated session.
+    pub runtime_dir: PathBuf,
 }
 
 /// A system user resolved via `getpwnam_r`, ready to drop the compositor's

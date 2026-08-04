@@ -44,7 +44,7 @@ pub fn launch_detached(
 
     // Drop `process` without waiting/killing: std Child does not kill on drop,
     // so the detached compositor keeps running.
-    Ok(DetachedBackend { pid, wayland_display })
+    Ok(DetachedBackend { pid, wayland_display, runtime_dir })
 }
 
 /// Random hex suffix so each call gets its own, unpredictable config

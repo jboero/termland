@@ -65,10 +65,11 @@ enum ApplyResult {
 impl OutputResizer {
     /// Connect to the compositor's Wayland socket and wait for the output
     /// manager globals to arrive.
-    pub fn connect(display_name: &str) -> Result<Self, ResizeError> {
-        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-            .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid()));
-        let socket_path = Path::new(&runtime_dir).join(display_name);
+    ///
+    /// `runtime_dir`: see `ScreenCapturer::connect`'s doc comment - must be
+    /// the compositor's actual runtime dir, not necessarily this process's own.
+    pub fn connect(display_name: &str, runtime_dir: &Path) -> Result<Self, ResizeError> {
+        let socket_path = runtime_dir.join(display_name);
 
         let stream = std::os::unix::net::UnixStream::connect(&socket_path)
             .map_err(|e| ResizeError::Connect(format!("{}: {e}", socket_path.display())))?;
