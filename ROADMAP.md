@@ -41,6 +41,8 @@ happen before the project is suitable for outside use.
   instances in one `termland-server`)
 - ✅ Bidirectional clipboard sync, real cursor-shape sync, session
   observability CLI (`--list-sessions`/`--close-session`)
+- ✅ Desktop session manager (`--manager`, egui): saved multi-host profiles,
+  live per-host session list, resume/new/close
 - ✅ Embedded SSH (`russh`) and QUIC (Q1) transports, on both the desktop
   server and the Android core
 - ✅ Native Android client (M1 core + M2 app) — see "Mobile clients" below
@@ -67,8 +69,9 @@ All v0.2 blockers have been resolved:
 
 - Session isolation: `setuid` into authenticated user after PAM auth
   (currently sessions run as server user)
-- GUI client rewrite: Qt6 native menubar, session manager with saved
-  profiles, connection dialog (now folded into the v0.5 milestone below)
+- ✅ ~~GUI client rewrite: Qt6 native menubar, session manager with saved
+  profiles, connection dialog~~ — shipped as `--manager` (egui, not Qt6; see
+  v0.5 section C below for why).
 
 ## v0.4 / GPU rendering + zero-copy capture
 
@@ -150,8 +153,12 @@ the server process (compositor survives via `setsid`) → fresh server process �
 attach resumes and decodes. Tray registers and lists live sessions.
 
 Deferred to a later pass: session-sink audio continuity across detach/attach;
-a `.desktop`/autostart entry for the tray; per-session idle-timeout policy;
-and, if ever wanted, a richer cxx-qt UI (the ksni tray covers the core need).
+a `.desktop`/autostart entry for the tray; per-session idle-timeout policy.
+
+The "richer UI" this note said might never be needed turned out to be
+needed: `--tray` requires a server address on the CLI every launch, with no
+saved multi-host profiles at all. See section C below — now ✅ shipped, and
+not with cxx-qt.
 
 ### A. Server-side session persistence (the milestone)
 
@@ -180,17 +187,32 @@ and, if ever wanted, a richer cxx-qt UI (the ksni tray covers the core need).
   codec.
 - Client caches known sessions per host to populate the resume list.
 
-### C. Qt6 tray + session manager (client chrome)
+### C. Session manager (client chrome) — SHIPPED, not with Qt6
 
-- **One global systray icon** (StatusNotifierItem) for all open connections;
-  its menu lists active/resumable sessions with attach/close actions.
-- **Session manager window:** saved connection profiles, per-host session
-  list, new-session dialog. Build with **`cxx-qt`** (Rust-driven Qt6/QML) so
-  the existing decode/render/input engine stays in Rust and the viewer
-  window simply becomes "attach to session N".
-- Supersedes the deferred v0.2 "Qt6 GUI client rewrite" item, and folds in
-  the "seamless reconnect" and "foreground session observability" items from
-  the stretch list below.
+- ✅ **One global systray icon** (StatusNotifierItem via ksni) for all open
+  connections; its menu lists active/resumable sessions with attach/close
+  actions, plus a "Manage profiles…" entry into the window below.
+- ✅ **Session manager window** (`termland-client --manager`): saved
+  connection profiles (`~/.config/termland/profiles.json`), per-host session
+  list, new-session/resume/close actions. The plan called for **`cxx-qt`**
+  (Rust-driven Qt6/QML); that doesn't work in this environment — a real,
+  reproducible incompatibility where cxx-qt-build/qt-build-utils 0.7.3 emits
+  no Qt6 link flags at all against the installed Qt 6.11.1, confirmed with a
+  from-scratch scratch-crate build. Also matches this codebase's own earlier
+  choice, in the paragraph above, of pure-Rust `ksni` over cxx-qt for the
+  tray for the same "build burden" reason. Built with **`egui`/`eframe`**
+  instead (pure Rust, confirmed building cleanly on the first try) — the
+  existing decode/render/input engine still stays entirely in
+  `termland-client`'s normal windowed mode; the manager only ever shells out
+  to it (`std::env::current_exe()` + `Command`, same pattern the tray already
+  used), never runs it in-process, since winit's event loop and egui's can't
+  share a process.
+- Supersedes the deferred v0.2 "Qt6 GUI client rewrite" item, and closes the
+  "foreground session observability" desktop-client half of that stretch-list
+  item (the server-side half — `--list-sessions`/`--close-session` on
+  `termland-server` — shipped separately). "Seamless reconnect" is still
+  open — the manager makes resuming a dropped session one click, not
+  automatic.
 
 ### Suggested order
 

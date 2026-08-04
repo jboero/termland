@@ -211,7 +211,9 @@ The client RPM installs:
 - [x] Native Android client (termland-mobile-core + Kotlin/Compose app;
       see [docs/mobile-clients.md](docs/mobile-clients.md))
 - [x] Embedded SSH transport (`russh`) for the mobile client
-- [ ] Qt6 desktop client with native menubar and session manager
+- [x] Desktop session manager (`termland-client --manager`, egui): saved
+      multi-host profiles, per-host session list, resume/new/close (not
+      Qt6/cxx-qt — see [ROADMAP.md](ROADMAP.md) for why)
 - [ ] iOS client
 - [ ] Per-session privilege separation (fork + setuid after PAM auth)
 - [ ] Audio bitrate configuration; Android audio playback (core delivers
