@@ -469,6 +469,22 @@ where
         tracing::info!("  Audio encoder: disabled (client did not request audio)");
         (None, None, None)
     };
+    // Shared hash: tracks content set by the client so the watch thread
+    // doesn't echo it back.
+    let client_clip_hash = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let client_clip_hash_watch = client_clip_hash.clone();
+
+    // Spawn clipboard watch thread
+    let (mut clip_rx, _clip_stop_tx, _clip_handle) = {
+        let (ctx, crx) = tokio::sync::mpsc::channel::<ClipboardPayload>(4);
+        let (cstop_tx, cstop_rx) = tokio::sync::oneshot::channel::<()>();
+        let clip_display = wayland_display.clone();
+        let h = std::thread::spawn(move || {
+            clipboard_watch_thread(&clip_display, ctx, cstop_rx, client_clip_hash_watch);
+        });
+        tracing::info!("  Clipboard: bidirectional via wl-clipboard");
+        (Some(crx), Some(cstop_tx), Some(h))
+    };
 
     // Send the first frame
     let first_msg = frame_to_message(&first_frame);
@@ -524,6 +540,20 @@ where
                 if let Some(chunk) = audio {
                     if let Err(e) = framed.send(Message::AudioChunk(chunk)).await {
                         tracing::error!("Failed to send audio: {e}");
+                        break;
+                    }
+                }
+            }
+
+            clip = async {
+                match clip_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(payload) = clip {
+                    if let Err(e) = framed.send(Message::ClipboardData(payload)).await {
+                        tracing::error!("Failed to send clipboard: {e}");
                         break;
                     }
                 }
@@ -586,6 +616,20 @@ where
                                 outcome = SessionOutcome::Closed;
                                 break;
                             }
+                            Message::ClipboardSend(cp) => {
+                                // Record hash so watch thread doesn't echo it back
+                                let hash = {
+                                    use std::hash::{Hash, Hasher};
+                                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                                    cp.data.hash(&mut h);
+                                    h.finish()
+                                };
+                                client_clip_hash.store(hash, Ordering::Relaxed);
+                                let wd = wayland_display.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    set_remote_clipboard(&wd, &cp.data, &cp.mime_type);
+                                });
+                            }
                             _ => {}
                         }
                     }
@@ -608,10 +652,16 @@ where
     if let Some(astop) = _audio_stop_tx {
         let _ = astop.send(());
     }
+    if let Some(cstop) = _clip_stop_tx {
+        let _ = cstop.send(());
+    }
     let _ = capture_handle.join();
     let _ = input_handle.join();
     if let Some(ah) = _audio_handle {
         let _ = ah.join();
+    }
+    if let Some(ch) = _clip_handle {
+        let _ = ch.join();
     }
 
     match outcome {
@@ -1027,6 +1077,111 @@ fn cleanup_null_sink(module_id: Option<&str>) {
             .args(["unload-module", id])
             .output();
     }
+}
+
+/// Clipboard poll thread: periodically runs `wl-paste` on the session's
+/// Wayland display and sends clipboard changes to the client.
+fn clipboard_watch_thread(
+    wayland_display: &str,
+    clip_tx: tokio::sync::mpsc::Sender<ClipboardPayload>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    client_set_hash: Arc<std::sync::atomic::AtomicU64>,
+) {
+    // Verify wl-paste is available
+    if std::process::Command::new("wl-paste")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        tracing::warn!("wl-paste not available — clipboard sync disabled");
+        return;
+    }
+
+    tracing::info!("Clipboard watch started on {wayland_display}");
+
+    let mut last_hash: u64 = 0;
+
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Run wl-paste to get current clipboard contents
+        let output = match std::process::Command::new("wl-paste")
+            .arg("--no-newline")
+            .env("WAYLAND_DISPLAY", wayland_display)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            Ok(o) if o.status.success() => o.stdout,
+            _ => continue,
+        };
+
+        if output.is_empty() {
+            continue;
+        }
+
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            output.hash(&mut h);
+            h.finish()
+        };
+
+        if hash == last_hash {
+            continue;
+        }
+        // Skip content that was set by the client (avoid echo loop)
+        if hash == client_set_hash.load(std::sync::atomic::Ordering::Relaxed) {
+            last_hash = hash;
+            continue;
+        }
+        {
+            last_hash = hash;
+            tracing::debug!("Clipboard changed ({} bytes), sending to client", output.len());
+            let payload = ClipboardPayload {
+                mime_type: "text/plain".into(),
+                data: output,
+            };
+            if clip_tx.blocking_send(payload).is_err() {
+                break;
+            }
+        }
+    }
+
+    tracing::info!("Clipboard watch thread exiting");
+}
+
+/// Set the remote session's clipboard via wl-copy.
+fn set_remote_clipboard(wayland_display: &str, data: &[u8], mime_type: &str) {
+    use std::io::Write;
+
+    let mime_arg = if mime_type.is_empty() { "text/plain" } else { mime_type };
+
+    let mut child = match std::process::Command::new("wl-copy")
+        .args(["--type", mime_arg])
+        .env("WAYLAND_DISPLAY", wayland_display)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("wl-copy failed: {e}");
+            return;
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(data);
+    }
+    let _ = child.wait();
 }
 
 /// Convert a captured frame (video) into a protocol message.

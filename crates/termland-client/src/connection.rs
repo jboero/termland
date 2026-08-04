@@ -34,6 +34,8 @@ pub enum ClientCommand {
     /// Toggle whether the server includes its cursor in the video stream.
     /// `true` = server-side cursor (in frame), `false` = client draws own cursor.
     SetCursorInFrame(bool),
+    /// Send clipboard content to the remote session.
+    ClipboardSend { mime_type: String, data: Vec<u8> },
     Disconnect,
 }
 
@@ -391,6 +393,12 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                         include_cursor_in_frame: yes,
                     })).await;
                 }
+                Ok(ClientCommand::ClipboardSend { mime_type, data }) => {
+                    let _ = framed.send(Message::ClipboardSend(ClipboardPayload {
+                        mime_type,
+                        data,
+                    })).await;
+                }
                 Err(_) => break,
             }
         }
@@ -422,6 +430,22 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                         bytes_since_report += ac.data.len() as u64;
                         if let Some(ref atx) = audio_tx {
                             let _ = atx.send(AudioJob { data: ac.data });
+                        }
+                    }
+                    Some(Ok(Message::ClipboardData(cp))) => {
+                        tracing::debug!("Clipboard received ({} bytes)", cp.data.len());
+                        use std::io::Write;
+                        if let Ok(mut child) = std::process::Command::new("wl-copy")
+                            .args(["--type", if cp.mime_type.is_empty() { "text/plain" } else { &cp.mime_type }])
+                            .stdin(std::process::Stdio::piped())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                        {
+                            if let Some(mut stdin) = child.stdin.take() {
+                                let _ = stdin.write_all(&cp.data);
+                            }
+                            let _ = child.wait();
                         }
                     }
                     Some(Ok(Message::SessionEnd(se))) => {

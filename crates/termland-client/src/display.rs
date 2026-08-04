@@ -580,6 +580,31 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
+            WindowEvent::Focused(gained) => {
+                if gained {
+                    // Window gained focus: read local clipboard in a background
+                    // thread and send to server. Must not block the event loop
+                    // or spawn processes synchronously (can cause focus oscillation).
+                    if let Some(ref tx) = self.client_tx {
+                        let tx = tx.clone();
+                        std::thread::spawn(move || {
+                            if let Ok(output) = std::process::Command::new("wl-paste")
+                                .arg("--no-newline")
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::null())
+                                .output()
+                            {
+                                if output.status.success() && !output.stdout.is_empty() {
+                                    let _ = tx.send(ClientCommand::ClipboardSend {
+                                        mime_type: "text/plain".into(),
+                                        data: output.stdout,
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+            }
             WindowEvent::CloseRequested => {
                 self.send_cmd(ClientCommand::Disconnect);
                 event_loop.exit();
