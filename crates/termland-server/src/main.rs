@@ -46,6 +46,19 @@ struct Args {
     /// Usage: termland-server --completions bash > /etc/bash_completion.d/termland-server
     #[arg(long, value_name = "SHELL")]
     completions: Option<Shell>,
+
+    /// List active sessions on this host (session id, mode, size, age, pid,
+    /// audio) and exit. Reads the session registry directly — no server
+    /// process needs to be listening for this to work.
+    #[arg(long)]
+    list_sessions: bool,
+
+    /// Close (terminate) one or more sessions by id and exit. Repeatable
+    /// (--close-session a --close-session b) or comma-separated
+    /// (--close-session a,b). Exits non-zero if any given id doesn't
+    /// correspond to a live session.
+    #[arg(long, value_name = "ID", value_delimiter = ',')]
+    close_session: Vec<String>,
 }
 
 #[tokio::main]
@@ -60,6 +73,27 @@ async fn main() -> Result<()> {
             &mut std::io::stdout(),
         );
         return Ok(());
+    }
+
+    // --list-sessions / --close-session are one-shot, host-local admin
+    // operations, just like --completions above: they short-circuit before
+    // the listener (or its tracing setup) ever starts. They read/write the
+    // filesystem-backed registry (crate::registry) directly rather than
+    // talking to a running server over the wire — there is no daemon to
+    // talk to, and none of this needs the tokio runtime beyond what
+    // `#[tokio::main]` already gives us for free.
+    //
+    // No PAM/--auth gate is applied here: these operations are only reachable
+    // by someone who already has filesystem access to $XDG_RUNTIME_DIR on
+    // this host, and such a user can already `kill` the compositor PID (or
+    // read/rm the session files) directly with equivalent effect. Gating
+    // this CLI path wouldn't add any real protection, only friction for the
+    // legitimate local-admin case it exists for.
+    if args.list_sessions {
+        return list_sessions();
+    }
+    if !args.close_session.is_empty() {
+        return close_sessions(&args.close_session);
     }
 
     tracing_subscriber::fmt()
@@ -103,4 +137,65 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `--list-sessions`: print all live sessions from the registry and exit.
+/// Mirrors the SESSION ID / MODE / SIZE / AGE columns of
+/// `termland-client`'s `--list-sessions` (which talks to a running server
+/// over the network), plus PID and audio, which are only available here
+/// because this runs on the same host as the registry.
+fn list_sessions() -> Result<()> {
+    let sessions = registry::list_alive();
+    if sessions.is_empty() {
+        println!("No active sessions.");
+        return Ok(());
+    }
+
+    let now = registry::now_unix();
+    println!(
+        "{:<16} {:<16} {:<11} {:>8} {:>10} {:>5}",
+        "SESSION ID", "MODE", "SIZE", "AGE", "PID", "AUDIO"
+    );
+    for s in &sessions {
+        println!(
+            "{:<16} {:<16} {:<11} {:>8} {:>10} {:>5}",
+            s.session_id,
+            s.mode,
+            format!("{}x{}", s.width, s.height),
+            format_age(now.saturating_sub(s.created_at_unix)),
+            s.compositor_pid,
+            if s.audio { "on" } else { "off" },
+        );
+    }
+    Ok(())
+}
+
+/// `--close-session`: terminate the named session(s) and exit. Errors
+/// (non-zero exit) if any id doesn't correspond to a live session, rather
+/// than silently succeeding on a typo.
+fn close_sessions(ids: &[String]) -> Result<()> {
+    let mut any_missing = false;
+    for id in ids {
+        if registry::read(id).is_some() {
+            registry::close(id);
+            println!("Closed session {id}");
+        } else {
+            eprintln!("Error: no such session '{id}'");
+            any_missing = true;
+        }
+    }
+    if any_missing {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Same formatting as `termland-client`'s connection.rs::format_age — kept
+/// as a tiny local duplicate rather than shared across crates, since it's a
+/// two-line display helper, not shared logic.
+fn format_age(secs: u64) -> String {
+    if secs < 60 { format!("{secs}s") }
+    else if secs < 3600 { format!("{}m", secs / 60) }
+    else if secs < 86400 { format!("{}h", secs / 3600) }
+    else { format!("{}d", secs / 86400) }
 }
