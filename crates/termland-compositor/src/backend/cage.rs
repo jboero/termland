@@ -7,12 +7,17 @@ use crate::session::CompositorError;
 
 /// Launch cage **detached** (setsid, stdio → `log_path`) so it survives the
 /// spawning connection. Returns the PID + Wayland socket.
+///
+/// `run_as`: forwarded to `detached_compositor_command` - when `Some`, cage
+/// (and the app it launches) run as that system user instead of the server's
+/// own user. See that function's doc comment for the privilege-drop mechanics.
 pub fn launch_detached(
     width: u32,
     height: u32,
     app_cmd: &str,
     app_args: &[String],
     log_path: &Path,
+    run_as: Option<&str>,
 ) -> Result<DetachedBackend, CompositorError> {
     let inner = if app_args.is_empty() {
         app_cmd.to_string()
@@ -21,7 +26,7 @@ pub fn launch_detached(
     };
     tracing::info!("Launching detached cage: {inner} ({width}x{height})");
 
-    let mut cmd = detached_compositor_command("cage", width, height, log_path)?;
+    let (mut cmd, runtime_dir) = detached_compositor_command("cage", width, height, log_path, run_as)?;
     cmd.arg("-d")
         .arg("--")
         .arg("sh")
@@ -38,7 +43,7 @@ pub fn launch_detached(
 
     let wayland_display = read_socket_from_log(log_path, &mut process)?;
     tracing::info!("cage created socket: {wayland_display}");
-    wait_socket_ready(&wayland_display);
+    wait_socket_ready(&wayland_display, &runtime_dir);
 
     Ok(DetachedBackend { pid, wayland_display })
 }

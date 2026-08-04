@@ -143,8 +143,12 @@ where
         );
     }
 
-    // Authentication (if required)
-    if require_auth {
+    // Authentication (if required). `authenticated_user` is the server-side
+    // source of truth for session isolation (setuid into this user once a
+    // session is created below) - it comes from PAM here, never from any
+    // client-supplied message, and stays `None` (preserving pre-isolation
+    // behavior exactly) when the server isn't running with `--auth`.
+    let authenticated_user: Option<String> = if require_auth {
         framed.send(Message::AuthRequest(AuthRequest {
             methods: vec!["password".into()],
         })).await.context("failed to send AuthRequest")?;
@@ -158,8 +162,9 @@ where
             other => anyhow::bail!("expected AuthResponse, got {:?}", other.message_id()),
         };
 
+        let auth_username = username.clone();
         let ok = tokio::task::spawn_blocking(move || {
-            crate::auth::pam_authenticate_user(&username, &password)
+            crate::auth::pam_authenticate_user(&auth_username, &password)
         }).await??;
 
         if !ok {
@@ -172,13 +177,29 @@ where
             anyhow::bail!("authentication failed");
         }
 
+        // A successful PAM auth confirms this is a real, authenticatable
+        // system account, but not that the username string is free of
+        // control characters some PAM backend might tolerate. `owner` below
+        // gets persisted into the registry's line-based key=value format
+        // (registry.rs), where an embedded newline could inject a spoofed
+        // key into a session record - reject rather than let that reach
+        // storage. A newline is not a valid character in any real Unix
+        // account name, so this can only ever reject a pathological
+        // username, never a real user.
+        if username.contains('\n') {
+            anyhow::bail!("rejected authenticated username containing a newline");
+        }
+
         framed.send(Message::AuthResult(AuthResult {
             success: true,
             message: "authenticated".into(),
         })).await.context("failed to send AuthResult")?;
 
         tracing::info!("Client authenticated");
-    }
+        Some(username)
+    } else {
+        None
+    };
 
     // Ensure the session registry directory exists.
     let _ = crate::registry::ensure_dir();
@@ -201,8 +222,15 @@ where
 
         match msg {
             Message::SessionList(_) => {
+                // Once --auth is on, only show the caller's own sessions -
+                // otherwise any authenticated user could enumerate every
+                // other user's session ids from this list alone (and then
+                // Attach/Close would be the only remaining gate). A record
+                // with no owner predates ownership tracking and is shown to
+                // everyone, same as when auth is off entirely.
                 let sessions: Vec<SessionInfo> = crate::registry::list_alive()
                     .into_iter()
+                    .filter(|r| owned_by_caller(&r.owner, &authenticated_user))
                     .map(|r| SessionInfo {
                         session_id: r.session_id,
                         mode: r.mode,
@@ -219,6 +247,25 @@ where
                     .context("failed to send SessionListResult")?;
             }
             Message::SessionClose(sc) => {
+                // Same ownership check as SessionAttach (see run_session) -
+                // knowing a session id (even an unguessable one, once handed
+                // out by SessionList to its owner) must not be enough for a
+                // different authenticated user to close it.
+                if let Some(rec) = crate::registry::read(&sc.session_id) {
+                    if !owned_by_caller(&rec.owner, &authenticated_user) {
+                        tracing::warn!(
+                            "refusing SessionClose for {}: not owned by the authenticated caller",
+                            sc.session_id
+                        );
+                        framed
+                            .send(Message::SessionEnd(SessionEnd {
+                                reason: "not authorized to close this session".into(),
+                            }))
+                            .await
+                            .ok();
+                        continue;
+                    }
+                }
                 tracing::info!("Client requested close of session {}", sc.session_id);
                 crate::registry::close(&sc.session_id);
                 framed
@@ -229,17 +276,33 @@ where
                     .ok();
             }
             Message::SessionCreate(sc) => {
-                run_session(&mut framed, SessionRequest::Create(sc)).await?;
+                run_session(&mut framed, SessionRequest::Create(sc), authenticated_user.clone()).await?;
                 return Ok(());
             }
             Message::SessionAttach(sa) => {
-                run_session(&mut framed, SessionRequest::Attach(sa)).await?;
+                run_session(&mut framed, SessionRequest::Attach(sa), authenticated_user.clone()).await?;
                 return Ok(());
             }
             other => {
                 anyhow::bail!("expected a session control message, got {:?}", other.message_id());
             }
         }
+    }
+}
+
+/// Is a session record visible/accessible to the currently-authenticated
+/// caller? `caller` is `handle_session`'s `authenticated_user` - `None` when
+/// the server isn't running with `--auth`, in which case there is no
+/// identity concept at all and everything is accessible (unchanged from
+/// before session ownership existed). When auth IS on, a record with no
+/// owner (written before this field existed) is also accessible to everyone,
+/// since it can't actually belong to a different authenticated user under
+/// the current code. Otherwise, the owner must match exactly.
+fn owned_by_caller(owner: &Option<String>, caller: &Option<String>) -> bool {
+    match (owner, caller) {
+        (_, None) => true,
+        (None, Some(_)) => true,
+        (Some(o), Some(c)) => o == c,
     }
 }
 
@@ -252,9 +315,15 @@ enum SessionRequest {
 /// Run one streaming session (freshly created or resumed) until the client
 /// detaches or closes it. On plain disconnect the compositor is left running
 /// (the session persists); on an explicit close/compositor-exit it is removed.
+///
+/// `run_as`: the PAM-authenticated username from `handle_session`'s auth
+/// block (server-side truth), or `None` if the server isn't running with
+/// `--auth`. Deliberately NOT sourced from `request` - the client must never
+/// get to say who the session runs as.
 async fn run_session<T>(
     framed: &mut Framed<T, TermlandCodec>,
     request: SessionRequest,
+    run_as: Option<String>,
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -340,6 +409,26 @@ where
                     .ok();
                 return Ok(());
             };
+            // A session id is unguessable (registry::new_session_id() draws
+            // from /dev/urandom), but SessionList hands it out to its owner
+            // and this codebase deliberately doesn't treat that alone as a
+            // sufficient secret - see owned_by_caller's doc comment. Refuse
+            // an attach from a different authenticated user rather than
+            // silently letting them stream and inject input into someone
+            // else's live desktop.
+            if !owned_by_caller(&rec.owner, &run_as) {
+                tracing::warn!(
+                    "refusing SessionAttach for {}: not owned by the authenticated caller",
+                    rec.session_id
+                );
+                framed
+                    .send(Message::SessionEnd(SessionEnd {
+                        reason: "not authorized to attach to this session".into(),
+                    }))
+                    .await
+                    .ok();
+                return Ok(());
+            }
             tracing::info!("Attaching to session {} ({})", rec.session_id, rec.wayland_display);
             let ep = sa.encoder_preset.clone().filter(|s| !s.is_empty());
             let ex = sa.encoder_extra_params.clone().filter(|s| !s.is_empty());
@@ -388,10 +477,13 @@ where
     let overlay_cursor_capture = overlay_cursor.clone();
 
     let capture_codecs = supported_codecs.clone();
+    // Cloned before the move into capture_thread below: also needed to
+    // populate the registry record's `owner` field once the compositor is up.
+    let record_owner = run_as.clone();
     let capture_handle = std::thread::spawn(move || {
         capture_thread(width, height, quality, mode, desktop_shell,
                        encoder_preset, encoder_crf, encoder_extra_params,
-                       capture_codecs, start_kind,
+                       capture_codecs, start_kind, run_as,
                        overlay_cursor_capture, resize_rx, frame_tx, display_tx, stop_rx);
     });
 
@@ -416,6 +508,7 @@ where
             height,
             created_at_unix: crate::registry::now_unix(),
             audio,
+            owner: record_owner,
         };
         if let Err(e) = crate::registry::write(&rec) {
             tracing::warn!("failed to write session registry record: {e}");
@@ -808,6 +901,12 @@ fn capture_thread(
     encoder_extra_params: Option<String>,
     supported_codecs: Vec<termland_protocol::VideoCodec>,
     start_kind: StartKind,
+    // The PAM-authenticated username to isolate a freshly-created session's
+    // compositor into (session isolation), or `None` when the server is
+    // running without `--auth`. Only consulted for `StartKind::Create` - an
+    // `Attach` reconnects to a compositor that already runs as whatever user
+    // it was originally spawned with, so there's nothing to (re-)drop here.
+    run_as: Option<String>,
     overlay_cursor: Arc<AtomicBool>,
     resize_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     frame_tx: tokio::sync::mpsc::Sender<CapturedFrame>,
@@ -817,7 +916,7 @@ fn capture_thread(
     let config = termland_compositor::CompositorConfig { width, height, mode, desktop_shell };
     let (mut compositor, comp_pid) = match start_kind {
         StartKind::Create { log_path } => {
-            match termland_compositor::Compositor::create(config, &log_path) {
+            match termland_compositor::Compositor::create(config, &log_path, run_as.as_deref()) {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::error!("Failed to create compositor: {e}");
@@ -1309,6 +1408,40 @@ fn cursor_watch_thread(
     }
 
     tracing::info!("Cursor shape watch thread exiting");
+}
+
+#[cfg(test)]
+mod owned_by_caller_tests {
+    use super::owned_by_caller;
+
+    #[test]
+    fn no_auth_sees_everything() {
+        // caller=None means --auth isn't on; ownership isn't enforced at all,
+        // regardless of what (if anything) the record's owner field says.
+        assert!(owned_by_caller(&None, &None));
+        assert!(owned_by_caller(&Some("alice".into()), &None));
+    }
+
+    #[test]
+    fn ownerless_record_is_visible_to_any_authenticated_caller() {
+        // A record with no owner predates ownership tracking; it can't
+        // actually belong to a different authenticated user under the
+        // current code, so it stays visible rather than becoming
+        // unreachable after an upgrade.
+        assert!(owned_by_caller(&None, &Some("alice".into())));
+    }
+
+    #[test]
+    fn matching_owner_is_allowed() {
+        assert!(owned_by_caller(&Some("alice".into()), &Some("alice".into())));
+    }
+
+    #[test]
+    fn different_owner_is_refused() {
+        // The actual point of this whole feature: bob authenticating
+        // successfully as himself must not grant access to alice's session.
+        assert!(!owned_by_caller(&Some("alice".into()), &Some("bob".into())));
+    }
 }
 
 #[cfg(test)]

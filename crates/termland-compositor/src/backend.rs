@@ -1,8 +1,9 @@
 //! Shared backend support for launching headless wlroots compositors
 //! (cage for single-app, labwc for full desktop).
 
+use std::ffi::CString;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use crate::session::CompositorError;
 
@@ -14,16 +15,187 @@ pub struct DetachedBackend {
     pub wayland_display: String,
 }
 
+/// A system user resolved via `getpwnam_r`, ready to drop the compositor's
+/// privileges into. All fields are plain data (no further allocation needed)
+/// so they can be moved as-is into a `pre_exec` closure, which runs in the
+/// forked child and must not allocate (see `detached_compositor_command`).
+///
+/// # Session-lifecycle scope (deliberately not done here)
+///
+/// TODO(followup, security): this drops the *process* uid/gid/supplementary
+/// groups, which is enough for filesystem/IPC isolation between sessions, but
+/// it is not a full PAM/logind login: no `pam_open_session`/`pam_close_session`
+/// /`pam_setcred`, no systemd-logind session registration, no cgroup
+/// placement. A real login would want a PAM handle held open for the whole
+/// compositor lifetime and closed when the session ends, but the compositor
+/// here is a *detached* process (see `DetachedBackend`'s doc comment) that
+/// deliberately outlives the connection handler that spawns it — there is no
+/// natural point in the current control flow to hold that handle across a
+/// process boundary. Do not attempt to bolt this on without rethinking the
+/// detached-process architecture first.
+#[derive(Clone, Debug)]
+pub struct TargetUser {
+    pub uid: libc::uid_t,
+    pub gid: libc::gid_t,
+    pub home: String,
+    /// Pre-built C string of the username. Kept around specifically for
+    /// `initgroups()` inside `pre_exec`, which cannot itself call
+    /// `CString::new` (allocation is not async-signal-safe).
+    username_c: CString,
+}
+
+/// Resolve `username` to a system user via the thread-safe `getpwnam_r`.
+///
+/// Deliberately NOT `getpwnam`: that function returns a pointer into a single
+/// shared static buffer and is documented as unsafe to call from more than
+/// one thread at a time. This server handles many connections concurrently
+/// (each on its own tokio task / blocking thread), so a data race here would
+/// be a real, remotely-triggerable bug, not a theoretical one.
+///
+/// Fails closed on anything short of "a real, non-root system user": unknown
+/// username, a `getpwnam_r` error, or a resolved uid of 0. In particular, a
+/// PAM-authenticated "root" is refused rather than silently kept privileged —
+/// callers must not interpret a resolution failure as "fall back to running
+/// as the server's own user"; the whole point of this feature is to *not* do
+/// that.
+pub fn resolve_target_user(username: &str) -> Result<TargetUser, CompositorError> {
+    let username_c = CString::new(username)
+        .map_err(|_| CompositorError::StartFailed(format!("username contains NUL byte: {username:?}")))?;
+
+    // SAFETY: `pwd` is a plain-old-data struct that getpwnam_r fully
+    // populates on success; zero-initializing before the call is standard
+    // practice for this API and only matters if we bail out before rc==0.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // getpwnam_r needs a caller-supplied buffer for the strings it points
+    // `pwd`'s fields into. Start reasonably large and grow on ERANGE rather
+    // than trying to size it perfectly up front.
+    let mut buf: Vec<i8> = vec![0; 4096];
+
+    loop {
+        let rc = unsafe {
+            libc::getpwnam_r(
+                username_c.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == 0 {
+            break;
+        }
+        if rc == libc::ERANGE && buf.len() < (1 << 20) {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        return Err(CompositorError::StartFailed(format!(
+            "getpwnam_r({username}) failed: errno {rc}"
+        )));
+    }
+
+    if result.is_null() {
+        // rc == 0 but no entry found - "no such user", not an error.
+        return Err(CompositorError::StartFailed(format!(
+            "cannot isolate session: no such system user '{username}'"
+        )));
+    }
+
+    if pwd.pw_uid == 0 {
+        return Err(CompositorError::StartFailed(format!(
+            "refusing to run an isolated session as uid 0 (user '{username}' \
+             resolved to root) - this would defeat session isolation entirely"
+        )));
+    }
+
+    if pwd.pw_dir.is_null() {
+        return Err(CompositorError::StartFailed(format!(
+            "user '{username}' has no home directory in passwd"
+        )));
+    }
+    // SAFETY: pw_dir is a non-null NUL-terminated string owned by `buf`
+    // (getpwnam_r points passwd's string fields into the buffer we gave it),
+    // which is still alive here. We copy it into an owned String immediately
+    // so nothing borrows from `buf` past this function returning.
+    let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }
+        .to_string_lossy()
+        .into_owned();
+
+    Ok(TargetUser {
+        uid: pwd.pw_uid,
+        gid: pwd.pw_gid,
+        home,
+        username_c,
+    })
+}
+
+/// Ensure `/run/user/<uid>` exists and is owned/permissioned correctly for
+/// `target`, returning its path. On a normal interactive login this
+/// directory is created by `pam_systemd`/logind; since this server
+/// deliberately does not invoke that machinery (see `TargetUser`'s doc
+/// comment), we create it ourselves the first time a session isolates into a
+/// given user. If it already exists (a real login for the same user is also
+/// active, or a previous termland session created it) we leave it alone
+/// rather than re-chowning a directory something else may be relying on.
+///
+/// Must be called while still privileged (root) - an unprivileged process
+/// cannot `chown` a directory to another uid.
+fn ensure_runtime_dir(target: &TargetUser) -> Result<PathBuf, CompositorError> {
+    let dir = PathBuf::from(format!("/run/user/{}", target.uid));
+    if dir.exists() {
+        return Ok(dir);
+    }
+
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| CompositorError::StartFailed(format!("mkdir {}: {e}", dir.display())))?;
+
+    let dir_c = CString::new(dir.as_os_str().as_encoded_bytes())
+        .map_err(|e| CompositorError::StartFailed(format!("runtime dir path: {e}")))?;
+
+    // SAFETY: dir_c is a valid NUL-terminated path we just created; chown/
+    // chmod are plain syscalls with no aliasing/lifetime hazards here.
+    let rc = unsafe { libc::chown(dir_c.as_ptr(), target.uid, target.gid) };
+    if rc != 0 {
+        return Err(CompositorError::StartFailed(format!(
+            "chown {} to uid={} gid={}: {}",
+            dir.display(), target.uid, target.gid, std::io::Error::last_os_error()
+        )));
+    }
+    let rc = unsafe { libc::chmod(dir_c.as_ptr(), 0o700) };
+    if rc != 0 {
+        return Err(CompositorError::StartFailed(format!(
+            "chmod {} to 0700: {}", dir.display(), std::io::Error::last_os_error()
+        )));
+    }
+
+    Ok(dir)
+}
+
 /// Like `compositor_command`, but detaches the child into its own session and
 /// sends stdout+stderr to `log_path`. `setsid` keeps the compositor alive when
 /// the spawning process (e.g. an SSH-subsystem connection) exits, and the
 /// logfile avoids the SIGPIPE that a closed stderr pipe would cause.
+///
+/// `run_as`: when `Some(username)`, the spawned process (and everything cage/
+/// labwc launches inside the session) drops privileges to that system user
+/// immediately after `fork()`, before `exec()` — see the `pre_exec` closure
+/// below for the exact mechanics and why the ordering inside it is not
+/// negotiable. When `None` (no `--auth`, so there is no PAM-authenticated
+/// identity to isolate into), behavior is exactly as before this feature:
+/// the compositor runs as the server's own user.
+///
+/// Returns the `Command` plus the `XDG_RUNTIME_DIR` it will use, so callers
+/// (`wait_socket_ready`) poll for the Wayland socket in the *same* directory
+/// the child was actually told to use — which is the target user's
+/// `/run/user/<uid>` when `run_as` is set, not the server process's own
+/// runtime dir.
 pub fn detached_compositor_command(
     program: &str,
     width: u32,
     height: u32,
     log_path: &Path,
-) -> Result<Command, CompositorError> {
+    run_as: Option<&str>,
+) -> Result<(Command, PathBuf), CompositorError> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -57,7 +229,94 @@ pub fn detached_compositor_command(
             Ok(())
         });
     }
-    Ok(cmd)
+
+    let runtime_dir = match run_as {
+        None => std::env::var("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(format!("/run/user/{}", nix::unistd::getuid()))),
+        Some(username) => {
+            // Resolve the uid/gid/home *here*, in the parent, while still
+            // privileged - not inside pre_exec. A bad username or uid-0
+            // resolution needs to fail this whole session-creation call with
+            // a normal `Result`/log line; inside pre_exec our only recourse
+            // is "the syscall failed", which is far less informative and, if
+            // this resolution logic were duplicated there, would also be
+            // running in an async-signal-safe context that can't allocate to
+            // even build the error message.
+            let target = resolve_target_user(username)?;
+            let runtime_dir = ensure_runtime_dir(&target)?;
+
+            cmd.env("HOME", &target.home)
+                .env("USER", username)
+                .env("LOGNAME", username)
+                .env("XDG_RUNTIME_DIR", &runtime_dir);
+
+            // Data moved into the pre_exec closure below. Everything here is
+            // already-resolved plain data (an owned CString + two integers) -
+            // no lookups or string-building happen inside the closure itself.
+            let username_c = target.username_c.clone();
+            let uid = target.uid;
+            let gid = target.gid;
+
+            // SAFETY / ASYNC-SIGNAL-SAFETY: this closure runs in the child
+            // between fork() and exec(), a context where the process may
+            // have only one thread (this one) but shares its address space
+            // with a parent that could have other threads mid-allocation, so
+            // only async-signal-safe operations are allowed: no heap
+            // allocation, no locking, no formatting - raw syscalls on data
+            // that was fully prepared above, in the parent, before fork.
+            //
+            // Ordering is load-bearing, not stylistic:
+            //   1. initgroups() BEFORE setgid()/setuid() - sets this
+            //      process's supplementary group list to the TARGET user's
+            //      own groups (looked up from /etc/group by initgroups
+            //      itself via `username_c`). Skipping this is the single
+            //      most common privilege-drop bug there is: without it, the
+            //      child keeps the SERVER's supplementary groups (root's,
+            //      typically just `root`/`wheel`-equivalent, but potentially
+            //      `docker` or other privileged groups on some systems) even
+            //      after setuid/setgid succeed and the primary ids look
+            //      correctly dropped. initgroups() requires CAP_SETGID,
+            //      which we still have at this point (we haven't called
+            //      setuid yet).
+            //   2. setgid() BEFORE setuid() - once setuid() drops root's
+            //      effective uid, the process no longer has the capability
+            //      needed to change its gid at all (dropping uid drops the
+            //      capability set derived from being uid 0 first). Reversing
+            //      these two would either fail setgid() outright, or -worse-
+            //      silently leave the process running with the SERVER's
+            //      original gid if the failure isn't checked.
+            //   3. setuid() LAST - the final, unrecoverable drop back to an
+            //      unprivileged uid.
+            // Every step's return value is checked and turned into an `Err`
+            // on failure. Returning `Err` here aborts `Command::spawn()`
+            // cleanly (posix_spawn/fork machinery reports it as a normal
+            // spawn error; the child never reaches exec()) - that
+            // Result-checking IS the verification. There is deliberately no
+            // "verify the drop succeeded" step in the parent after spawn():
+            // by the time the parent observes anything, the child has either
+            // already exec'd (drop succeeded) or already exited (it didn't),
+            // so there is nothing left in the child to inspect from outside.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::initgroups(username_c.as_ptr(), gid) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::setgid(gid) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::setuid(uid) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+
+            runtime_dir
+        }
+    };
+
+    Ok((cmd, runtime_dir))
 }
 
 /// Poll the compositor's logfile for the `TERMLAND_SOCKET:<name>` marker echoed
@@ -128,12 +387,17 @@ pub fn validate_shell_command(cmd: &str) -> Result<(), CompositorError> {
     Ok(())
 }
 
-/// Wait for the Wayland socket file to appear in XDG_RUNTIME_DIR, then
-/// give the compositor a short grace period to finish initialization.
-pub fn wait_socket_ready(wayland_display: &str) {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid()));
-    let socket_path = std::path::Path::new(&runtime_dir).join(wayland_display);
+/// Wait for the Wayland socket file to appear in `runtime_dir`, then give the
+/// compositor a short grace period to finish initialization.
+///
+/// `runtime_dir` must be the *same* directory the compositor process was
+/// actually told to use (its `XDG_RUNTIME_DIR`), which is `detached_compositor_command`'s
+/// second return value - it is NOT necessarily this (server) process's own
+/// `XDG_RUNTIME_DIR`/uid. When a session runs as a different target user
+/// (privilege drop), the socket appears under that user's `/run/user/<uid>`,
+/// not the server's - polling the server's own directory would never find it.
+pub fn wait_socket_ready(wayland_display: &str, runtime_dir: &Path) {
+    let socket_path = runtime_dir.join(wayland_display);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
@@ -189,3 +453,40 @@ pub fn detect_desktop_shell() -> String {
 
 pub mod cage;
 pub mod labwc;
+
+#[cfg(test)]
+mod target_user_tests {
+    use super::resolve_target_user;
+
+    /// The "fail closed on root" rule is the whole point of this feature -
+    /// if a caller passed "root" as the PAM-authenticated username (e.g. a
+    /// misconfigured PAM service allowing root login), we must refuse to
+    /// isolate into it rather than silently keeping the compositor running
+    /// as the server's own (privileged) user. This is testable without
+    /// actually being root: `getpwnam_r("root")` succeeds as a plain lookup
+    /// for anyone, it's the *use* of uid 0 that's privileged, not the lookup.
+    #[test]
+    fn refuses_uid_zero() {
+        let err = resolve_target_user("root").unwrap_err().to_string();
+        assert!(err.contains("uid 0"), "expected a uid-0 refusal, got: {err}");
+    }
+
+    /// An unknown username must be rejected explicitly, not treated as "fall
+    /// back to something else". The username is deliberately implausible so
+    /// this doesn't flake on a system that happens to have such an account.
+    #[test]
+    fn refuses_unknown_username() {
+        let err = resolve_target_user("termland-test-nonexistent-user-8f3c1a")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such system user"), "expected a no-such-user error, got: {err}");
+    }
+
+    /// A username containing a NUL byte can't even be turned into a
+    /// C string for the syscall - must be rejected before any FFI call,
+    /// not panic or truncate silently.
+    #[test]
+    fn refuses_embedded_nul() {
+        assert!(resolve_target_user("bad\0user").is_err());
+    }
+}

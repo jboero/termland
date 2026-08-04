@@ -74,18 +74,25 @@ impl Compositor {
     /// Spawn a NEW detached compositor for `config` and attach to it. Returns
     /// the attachment plus the detached compositor's PID (record it in the
     /// session registry). The compositor survives this process.
-    pub fn create(config: CompositorConfig, log_path: &Path) -> Result<(Self, u32), CompositorError> {
+    ///
+    /// `run_as`: the PAM-authenticated username to isolate this session into
+    /// (session isolation - see `backend::detached_compositor_command`), or
+    /// `None` when the server was started without `--auth`, in which case
+    /// behavior is unchanged from before this feature: the compositor runs
+    /// as the server's own user. This must come from server-side auth state,
+    /// never from client-supplied session-create parameters.
+    pub fn create(config: CompositorConfig, log_path: &Path, run_as: Option<&str>) -> Result<(Self, u32), CompositorError> {
         let (pid, wayland_display, backend_name) = match &config.mode {
             SessionMode::Desktop => {
                 let shell = config.desktop_shell
                     .clone()
                     .unwrap_or_else(detect_desktop_shell);
                 tracing::info!("Desktop shell: {shell}");
-                let d = backend::labwc::launch_detached(config.width, config.height, &shell, log_path)?;
+                let d = backend::labwc::launch_detached(config.width, config.height, &shell, log_path, run_as)?;
                 (d.pid, d.wayland_display, "labwc")
             }
             SessionMode::App { command, args } => {
-                let d = backend::cage::launch_detached(config.width, config.height, command, args, log_path)?;
+                let d = backend::cage::launch_detached(config.width, config.height, command, args, log_path, run_as)?;
                 (d.pid, d.wayland_display, "cage")
             }
         };

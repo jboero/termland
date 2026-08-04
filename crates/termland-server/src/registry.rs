@@ -25,12 +25,22 @@ pub struct SessionRecord {
     pub height: u32,
     pub created_at_unix: u64,
     pub audio: bool,
+    /// The PAM-authenticated username that created this session (server-side
+    /// truth, from `--auth`), or `None` when the server isn't running with
+    /// `--auth` — in which case there is no identity concept at all and
+    /// ownership is not enforced (matches how `run_as: None` preserves
+    /// unisolated behavior at the OS level too). Used to restrict
+    /// `SessionList`/`SessionAttach`/`SessionClose` to the owning user once
+    /// auth is on, so one authenticated user cannot see, attach to, or close
+    /// another authenticated user's session just because they can guess or
+    /// enumerate its id.
+    pub owner: Option<String>,
 }
 
 impl SessionRecord {
     fn to_kv(&self) -> String {
         format!(
-            "session_id={}\ncompositor_pid={}\nwayland_display={}\nmode={}\nwidth={}\nheight={}\ncreated_at_unix={}\naudio={}\n",
+            "session_id={}\ncompositor_pid={}\nwayland_display={}\nmode={}\nwidth={}\nheight={}\ncreated_at_unix={}\naudio={}\nowner={}\n",
             self.session_id,
             self.compositor_pid,
             self.wayland_display,
@@ -39,6 +49,7 @@ impl SessionRecord {
             self.height,
             self.created_at_unix,
             self.audio,
+            self.owner.as_deref().unwrap_or(""),
         )
     }
 
@@ -51,6 +62,13 @@ impl SessionRecord {
         let mut height = None;
         let mut created_at_unix = None;
         let mut audio = false;
+        // Absent entirely on records written before this field existed -
+        // treated the same as an explicitly-empty value (see the `owner`
+        // field's doc comment: an ownerless record is visible/attachable by
+        // anyone once auth is on, which is correct here since such a record
+        // predates ownership tracking and can't actually belong to a
+        // different authenticated user under the new code).
+        let mut owner: Option<String> = None;
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k {
@@ -62,6 +80,7 @@ impl SessionRecord {
                 "height" => height = v.parse().ok(),
                 "created_at_unix" => created_at_unix = v.parse().ok(),
                 "audio" => audio = v == "true",
+                "owner" => owner = if v.is_empty() { None } else { Some(v.to_string()) },
                 _ => {}
             }
         }
@@ -74,6 +93,7 @@ impl SessionRecord {
             height: height?,
             created_at_unix: created_at_unix?,
             audio,
+            owner,
         })
     }
 }
