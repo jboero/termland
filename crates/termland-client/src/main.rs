@@ -1,6 +1,8 @@
 mod connection;
 mod display;
+mod manager;
 mod overlay;
+mod profile;
 mod tray;
 
 use anyhow::Result;
@@ -38,7 +40,7 @@ impl CodecArg {
 #[command(name = "termland-client", about = "Termland remote desktop client", version)]
 pub struct Args {
     /// Server address (host:port for TCP, user@host for SSH)
-    #[arg(required_unless_present = "completions")]
+    #[arg(required_unless_present_any = ["completions", "manager"])]
     pub server: Option<String>,
 
     /// Use SSH subsystem instead of direct TCP.
@@ -93,6 +95,12 @@ pub struct Args {
     /// icon; lists/ resumes/ closes sessions and starts new ones).
     #[arg(long)]
     pub tray: bool,
+
+    /// Open the desktop session manager window: saved multi-host connection
+    /// profiles plus each host's resumable-session list. Manages its own
+    /// profiles, so unlike --tray it takes no server address up front.
+    #[arg(long)]
+    pub manager: bool,
 
     /// For --mode desktop: startup command to run inside labwc.
     /// Examples: "konsole", "startplasma-wayland", "dbus-run-session sway".
@@ -176,6 +184,13 @@ fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // The manager owns its own multi-host profiles and takes no server
+    // argument up front, so it has to branch before the other one-shot modes
+    // below unconditionally require one.
+    if args.manager {
+        return manager::run();
+    }
 
     // One-shot session-management ops (and the tray) run without a session
     // window.

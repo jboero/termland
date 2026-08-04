@@ -137,6 +137,16 @@ impl ksni::Tray for TermlandTray {
         );
         items.push(
             StandardItem {
+                // Unlike spawn_client, this must not append a server address
+                // — the manager window manages its own multi-host profiles.
+                label: "Manage profiles…".into(),
+                activate: Box::new(|_: &mut Self| crate::manager::spawn_manager_window()),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
                 label: "Quit tray".into(),
                 activate: Box::new(|_| std::process::exit(0)),
                 ..Default::default()
