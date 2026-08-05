@@ -25,6 +25,7 @@ rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
 libc = { workspace = true }
 bytemuck = { workspace = true }
+bytes = { workspace = true }
 # aws-lc-rs to match the explicit provider tls.rs/quic.rs select (workspace's
 # `rustls` default features already bring aws-lc-rs in for this crate).
 quinn = { workspace = true, features = ["rustls-aws-lc-rs"] }

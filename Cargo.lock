@@ -4908,6 +4908,7 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "bytes",
  "clap",
  "clap_complete",
  "futures",

@@ -26,16 +26,22 @@ pub enum Transport {
     /// `SshHostKeyPolicy` for the host-key posture and the module-level
     /// followup note on key-based auth.
     Ssh { username: String, password: String },
-    /// Q1 of the QUIC transport plan (`docs/quic-transport.md`): the entire
-    /// protocol carried unmodified over a single bidirectional QUIC stream,
-    /// dialed with `quinn` instead of a plain/TLS `TcpStream`. Exists for the
-    /// same reason the design doc pulled QUIC forward to accompany the
-    /// mobile milestone rather than treating it as a desktop-only stretch
-    /// goal: connection migration and fast reconnect matter most on a phone
-    /// roaming between Wi-Fi and cellular. `accept_invalid_certs` mirrors
-    /// `Transport::Tls`'s field of the same name/meaning — QUIC always
-    /// requires TLS 1.3, so the same self-signed-cert-on-a-LAN tradeoff
-    /// applies.
+    /// The QUIC transport (`docs/quic-transport.md`), dialed with `quinn`
+    /// instead of a plain/TLS `TcpStream`. Control messages
+    /// (Hello/auth/`Session*`/input/clipboard) run over one bidirectional
+    /// stream exactly as they do over TCP/TLS/SSH; since Q2, video and audio
+    /// run on their own QUIC objects instead of sharing that stream — see
+    /// `session::run_session`'s QUIC reader tasks and
+    /// `crates/termland-server/src/quic.rs`'s module doc comment for the
+    /// full plane layout. Exists for the same reason the design doc pulled
+    /// QUIC forward to accompany the mobile milestone rather than treating
+    /// it as a desktop-only stretch goal: connection migration and fast
+    /// reconnect matter most on a phone roaming between Wi-Fi and cellular,
+    /// and Q2's split planes mean a lossy cellular link no longer stalls
+    /// input/control behind a slow video packet. `accept_invalid_certs`
+    /// mirrors `Transport::Tls`'s field of the same name/meaning — QUIC
+    /// always requires TLS 1.3, so the same self-signed-cert-on-a-LAN
+    /// tradeoff applies.
     Quic { accept_invalid_certs: bool },
 }
 
@@ -63,7 +69,7 @@ impl Transport {
         }
     }
 
-    pub async fn connect(&self, host: &str, port: u16) -> Result<Box<dyn Io>> {
+    pub async fn connect(&self, host: &str, port: u16) -> Result<Connected> {
         // QUIC is UDP-based, not a TCP socket wrapped in something else like
         // Tls/Ssh below are — it needs its own connection path entirely, so
         // it branches off before the shared `TcpStream::connect` the other
@@ -85,7 +91,7 @@ impl Transport {
         match self {
             Transport::Tcp => {
                 tracing::info!("Connected to {addr}");
-                Ok(Box::new(stream))
+                Ok(Connected { io: Box::new(stream), quic_connection: None })
             }
             Transport::Tls { accept_invalid_certs } => {
                 tracing::info!("Connected to {addr} (TLS)");
@@ -98,7 +104,7 @@ impl Transport {
                     .await
                     .map_err(|e| TermlandError::tls(format!("handshake failed: {e}")))?;
                 tracing::info!("TLS handshake complete");
-                Ok(Box::new(tls))
+                Ok(Connected { io: Box::new(tls), quic_connection: None })
             }
             Transport::Ssh { username, password } => {
                 tracing::info!("Connected to {addr}, starting SSH handshake");
@@ -158,7 +164,7 @@ impl Transport {
                 // readable/writable as long as the SSH session's background
                 // task keeps running, which is tied to `handle`'s lifetime
                 // (dropping it closes the connection). Bundle both together.
-                Ok(Box::new(SshIo { stream: channel.into_stream(), _handle: handle }))
+                Ok(Connected { io: Box::new(SshIo { stream: channel.into_stream(), _handle: handle }), quic_connection: None })
             }
             Transport::Quic { .. } => {
                 unreachable!("Transport::Quic returns early above, before the TCP connect")
@@ -167,11 +173,33 @@ impl Transport {
     }
 }
 
+/// What `Transport::connect` hands back: the control-plane byte stream every
+/// transport provides, plus (QUIC only) the extra `Connection` handle Q2
+/// needs for its split video/audio planes.
+pub(crate) struct Connected {
+    pub(crate) io: Box<dyn Io>,
+    /// `Some` only for `Transport::Quic` — every other transport carries
+    /// video/audio inline on `io` via the ordinary `Message` framing (Q2
+    /// only exists for QUIC), so this stays `None` for Tcp/Tls/Ssh.
+    ///
+    /// Deliberately just the raw `Connection`, not an already-`accept_uni()`'d
+    /// video stream: accepting it here, before this function even returns to
+    /// let `connect_and_handshake` send `Hello`, would block waiting for a
+    /// uni stream the server doesn't open until well after
+    /// Hello/auth/SessionCreate have already round-tripped over the control
+    /// bidi stream (see `crates/termland-server/src/quic.rs`'s `run_session`
+    /// comment for exactly when). `session::run_session` accepts it lazily,
+    /// in a spawned background task, once streaming actually starts.
+    pub(crate) quic_connection: Option<quinn::Connection>,
+}
+
 /// Dials a QUIC connection with `quinn`, completes the TLS 1.3 handshake,
-/// and opens the single bidirectional stream Q1's client contract requires
-/// (mirrors `crates/termland-server/src/quic.rs`'s `accept_bi()` on the
-/// server side — see that module's doc comment for the full Q1/Q2 rationale).
-async fn connect_quic(host: &str, port: u16, accept_invalid_certs: bool) -> Result<Box<dyn Io>> {
+/// and opens the control bidirectional stream (unchanged from Q1's
+/// contract — mirrors `crates/termland-server/src/quic.rs`'s `accept_bi()`
+/// on the server side). Does NOT accept the Q2 video uni stream or start
+/// reading datagrams here — see `Connected::quic_connection`'s doc comment
+/// for why that has to wait.
+async fn connect_quic(host: &str, port: u16, accept_invalid_certs: bool) -> Result<Connected> {
     let addr_str = format!("{host}:{port}");
     let addr = tokio::net::lookup_host(&addr_str)
         .await
@@ -194,18 +222,21 @@ async fn connect_quic(host: &str, port: u16, accept_invalid_certs: bool) -> Resu
         .map_err(|e| TermlandError::connect(format!("QUIC handshake with {addr_str} failed: {e}")))?;
     tracing::info!("Connected to {addr_str} (QUIC), handshake complete");
 
-    // Q1: exactly one bidi stream carries the whole session, opened
-    // immediately — the server is waiting on `accept_bi()` for it.
+    // The control bidi stream: opened immediately — the server is waiting
+    // on `accept_bi()` for it. Unchanged from Q1's contract.
     let (send, recv) = connection
         .open_bi()
         .await
         .map_err(|e| TermlandError::connect(format!("failed to open QUIC stream: {e}")))?;
 
-    Ok(Box::new(QuicIo {
-        io: tokio::io::join(recv, send),
-        _connection: connection,
-        _endpoint: endpoint,
-    }))
+    Ok(Connected {
+        io: Box::new(QuicIo {
+            io: tokio::io::join(recv, send),
+            _connection: connection.clone(),
+            _endpoint: endpoint,
+        }),
+        quic_connection: Some(connection),
+    })
 }
 
 /// Builds quinn's `ClientConfig` by reusing `tls_config` (the same

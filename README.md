@@ -207,7 +207,9 @@ The client RPM installs:
 
 - [x] Clipboard sync (plain text, bidirectional)
 - [x] Cursor shape sync (real cursor bitmap, not a placeholder)
-- [x] QUIC transport (Q1: drop-in single-stream; Q2 plane-splitting pending)
+- [x] QUIC transport (Q1: drop-in single-stream; Q2: video/audio split onto
+      their own stream/datagrams, HOL-free from control/input; Q3 —
+      datagram-fragmented video with FEC — not started)
 - [x] Native Android client (termland-mobile-core + Kotlin/Compose app;
       see [docs/mobile-clients.md](docs/mobile-clients.md))
 - [x] Embedded SSH transport (`russh`) for the mobile client

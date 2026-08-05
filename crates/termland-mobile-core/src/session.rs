@@ -14,6 +14,15 @@ use crate::types::{
     VideoPacket,
 };
 
+/// Q2 video/audio header layout — must match
+/// `crates/termland-server/src/quic.rs`'s `VIDEO_HEADER_LEN`/
+/// `AUDIO_HEADER_LEN` and their `*_header_bytes` encoders byte-for-byte.
+/// `[codec: u8][frame_type: u8][width: u16][height: u16][timestamp_us: u64][data_len: u32]`,
+/// little-endian = 1+1+2+2+8+4 = 18 bytes.
+const VIDEO_HEADER_LEN: usize = 18;
+/// `[sample_rate: u32][channels: u8]`, little-endian = 4+1 = 5 bytes.
+const AUDIO_HEADER_LEN: usize = 5;
+
 /// The framed protocol stream, whatever transport is underneath.
 pub(crate) type Conn = Framed<Box<dyn Io>, TermlandCodec>;
 
@@ -50,11 +59,20 @@ impl InputCommand {
 
 /// Open the transport and complete Hello/HelloAck + optional PAM auth. Shared by
 /// the streaming path and the one-shot control ops, exactly as on the desktop.
-pub(crate) async fn connect_and_handshake(profile: &ServerProfile) -> Result<Conn> {
-    let io = Transport::for_profile(profile)
+///
+/// Returns the QUIC `Connection` handle alongside the framed stream when the
+/// transport is `Transport::Quic` (`None` otherwise) — callers that only do
+/// one-shot control ops (`list_sessions`, `close_session`) ignore it; only
+/// `open_session`/`run_session` (the actual streaming path) need it, to
+/// later accept Q2's video uni stream and read audio datagrams.
+pub(crate) async fn connect_and_handshake(
+    profile: &ServerProfile,
+) -> Result<(Conn, Option<quinn::Connection>)> {
+    let connected = Transport::for_profile(profile)
         .connect(&profile.host, profile.port)
         .await?;
-    let mut framed = Framed::new(io, TermlandCodec);
+    let quic_connection = connected.quic_connection;
+    let mut framed = Framed::new(connected.io, TermlandCodec);
 
     framed
         .send(Message::Hello(Hello {
@@ -112,11 +130,11 @@ pub(crate) async fn connect_and_handshake(profile: &ServerProfile) -> Result<Con
         }
     }
 
-    Ok(framed)
+    Ok((framed, quic_connection))
 }
 
 pub(crate) async fn list_sessions(profile: &ServerProfile) -> Result<Vec<SessionSummary>> {
-    let mut framed = connect_and_handshake(profile).await?;
+    let (mut framed, _quic_connection) = connect_and_handshake(profile).await?;
     framed.send(Message::SessionList(SessionList {})).await?;
     match next_message(&mut framed).await? {
         Message::SessionListResult(r) => Ok(r
@@ -136,7 +154,7 @@ pub(crate) async fn list_sessions(profile: &ServerProfile) -> Result<Vec<Session
 }
 
 pub(crate) async fn close_session(profile: &ServerProfile, session_id: String) -> Result<()> {
-    let mut framed = connect_and_handshake(profile).await?;
+    let (mut framed, _quic_connection) = connect_and_handshake(profile).await?;
     framed
         .send(Message::SessionClose(SessionClose { session_id }))
         .await?;
@@ -153,8 +171,8 @@ pub(crate) async fn open_session(
     profile: &ServerProfile,
     attach_to: Option<String>,
     params: &SessionParams,
-) -> Result<(Conn, SessionReadyInfo)> {
-    let mut framed = connect_and_handshake(profile).await?;
+) -> Result<(Conn, Option<quinn::Connection>, SessionReadyInfo)> {
+    let (mut framed, quic_connection) = connect_and_handshake(profile).await?;
     let supported_codecs = params.advertised_codecs();
 
     match attach_to {
@@ -216,7 +234,7 @@ pub(crate) async fn open_session(
                 codec: codec.into(),
                 session_id: sr.session_id,
             };
-            Ok((framed, info))
+            Ok((framed, quic_connection, info))
         }
         other => Err(unexpected("SessionReady", &other)),
     }
@@ -225,8 +243,22 @@ pub(crate) async fn open_session(
 /// Pump the session: route server messages to the observer, forward queued
 /// input. Returns when the server ends the stream or the client detaches
 /// (`input_rx` closed by `disconnect()`).
+///
+/// `quic_connection` is `Some` only for `Transport::Quic` — see
+/// `Connected::quic_connection`'s doc comment for why it isn't accepted/read
+/// from until here rather than back in `connect_and_handshake`. When `Some`,
+/// this spawns two background tasks (`quic_video_reader`, `quic_audio_reader`)
+/// that own the video uni stream / datagram reads respectively and forward
+/// parsed packets over channels this loop's `select!` drains below - NOT
+/// inline `select!` branches directly on `accept_uni()`/`read_datagram()`,
+/// because a `select!` branch that loses the race gets its future dropped
+/// mid-poll, which would lose whatever partial header/frame bytes a video
+/// read was midway through and desync the stream framing. An mpsc channel's
+/// `recv()` has no such problem — dropping it never discards an item that
+/// was already sent.
 pub(crate) async fn run_session(
     mut framed: Conn,
+    quic_connection: Option<quinn::Connection>,
     ready: SessionReadyInfo,
     observer: Arc<dyn SessionObserver>,
     mut input_rx: mpsc::UnboundedReceiver<InputCommand>,
@@ -237,6 +269,20 @@ pub(crate) async fn run_session(
     let mut last_report = std::time::Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Q2 planes. These channels are created unconditionally but only ever
+    // fed when `quic_connection` is `Some` below; for every other transport
+    // their `Sender` halves just sit unused for the life of this function,
+    // so `video_rx.recv()`/`audio_rx.recv()` below pend forever without ever
+    // firing - the same "no-op branch" pattern the server side uses for its
+    // optional audio channel in `transport.rs`'s `run_session`.
+    let (video_tx, mut video_rx) = mpsc::channel::<VideoPacket>(4);
+    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(8);
+    if let Some(connection) = quic_connection {
+        let video_connection = connection.clone();
+        tokio::spawn(quic_video_reader(video_connection, video_tx));
+        tokio::spawn(quic_audio_reader(connection, audio_tx));
+    }
 
     let reason = loop {
         tokio::select! {
@@ -255,6 +301,23 @@ pub(crate) async fn run_session(
                     // Sender dropped == disconnect(): detach without telling the
                     // server anything, which leaves the session resumable.
                     None => break "detached".to_string(),
+                }
+            }
+
+            // Q2 video plane (QUIC only - see this function's doc comment).
+            // No-op branch (never fires) on every other transport.
+            pkt = video_rx.recv() => {
+                if let Some(pkt) = pkt {
+                    bytes_since_report += pkt.data.len() as u64;
+                    observer.on_video_packet(pkt);
+                }
+            }
+
+            // Q2 audio plane (QUIC only). No-op branch on every other transport.
+            chunk = audio_rx.recv() => {
+                if let Some(data) = chunk {
+                    bytes_since_report += data.len() as u64;
+                    observer.on_audio_packet(data);
                 }
             }
 
@@ -324,6 +387,141 @@ pub(crate) async fn run_session(
     observer.on_disconnected(reason);
 }
 
+/// Q2's video plane reader. First `accept_uni()`s the server-opened video
+/// stream (deferred to here rather than `Transport::connect` - see
+/// `Connected::quic_connection`'s doc comment), then reads one frame after
+/// another: an 18-byte fixed header, then exactly `data_len` bytes of
+/// encoded frame data - see `crates/termland-server/src/quic.rs`'s module
+/// doc comment for the full header layout and why it's fixed-binary rather
+/// than the CBOR `Message` envelope.
+///
+/// Ends the task (dropping `tx`, which `run_session`'s `video_rx.recv()`
+/// then reads as "no more packets", a silent no-op) on any read/parse error
+/// or clean stream close. A broken video plane must not bring down the
+/// control-plane connection - that loss of head-of-line independence is
+/// exactly what Q2 exists to avoid.
+async fn quic_video_reader(connection: quinn::Connection, tx: mpsc::Sender<VideoPacket>) {
+    let mut video = match connection.accept_uni().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("QUIC video stream never opened: {e}");
+            return;
+        }
+    };
+
+    // Defensive cap on `data_len`: a corrupt/malicious header must not turn
+    // into an unbounded allocation. No real encoded frame at any sane
+    // resolution approaches this; it exists purely as a backstop.
+    const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
+
+    loop {
+        let mut header = [0u8; VIDEO_HEADER_LEN];
+        if let Err(e) = video.read_exact(&mut header).await {
+            tracing::info!("QUIC video stream ended: {e}");
+            return;
+        }
+
+        let Some((codec, keyframe, width, height, timestamp_us, data_len)) = parse_video_header(&header) else {
+            tracing::warn!("QUIC video stream: unknown codec tag {}, ending read loop", header[0]);
+            return;
+        };
+
+        if data_len > MAX_FRAME_BYTES {
+            tracing::warn!("QUIC video stream: implausible frame size {data_len} bytes, ending read loop");
+            return;
+        }
+
+        let mut data = vec![0u8; data_len as usize];
+        if let Err(e) = video.read_exact(&mut data).await {
+            tracing::info!("QUIC video stream ended mid-frame: {e}");
+            return;
+        }
+
+        let packet = VideoPacket {
+            data,
+            timestamp_us,
+            keyframe,
+            codec: MobileCodec::from(codec),
+            width: width as u32,
+            height: height as u32,
+        };
+        if tx.send(packet).await.is_err() {
+            return; // run_session exited; nothing left to feed.
+        }
+    }
+}
+
+/// Parse the 18-byte Q2 video header into its fields (codec, keyframe,
+/// width, height, timestamp_us, data_len). `None` for an unrecognized codec
+/// tag - see `decode_video_codec_tag`. Pulled out of `quic_video_reader` as
+/// a pure function so the byte layout can be unit-tested without a real
+/// QUIC connection.
+fn parse_video_header(header: &[u8; VIDEO_HEADER_LEN]) -> Option<(VideoCodec, bool, u16, u16, u64, u32)> {
+    let codec = decode_video_codec_tag(header[0])?;
+    let keyframe = header[1] == 1;
+    let width = u16::from_le_bytes([header[2], header[3]]);
+    let height = u16::from_le_bytes([header[4], header[5]]);
+    let timestamp_us = u64::from_le_bytes(header[6..14].try_into().unwrap_or_default());
+    let data_len = u32::from_le_bytes(header[14..18].try_into().unwrap_or_default());
+    Some((codec, keyframe, width, height, timestamp_us, data_len))
+}
+
+/// Matches `crates/termland-server/src/quic.rs`'s `codec_tag` exactly (and,
+/// transitively, `termland_protocol::VideoCodec::all_preferred()`'s
+/// declared preference order).
+fn decode_video_codec_tag(tag: u8) -> Option<VideoCodec> {
+    match tag {
+        0 => Some(VideoCodec::Av1),
+        1 => Some(VideoCodec::Vp9),
+        2 => Some(VideoCodec::Vp8),
+        3 => Some(VideoCodec::H265),
+        4 => Some(VideoCodec::H264),
+        _ => None,
+    }
+}
+
+/// Q2's audio plane reader. `connection.read_datagram()` yields one complete
+/// QUIC datagram per call - datagrams are already message-delimited (never
+/// partial), so unlike the video stream there is no length-prefixed loop
+/// here beyond stripping the fixed 5-byte header. The Opus payload is
+/// forwarded as-is: this core never decodes audio (see the module doc
+/// comment), so `sample_rate`/`channels` in the header are read but not
+/// currently needed downstream - the platform decoder is configured once,
+/// up front, from the session's fixed Opus format.
+async fn quic_audio_reader(connection: quinn::Connection, tx: mpsc::Sender<Vec<u8>>) {
+    loop {
+        let datagram = match connection.read_datagram().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::info!("QUIC audio datagram stream ended: {e}");
+                return;
+            }
+        };
+        let Some((_sample_rate, _channels, payload)) = parse_audio_datagram(&datagram) else {
+            tracing::warn!("QUIC audio datagram too short ({} bytes), dropping", datagram.len());
+            continue;
+        };
+        if tx.send(payload.to_vec()).await.is_err() {
+            return; // run_session exited; nothing left to feed.
+        }
+    }
+}
+
+/// Split one Q2 audio datagram into its 5-byte header fields
+/// (`sample_rate`, `channels`) and the remaining Opus payload. `None` if the
+/// datagram is shorter than the fixed header - malformed/truncated, not a
+/// framing case this wire format can otherwise produce (QUIC datagrams are
+/// never partial). Pulled out of `quic_audio_reader` as a pure function so
+/// the byte layout can be unit-tested without a real QUIC connection.
+fn parse_audio_datagram(datagram: &[u8]) -> Option<(u32, u8, &[u8])> {
+    if datagram.len() < AUDIO_HEADER_LEN {
+        return None;
+    }
+    let sample_rate = u32::from_le_bytes(datagram[0..4].try_into().unwrap_or_default());
+    let channels = datagram[4];
+    Some((sample_rate, channels, &datagram[AUDIO_HEADER_LEN..]))
+}
+
 async fn next_message(framed: &mut Conn) -> Result<Message> {
     match framed.next().await {
         Some(Ok(msg)) => Ok(msg),
@@ -334,4 +532,112 @@ async fn next_message(framed: &mut Conn) -> Result<Message> {
 
 fn unexpected(expected: &str, got: &Message) -> TermlandError {
     TermlandError::protocol(format!("expected {expected}, got {:?}", got.message_id()))
+}
+
+#[cfg(test)]
+mod quic_framing_tests {
+    use super::*;
+
+    /// Builds a Q2 video header byte-for-byte the way
+    /// `crates/termland-server/src/quic.rs`'s `video_header_bytes` does, so
+    /// this test exercises the client's decoder against an independently
+    /// constructed fixture rather than its own encoder (there is no
+    /// encoder on the client - it never originates video).
+    fn build_video_header(codec_tag: u8, frame_type_tag: u8, width: u16, height: u16, timestamp_us: u64, data_len: u32) -> [u8; VIDEO_HEADER_LEN] {
+        let mut buf = [0u8; VIDEO_HEADER_LEN];
+        buf[0] = codec_tag;
+        buf[1] = frame_type_tag;
+        buf[2..4].copy_from_slice(&width.to_le_bytes());
+        buf[4..6].copy_from_slice(&height.to_le_bytes());
+        buf[6..14].copy_from_slice(&timestamp_us.to_le_bytes());
+        buf[14..18].copy_from_slice(&data_len.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn video_header_decodes_all_codec_and_frame_type_tags() {
+        let cases = [
+            (0u8, VideoCodec::Av1),
+            (1, VideoCodec::Vp9),
+            (2, VideoCodec::Vp8),
+            (3, VideoCodec::H265),
+            (4, VideoCodec::H264),
+        ];
+        for (tag, expected_codec) in cases {
+            for (ft_tag, expected_keyframe) in [(0u8, false), (1u8, true)] {
+                let header = build_video_header(tag, ft_tag, 1920, 1080, 123_456_789_012, 65536);
+                let (codec, keyframe, width, height, timestamp_us, data_len) =
+                    parse_video_header(&header).unwrap_or_else(|| panic!("expected header to decode for codec tag {tag}"));
+                assert_eq!(codec, expected_codec);
+                assert_eq!(keyframe, expected_keyframe);
+                assert_eq!(width, 1920);
+                assert_eq!(height, 1080);
+                assert_eq!(timestamp_us, 123_456_789_012);
+                assert_eq!(data_len, 65536);
+            }
+        }
+    }
+
+    #[test]
+    fn video_header_rejects_unknown_codec_tag() {
+        let header = build_video_header(255, 0, 640, 480, 0, 0);
+        assert!(parse_video_header(&header).is_none());
+    }
+
+    #[test]
+    fn video_header_field_offsets_match_server_layout() {
+        // Same exact-byte-offset pin as the server's
+        // `video_header_byte_offsets_are_exact` test - both sides must agree
+        // on where every field lives, not just round-trip through each
+        // side's own (mirror-image) implementation.
+        let header = build_video_header(4, 1, 0x0102, 0x0304, 0x0102030405060708, 0xAABBCCDD);
+        assert_eq!(header[0], 4);
+        assert_eq!(header[1], 1);
+        assert_eq!(&header[2..4], &0x0102u16.to_le_bytes());
+        assert_eq!(&header[4..6], &0x0304u16.to_le_bytes());
+        assert_eq!(&header[6..14], &0x0102030405060708u64.to_le_bytes());
+        assert_eq!(&header[14..18], &0xAABBCCDDu32.to_le_bytes());
+
+        let (codec, keyframe, width, height, timestamp_us, data_len) = parse_video_header(&header).unwrap();
+        assert_eq!(codec, VideoCodec::H264);
+        assert!(keyframe);
+        assert_eq!(width, 0x0102);
+        assert_eq!(height, 0x0304);
+        assert_eq!(timestamp_us, 0x0102030405060708);
+        assert_eq!(data_len, 0xAABBCCDD);
+    }
+
+    #[test]
+    fn audio_datagram_round_trips_header_and_payload() {
+        let mut datagram = Vec::new();
+        datagram.extend_from_slice(&48000u32.to_le_bytes());
+        datagram.push(2u8);
+        datagram.extend_from_slice(b"opus-payload-bytes");
+
+        let (sample_rate, channels, payload) =
+            parse_audio_datagram(&datagram).expect("datagram at least AUDIO_HEADER_LEN bytes");
+        assert_eq!(sample_rate, 48000);
+        assert_eq!(channels, 2);
+        assert_eq!(payload, b"opus-payload-bytes");
+    }
+
+    #[test]
+    fn audio_datagram_shorter_than_header_is_rejected() {
+        let short = vec![0u8; AUDIO_HEADER_LEN - 1];
+        assert!(parse_audio_datagram(&short).is_none());
+    }
+
+    #[test]
+    fn audio_datagram_with_empty_payload_is_valid() {
+        // A degenerate but well-formed datagram: header only, no Opus bytes.
+        // Not something the server would ever send, but the parser must not
+        // panic on it.
+        let mut datagram = Vec::new();
+        datagram.extend_from_slice(&16000u32.to_le_bytes());
+        datagram.push(1u8);
+        let (sample_rate, channels, payload) = parse_audio_datagram(&datagram).unwrap();
+        assert_eq!(sample_rate, 16000);
+        assert_eq!(channels, 1);
+        assert!(payload.is_empty());
+    }
 }

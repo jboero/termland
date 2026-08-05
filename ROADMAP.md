@@ -43,8 +43,8 @@ happen before the project is suitable for outside use.
   observability CLI (`--list-sessions`/`--close-session`)
 - ✅ Desktop session manager (`--manager`, egui): saved multi-host profiles,
   live per-host session list, resume/new/close
-- ✅ Embedded SSH (`russh`) and QUIC (Q1) transports, on both the desktop
-  server and the Android core
+- ✅ Embedded SSH (`russh`) and QUIC (Q1 + Q2: split video/audio planes)
+  transports, on both the desktop server and the Android core
 - ✅ Native Android client (M1 core + M2 app) — see "Mobile clients" below
 - ✅ Session isolation (setuid into the PAM-authenticated user), clipboard
   file transfer, seamless reconnect, Android audio playback
@@ -289,7 +289,7 @@ actually built.
   real assembled APK with both native-lib ABIs inspected), not by an actual
   tablet talking to an actual server.
 
-### QUIC transport — Q1 SHIPPED, Q2 not started
+### QUIC transport — Q1 + Q2 SHIPPED
 
 Full design in [docs/quic-transport.md](docs/quic-transport.md). QUIC gives
 **connection migration** (survive Wi-Fi↔cellular), **0-RTT resume**, and
@@ -304,8 +304,26 @@ and the mobile core (`Transport::Quic`).
   real integration test (spawns the actual server binary, opens a real QUIC
   connection, sends `Hello`, gets back a real `HelloAck`) plus a second,
   independent manual client against a running `--quic` server.
-- Not started: **Q2 — split the planes** onto their own streams/datagrams for
-  HOL-free A/V.
+- ✅ **Q2 — split planes.** Video moved to its own reliable server-opened QUIC
+  uni stream (fixed 18-byte binary header, not CBOR — this stream only ever
+  carries one shape of message); audio moved to QUIC datagrams (one Opus
+  chunk per datagram, no fragmentation needed at real-world sizes). Control
+  (including input) stays on the one bidi stream, byte-for-byte unchanged.
+  `termland-mobile-core` is the only QUIC client that exists, so Q2 replaces
+  Q1's single-stream contract outright rather than negotiating between the
+  two. `handle_session`/`run_session` gained one new `Option<quinn::Connection>`
+  parameter (`None` for every non-QUIC transport — zero behavior change
+  there) rather than a bigger transport-abstraction rewrite. Verified live,
+  not just unit-tested: a real end-to-end integration test gets a genuine
+  AV1-encoded keyframe off the video stream and a genuine Opus datagram (fed
+  from real non-silent audio via `pacat`) off the audio plane, both parsed
+  back and checked against what the server actually produced. The harder
+  remaining piece — fragmenting individual frames across datagrams with
+  FEC/pacing so a lost packet costs part of a frame instead of stalling —
+  is now called out as its own **Q3** in
+  [docs/quic-transport.md](docs/quic-transport.md), not started, and only
+  worth doing once Q2's simpler reliable-stream video is shown to actually
+  stall under real cellular loss.
 - Along the way, fixed a real pre-existing bug: `--tls` could panic at
   runtime (`Could not automatically determine the process-level
   CryptoProvider`) once a full workspace build unified two crates'

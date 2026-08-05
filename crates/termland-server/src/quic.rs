@@ -1,34 +1,66 @@
-//! QUIC transport — Q1 only.
+//! QUIC transport — Q2 (split video/audio planes).
 //!
-//! Per `docs/quic-transport.md`'s phasing, Q1 treats QUIC purely as a
-//! drop-in *byte* transport: the entire existing protocol (control messages,
-//! video, audio, input, clipboard, cursor — everything `handle_session`
-//! already does) runs unmodified over a single bidirectional QUIC stream per
-//! connection. That's the whole point of the change: `handle_session` is
-//! already generic over `T: AsyncRead + AsyncWrite + Unpin`, so a QUIC
-//! stream just needs to satisfy that bound and nothing downstream has to
-//! know QUIC exists. Splitting video/audio onto their own
-//! streams/datagrams for head-of-line-blocking-free delivery is Q2 — out of
-//! scope here, and deliberately not attempted.
+//! Per `docs/quic-transport.md`'s phasing, Q1 treated QUIC purely as a
+//! drop-in *byte* transport: the entire protocol (control messages, video,
+//! audio, input, clipboard, cursor) ran unmodified over a single
+//! bidirectional QUIC stream. Q2 — implemented here — moves video and audio
+//! off that shared stream onto their own QUIC objects, so a lost/slow video
+//! packet no longer head-of-line-blocks control/input messages behind it
+//! (which is the whole reason QUIC was worth adopting over TCP in the first
+//! place; Q1 alone didn't actually buy HOL-blocking freedom *within* one
+//! connection, only *across* connections).
 //!
-//! What Q1 buys anyway, for free, just from swapping the byte transport:
+//! There is exactly one QUIC client in existence (`termland-mobile-core`) and
+//! no third party depends on Q1's single-stream wire contract, so Q2
+//! *replaces* it outright rather than versioning or negotiating between the
+//! two — `--quic` now means Q2, full stop.
+//!
+//! ## Plane layout
+//!
+//! - **Control** (Hello/auth/`Session*`/resize/cursor mode/clipboard/input —
+//!   everything except video and audio): unchanged. One client-opened bidi
+//!   stream, the same CBOR `TermlandCodec` framing `handle_session` already
+//!   speaks over TCP/TLS/SSH. This is what lets Q2 reuse `handle_session`'s
+//!   entire control/session lifecycle unmodified.
+//! - **Video**: one server-opened **uni** stream, reliable (ordinary QUIC
+//!   stream delivery — not datagrams). Framed with a lightweight *fixed*
+//!   binary header (see `video_header_bytes`) rather than a CBOR `Message`,
+//!   because this stream only ever carries one shape of message — one frame
+//!   after another — so there's nothing for a tagged/flexible envelope to
+//!   buy here, only per-frame overhead at 30fps. Deliberately reliable, not
+//!   datagram-fragmented: splitting frames across datagrams so a lost
+//!   fragment only costs one frame (Moonlight-style FEC/pacing) is real added
+//!   complexity around loss-tolerant keyframe/interframe reconstruction that
+//!   `docs/quic-transport.md` explicitly earmarks as a later refinement, not
+//!   this change.
+//! - **Audio**: QUIC **datagrams**, one complete Opus chunk per datagram.
+//!   Safe without fragmentation logic: a 20ms@48kHz-stereo Opus frame is
+//!   roughly 100-200 bytes, comfortably under any real-world QUIC datagram
+//!   MTU (~1200 bytes after QUIC/UDP/IP overhead) — but the send path still
+//!   checks the connection's actual negotiated `max_datagram_size` and
+//!   drops+logs rather than risk truncating/corrupting a chunk that
+//!   somehow doesn't fit, or panicking on a peer that disabled datagrams.
+//!
+//! What plain QUIC (Q1's contribution) still buys underneath all of this:
 //! connection migration (the QUIC connection ID survives the client's IP
 //! changing, e.g. Wi-Fi to cellular), faster reconnect than a fresh TCP+TLS
 //! handshake, and no head-of-line blocking against *other* QUIC connections
 //! sharing the same UDP socket.
 //!
 //! Client contract: immediately after the QUIC/TLS handshake completes, the
-//! client opens exactly one bidirectional stream and speaks the same CBOR
-//! `TermlandCodec` framing over it that it would over a fresh TCP
-//! connection. This listener calls `accept_bi()` exactly once per
-//! connection; if a client opens additional streams they are simply never
-//! read (there is nothing for them to carry yet — that's reserved for Q2).
+//! client opens the control bidi stream (`open_bi()`) exactly as in Q1, then
+//! separately `accept_uni()`s the server-opened video stream (opened lazily
+//! by `run_session` — see its doc comment for why not eagerly here) and
+//! starts reading datagrams for audio. This listener calls `accept_bi()`
+//! exactly once per connection for the control stream; the video uni stream
+//! is opened from the server side, not accepted from the client.
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use termland_protocol::{FrameType, VideoCodec};
 
 /// ALPN identifier for the termland QUIC transport. QUIC requires ALPN — it's
 /// how the handshake picks a protocol and defends against version-downgrade
@@ -99,15 +131,25 @@ pub async fn run_quic_listener(
     Ok(())
 }
 
-/// Complete the QUIC handshake, open the one Q1 bidi stream, and hand it to
-/// the transport-agnostic `handle_session` unchanged.
+/// Complete the QUIC handshake, open the control bidi stream, and hand both
+/// it and the raw `Connection` to the transport-agnostic `handle_session`.
+///
+/// Deliberately does NOT open the video uni stream here: `handle_session`
+/// doesn't yet know whether this connection will even reach a live session
+/// (Hello/auth/SessionCreate all still have to happen first, and any of them
+/// can fail or the client can just be listing/closing sessions and never
+/// stream at all). `run_session` opens the video stream itself, lazily,
+/// right when the encoder has produced its first frame — see that call
+/// site's doc comment. This function's job is just to get the `Connection`
+/// handle down to where that decision gets made.
 async fn handle_quic_connection(incoming: quinn::Incoming, require_auth: bool) -> Result<()> {
     let connection = incoming.await.context("QUIC handshake failed")?;
     let remote = connection.remote_address();
     tracing::info!("QUIC handshake complete for {remote}");
 
-    // Q1 contract: the client opens exactly one bidi stream right after the
-    // handshake, and that stream carries the entire session.
+    // Client contract: the client opens exactly one bidi stream right after
+    // the handshake, and that stream carries the control plane for the
+    // entire session (unchanged from Q1).
     let (send, recv) = connection
         .accept_bi()
         .await
@@ -117,7 +159,149 @@ async fn handle_quic_connection(incoming: quinn::Incoming, require_auth: bool) -
     // them back into one AsyncRead+AsyncWrite the same way `run_subsystem`
     // already combines stdin/stdout for the SSH-subsystem entry point.
     let io = tokio::io::join(recv, send);
-    crate::transport::handle_session(io, require_auth).await
+    crate::transport::handle_session(io, require_auth, Some(connection)).await
+}
+
+/// The Q2 video/audio planes for one QUIC session, assembled by
+/// `run_session` once it actually needs them (see that call site).
+pub(crate) struct QuicPlanes {
+    /// Server-opened uni stream carrying one Q2-framed video frame after
+    /// another (`video_header_bytes` + raw encoded bytes).
+    pub(crate) video: quinn::SendStream,
+    /// Kept for `Connection::send_datagram` (audio) — sending a datagram
+    /// needs only the connection, not a stream object.
+    pub(crate) connection: quinn::Connection,
+}
+
+/// Fixed binary header prefixing every frame on the Q2 video uni stream.
+/// All multi-byte fields little-endian:
+/// `[codec: u8][frame_type: u8][width: u16][height: u16][timestamp_us: u64][data_len: u32]`
+/// = 1+1+2+2+8+4 = 18 bytes. Followed immediately by `data_len` bytes of the
+/// encoded frame — standard length-prefixed framing, nothing fancier.
+pub(crate) const VIDEO_HEADER_LEN: usize = 18;
+
+/// Fixed binary header prefixing the Opus payload in every Q2 audio
+/// datagram: `[sample_rate: u32][channels: u8]`, little-endian = 5 bytes.
+/// No length field: a QUIC datagram is already message-delimited (one
+/// `send_datagram()`/`read_datagram()` call is exactly one complete
+/// datagram, never partial) — everything after these 5 bytes IS the
+/// payload.
+pub(crate) const AUDIO_HEADER_LEN: usize = 5;
+
+/// Encode one video frame's 18-byte Q2 header. Must match
+/// `termland-mobile-core`'s client-side decoder byte-for-byte — see this
+/// module's tests for the exact layout.
+pub(crate) fn video_header_bytes(
+    codec: VideoCodec,
+    frame_type: FrameType,
+    width: u16,
+    height: u16,
+    timestamp_us: u64,
+    data_len: u32,
+) -> [u8; VIDEO_HEADER_LEN] {
+    let mut buf = [0u8; VIDEO_HEADER_LEN];
+    buf[0] = codec_tag(codec);
+    buf[1] = frame_type_tag(frame_type);
+    buf[2..4].copy_from_slice(&width.to_le_bytes());
+    buf[4..6].copy_from_slice(&height.to_le_bytes());
+    buf[6..14].copy_from_slice(&timestamp_us.to_le_bytes());
+    buf[14..18].copy_from_slice(&data_len.to_le_bytes());
+    buf
+}
+
+/// Encode one audio datagram's 5-byte Q2 header.
+pub(crate) fn audio_header_bytes(sample_rate: u32, channels: u8) -> [u8; AUDIO_HEADER_LEN] {
+    let mut buf = [0u8; AUDIO_HEADER_LEN];
+    buf[0..4].copy_from_slice(&sample_rate.to_le_bytes());
+    buf[4] = channels;
+    buf
+}
+
+/// Matches `termland_protocol::VideoCodec::all_preferred()`'s declared
+/// preference order exactly (Av1 best/most-open first) — this is a fixed
+/// wire tag, not derived from the enum's declaration order, so it can't
+/// silently drift if `VideoCodec`'s variants are ever reordered.
+fn codec_tag(codec: VideoCodec) -> u8 {
+    match codec {
+        VideoCodec::Av1 => 0,
+        VideoCodec::Vp9 => 1,
+        VideoCodec::Vp8 => 2,
+        VideoCodec::H265 => 3,
+        VideoCodec::H264 => 4,
+    }
+}
+
+fn frame_type_tag(frame_type: FrameType) -> u8 {
+    match frame_type {
+        FrameType::Inter => 0,
+        FrameType::Keyframe => 1,
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    /// Mirrors the client-side decoder this header must match: unpack the 18
+    /// bytes back into fields the same way `termland-mobile-core`'s
+    /// `quic_video_reader` does, and check they round-trip. Kept local to
+    /// this test (not exposed as production code) since the server itself
+    /// never needs to decode a header it always originates.
+    fn decode_video_header(buf: &[u8; VIDEO_HEADER_LEN]) -> (u8, u8, u16, u16, u64, u32) {
+        let codec = buf[0];
+        let frame_type = buf[1];
+        let width = u16::from_le_bytes([buf[2], buf[3]]);
+        let height = u16::from_le_bytes([buf[4], buf[5]]);
+        let timestamp_us = u64::from_le_bytes(buf[6..14].try_into().unwrap());
+        let data_len = u32::from_le_bytes(buf[14..18].try_into().unwrap());
+        (codec, frame_type, width, height, timestamp_us, data_len)
+    }
+
+    #[test]
+    fn video_header_round_trips_all_codecs_and_frame_types() {
+        for (codec, tag) in [
+            (VideoCodec::Av1, 0u8),
+            (VideoCodec::Vp9, 1),
+            (VideoCodec::Vp8, 2),
+            (VideoCodec::H265, 3),
+            (VideoCodec::H264, 4),
+        ] {
+            for (frame_type, ft_tag) in [(FrameType::Inter, 0u8), (FrameType::Keyframe, 1u8)] {
+                let header = video_header_bytes(codec, frame_type, 1920, 1080, 123_456_789_012, 65536);
+                assert_eq!(header.len(), VIDEO_HEADER_LEN);
+                let (c, ft, w, h, ts, len) = decode_video_header(&header);
+                assert_eq!(c, tag, "codec tag for {codec:?}");
+                assert_eq!(ft, ft_tag, "frame_type tag for {frame_type:?}");
+                assert_eq!(w, 1920);
+                assert_eq!(h, 1080);
+                assert_eq!(ts, 123_456_789_012);
+                assert_eq!(len, 65536);
+            }
+        }
+    }
+
+    #[test]
+    fn video_header_byte_offsets_are_exact() {
+        // Pin the exact byte layout, not just round-trip-through-our-own-decoder:
+        // a future refactor of `video_header_bytes` that still round-trips
+        // through a matching decode function could still silently break wire
+        // compatibility with the client if both sides drifted together.
+        let header = video_header_bytes(VideoCodec::H264, FrameType::Keyframe, 0x0102, 0x0304, 0x0102030405060708, 0xAABBCCDD);
+        assert_eq!(header[0], 4); // H264 tag
+        assert_eq!(header[1], 1); // Keyframe tag
+        assert_eq!(&header[2..4], &0x0102u16.to_le_bytes());
+        assert_eq!(&header[4..6], &0x0304u16.to_le_bytes());
+        assert_eq!(&header[6..14], &0x0102030405060708u64.to_le_bytes());
+        assert_eq!(&header[14..18], &0xAABBCCDDu32.to_le_bytes());
+    }
+
+    #[test]
+    fn audio_header_layout_is_exact() {
+        let header = audio_header_bytes(48000, 2);
+        assert_eq!(header.len(), AUDIO_HEADER_LEN);
+        assert_eq!(&header[0..4], &48000u32.to_le_bytes());
+        assert_eq!(header[4], 2);
+    }
 }
 
 /// Build quinn's `ServerConfig` around an rustls `ServerConfig` sharing cert

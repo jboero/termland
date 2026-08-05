@@ -252,7 +252,8 @@ impl TermlandClient {
         self.disconnect();
 
         let runtime = self.runtime()?;
-        let (framed, ready) = runtime.block_on(session::open_session(&profile, attach_to, &params))?;
+        let (framed, quic_connection, ready) =
+            runtime.block_on(session::open_session(&profile, attach_to, &params))?;
 
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let connected = Arc::new(AtomicBool::new(true));
@@ -264,6 +265,7 @@ impl TermlandClient {
         let loop_connected = connected.clone();
         runtime.spawn(session::run_session(
             framed,
+            quic_connection,
             ready,
             observer,
             input_rx,
