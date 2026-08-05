@@ -46,6 +46,8 @@ happen before the project is suitable for outside use.
 - ✅ Embedded SSH (`russh`) and QUIC (Q1) transports, on both the desktop
   server and the Android core
 - ✅ Native Android client (M1 core + M2 app) — see "Mobile clients" below
+- ✅ Session isolation (setuid into the PAM-authenticated user), clipboard
+  file transfer, seamless reconnect, Android audio playback
 
 ## v0.2 — SHIPPED (v0.3.1)
 
@@ -67,8 +69,22 @@ All v0.2 blockers have been resolved:
 
 ### Remaining v0.2 items (deferred)
 
-- Session isolation: `setuid` into authenticated user after PAM auth
-  (currently sessions run as server user)
+- ✅ **Session isolation**: `setuid` into the PAM-authenticated user after
+  auth, instead of every session running as the server's own user (root).
+  `initgroups`→`setgid`→`setuid` in a `pre_exec` closure after resolving the
+  target user via thread-safe `getpwnam_r`; fails closed on an unknown
+  username or a resolved uid of 0. Also closes a gap an adversarial review
+  found before this was accepted: OS-level uid separation alone didn't stop
+  one authenticated user from listing/attaching to/closing a *different*
+  authenticated user's session — `SessionRecord` now tracks an `owner` and
+  `SessionList`/`SessionAttach`/`SessionClose` enforce it. Integrating this
+  also surfaced (and fixed) a real regression: several already-shipped
+  Wayland-connecting code paths (clipboard sync, cursor-shape sync, and —
+  most seriously — keyboard/mouse input injection) resolved the compositor's
+  socket via this *process's own* `XDG_RUNTIME_DIR`, which silently breaks
+  once an isolated session's compositor runs under a different uid's
+  `/run/user/<uid>`. Fixed by threading the compositor's actual resolved
+  runtime dir end to end instead of assuming it.
 - ✅ ~~GUI client rewrite: Qt6 native menubar, session manager with saved
   profiles, connection dialog~~ — shipped as `--manager` (egui, not Qt6; see
   v0.5 section C below for why).
@@ -261,9 +277,12 @@ actually built.
   real libxkbcommon, not just "it compiles."
 - ✅ **v0.5 persistence UX**: resumable-session list is the app's home screen,
   per the "mobile links drop constantly" rationale this was built for.
-- Android audio playback (AudioTrack) is a documented no-op stub — the core
-  already delivers `onAudioPacket`, only the Kotlin-side player is
-  unimplemented. iOS (M3) has not been started.
+- ✅ **Android audio playback** — async MediaCodec (`audio/opus`) → AudioTrack,
+  the audio-side twin of the video decoder's shape. The fiddly part: MediaCodec
+  expects Ogg/WebM-Opus container CSD, but the stream is headerless raw Opus,
+  so the mandatory 19-byte OpusHead (RFC 7845 §5.1) is synthesized by hand from
+  the two fixed, never-negotiated stream parameters (48kHz stereo).
+  iOS (M3) has not been started.
 - Not runtime-verified: no device or emulator was available while building
   this. Everything above is confirmed at the build/compile/unit-test level
   (including two independent live QUIC handshake proofs — see below — and a
@@ -306,14 +325,28 @@ and the mobile core (`Transport::Quic`).
 - ✅ **Foreground session observability** — `termland-server --list-sessions`
   / `--close-session <id>` read/signal the v0.5 registry directly (no
   network round-trip, no running server process required).
-- File transfer (clipboard paste of files, or drag-and-drop)
+- ✅ **File transfer** — scoped to clipboard paste of files (copy files on one
+  side, real files land on the other's clipboard); full drag-and-drop between
+  windows remains open, a separate and much bigger Wayland DnD integration.
+  New `FileTransferData`/`FileTransferSend` messages, capped at 12 MiB total
+  and sent unchunked — deliberately "a few documents or images," not a
+  general transfer protocol. Filenames arriving over the wire are sanitized
+  to a bare basename (reject, not strip), closing the path-traversal surface
+  a crafted `../../etc/passwd` entry would otherwise open.
+- ✅ **Seamless reconnect** — an unexpected connection loss (vs. a real
+  server-sent `SessionEnd`) now auto-retries with capped exponential backoff
+  (1s→2s→4s→8s→16s→30s, indefinitely; `--no-reconnect` opts out), reattaching
+  to the *same* session rather than creating a new one, with a "Reconnecting…
+  (attempt N)" banner over the frozen last frame instead of exiting. Verified
+  live: killed a running server mid-session, watched the client retry and
+  never exit, restarted the server, confirmed reattachment to the identical
+  session id.
 - Taskbar / window list protocol — plasmashell's task manager widget
   can't see labwc windows because labwc doesn't speak `org_kde_plasma
   _window_management`. Options: launch waybar alongside plasmashell
   (workaround), or patch labwc (upstream work).
 - SDDM / greetd integration — proper login screen + session selection
   for multi-user deployments
-- Seamless reconnect — drop/reconnect without losing the session
 - Native Windows / macOS clients — currently Linux only; the server
   is Wayland-specific by design but the client can be cross-platform
 

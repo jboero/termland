@@ -214,10 +214,13 @@ The client RPM installs:
 - [x] Desktop session manager (`termland-client --manager`, egui): saved
       multi-host profiles, per-host session list, resume/new/close (not
       Qt6/cxx-qt — see [ROADMAP.md](ROADMAP.md) for why)
+- [x] Session isolation: `setuid` into the PAM-authenticated user, with
+      ownership enforcement on session list/attach/close
+- [x] Clipboard file transfer (copy files, real files land on the other side)
+- [x] Seamless reconnect (auto-retry + reattach on an unexpected drop)
+- [x] Android audio playback (MediaCodec Opus → AudioTrack)
 - [ ] iOS client
-- [ ] Per-session privilege separation (fork + setuid after PAM auth)
-- [ ] Audio bitrate configuration; Android audio playback (core delivers
-      packets, Kotlin-side AudioTrack player not yet wired up)
+- [ ] Audio bitrate configuration
 - [ ] Multi-monitor support
 - [ ] Web client (WebCodecs + WebTransport)
 
