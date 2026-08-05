@@ -75,6 +75,36 @@ Each session runs an isolated headless Wayland compositor with its own screen ca
 - Client-side cursor rendering for low-latency mouse interaction
 - Data rate overlay, fullscreen toggle (F11), menubar toggle (F10)
 - Shell tab completion for bash, zsh, fish
+- Desktop session manager (`--manager`): saved multi-host connection
+  profiles, live per-host session list, resume/new/close
+- Seamless reconnect: auto-retry with backoff, reattaches to the same
+  session after an unexpected drop instead of exiting
+
+### Mobile (Android)
+A native Android client — same protocol, same server, no separate backend.
+Works as a **full thin client with an external keyboard and mouse** (the
+primary use case: turn a tablet into a terminal for a real desktop session)
+**or standalone with just the touchscreen**, no peripherals required:
+
+- **With a keyboard/mouse** (Bluetooth or USB-C dock): real hardware input —
+  `Ctrl+C`, `Alt+Tab`, `Ctrl+Alt+F2` and friends all reach the remote
+  session, plus mouse hover/click/scroll and an optional pointer-capture
+  trackpad mode.
+- **Touch-only**: tap = click, long-press = right-click, drag = drag,
+  two-finger scroll = wheel, plus an on-screen modifier bar (Ctrl/Alt/Super/
+  Esc/Tab/arrows) for the shortcuts a touchscreen alone can't express. The
+  soft keyboard commits real Unicode (autocorrect, emoji, CJK) via a
+  dedicated text-input channel — not synthesized scancodes.
+- Hardware-accelerated decode via Android's own `MediaCodec` (no bundled
+  FFmpeg), codec choice negotiated automatically from what the device
+  actually supports.
+- Opus audio playback, and the same persistent-session resume list as the
+  desktop client — pick up a dropped mobile connection exactly where it
+  left off.
+- Transports: TCP+TLS, embedded SSH (pure-Rust, no `ssh` binary needed —
+  works inside Android's app sandbox), and QUIC (connection migration
+  across Wi-Fi↔cellular, split video/audio planes so a lossy link doesn't
+  stall input).
 
 ## Quick Start
 
@@ -140,6 +170,32 @@ termland-client --desktop-shell "dbus-run-session sway" --ssh user@server
 termland-client --preset 8 --crf 30 --ssh user@server
 ```
 
+### Android Client
+
+No server-side changes needed — the Android app speaks the same protocol as
+`termland-client`. Grab a debug APK from the
+[releases page](https://github.com/jboero/termland/releases) and sideload it
+(`adb install app-debug.apk`, or transfer + install from the device), or
+build it yourself:
+
+```bash
+cd android
+./gradlew assembleDebug
+# APK at app/build/outputs/apk/debug/app-debug.apk
+```
+
+Building requires the Android SDK/NDK (`ANDROID_HOME`/`ANDROID_NDK_HOME`) and
+a Rust toolchain with the Android targets installed
+(`rustup target add aarch64-linux-android x86_64-linux-android`) — Gradle
+cross-compiles `termland-mobile-core` and generates its Kotlin bindings
+automatically as part of the build, no manual steps.
+
+On first launch, open the profile screen and add a host (same connection
+details as `termland-client`: address, TLS/SSH/QUIC, credentials). Sessions
+you create or resume there show up in the same resumable-session list the
+desktop `--manager`/`--tray` see, since they're the same server-side
+sessions.
+
 ## Building from Source
 
 ### Dependencies
@@ -181,9 +237,12 @@ termland/
     termland-codec/       AV1 encode/decode, Opus encode/decode
     termland-server/      Session broker, PAM auth, TLS, capture + encode pipeline
     termland-client/      winit window, softbuffer renderer, decode + playback
+    termland-mobile-core/ UniFFI Rust core for mobile (protocol + transport +
+                           negotiation; no FFmpeg — decode is platform-native)
+  android/                Kotlin/Compose app built on termland-mobile-core
 ```
 
-**Wire protocol**: length-delimited binary framing (`[Magic "TL"][MsgID][Length][CBOR]`) carrying control messages (handshake, auth, session lifecycle, resize, ping) and data messages (AV1 video, Opus audio, cursor image, clipboard, key/pointer input, Unicode text input). Runs over TCP, TLS, an embedded SSH subsystem channel, or QUIC (Q1: single-stream drop-in).
+**Wire protocol**: length-delimited binary framing (`[Magic "TL"][MsgID][Length][CBOR]`) carrying control messages (handshake, auth, session lifecycle, resize, ping) and data messages (AV1 video, Opus audio, cursor image, clipboard, key/pointer input, Unicode text input). Runs over TCP, TLS, an embedded SSH subsystem channel (`russh` on mobile, since app sandboxes forbid spawning the `ssh` binary), or QUIC — Q1 (single-stream drop-in) plus Q2 (video and audio split onto their own QUIC stream/datagrams so a lossy link doesn't stall control/input).
 
 **Encoder pipeline**: compositor buffer capture via wlr-screencopy-unstable-v1, RGBA-to-YUV conversion respecting ffmpeg's 32-byte row alignment, hardware encoder probing at startup with automatic fallback.
 
