@@ -250,6 +250,22 @@ termland/
 
 ## Packaging
 
+### COPR (Fedora/RHEL/CentOS/EPEL)
+
+Pre-built RPMs, rebuilt from each tagged release:
+
+```bash
+sudo dnf copr enable boeroboy/mawenzy
+sudo dnf install termland-server termland-client
+```
+
+`termland-server`/`termland-client` are two packages inside the
+[boeroboy/mawenzy](https://copr.fedorainfracloud.org/coprs/boeroboy/mawenzy/)
+COPR project (a general personal repo, not termland-only — the `dnf copr
+enable` step above only pulls in what you actually `dnf install`). Built
+directly from `packaging/termland-server.spec` / `packaging/termland-client.spec`
+in this repo, so it tracks whatever's tagged here.
+
 The server RPM installs:
 - `/usr/bin/termland-server`
 - `/etc/ssh/sshd_config.d/50-termland.conf` — SSH subsystem registration
