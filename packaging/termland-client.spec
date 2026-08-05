@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.5.0
+%global version 0.6.0
 
 Name:           termland-client
 Version:        %{version}
@@ -134,6 +134,20 @@ install -Dm644 termland-client.fish %{buildroot}%{_datadir}/fish/vendor_completi
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Wed Aug 5 2026 John Boero - 0.6.0-1
+- Desktop session manager (--manager): saved multi-host connection profiles
+  in a real window (egui), with a live per-host session list and
+  resume/new/close, replacing the old one-host-per-launch tray-only flow.
+- Seamless reconnect: auto-retry with backoff and reattach to the same
+  session after an unexpected connection drop, instead of exiting.
+- Bidirectional clipboard sync, including file transfer via clipboard paste.
+- Real cursor-shape sync in client-side-cursor mode (actual compositor
+  cursor bitmap, not a placeholder).
+- Embedded SSH (russh) and QUIC transports (--quic), the latter now with Q2
+  split video/audio planes.
+- --list-sessions and --close gain the new session-owner semantics from
+  server-side session isolation.
+
 * Fri Jul 10 2026 John Boero - 0.5.0-1
 - Resume persistent sessions: --attach <id> reconnects to a running session;
   --list-sessions and --close <id> manage them from the CLI

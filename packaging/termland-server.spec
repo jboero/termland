@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.5.0
+%global version 0.6.0
 
 Name:           termland-server
 Version:        %{version}
@@ -173,6 +173,26 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Wed Aug 5 2026 John Boero - 0.6.0-1
+- Session isolation: setuid into the PAM-authenticated user after --auth,
+  instead of every session running as the server's own (root) user; sessions
+  now also record and enforce an owner so one authenticated user cannot
+  list, attach to, or close another's session.
+- Embedded SSH (russh) and QUIC transports, the latter now with Q2 (video on
+  its own reliable QUIC stream, audio on datagrams) so a lost video packet
+  no longer head-of-line-blocks control/input.
+- Bidirectional clipboard sync, including file transfer via clipboard paste.
+- Real cursor-shape sync (actual compositor cursor bitmap, not a placeholder).
+- Seamless reconnect: auto-retry with backoff and reattach to the same
+  session after an unexpected connection drop.
+- --list-sessions / --close-session admin CLI (registry-only, no running
+  server process required).
+- Desktop session manager (--manager): saved multi-host connection profiles
+  with a live per-host session list, resume/new/close.
+- First Android client (termland-mobile-core + native Kotlin/Compose app):
+  hardware keyboard/mouse as primary input, touch as secondary, audio
+  playback, session resume list.
+
 * Fri Jul 10 2026 John Boero - 0.5.0-1
 - Persistent detachable sessions (X2Go/NX-style): a session keeps running on the
   server after the client disconnects and can be resumed later. Daemon-free —
