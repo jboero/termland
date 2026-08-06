@@ -7,6 +7,12 @@
 -keep class * implements com.sun.jna.Library { *; }
 -keep class * implements com.sun.jna.Callback { *; }
 
+# JNA's Native$AWT is a desktop-only helper (java.awt.Component/Window/etc. for
+# embedding native windows in a Swing/AWT app) that's never reachable on
+# Android - there is no java.awt here. R8 can't prove that statically, so it
+# hard-errors on the missing classes unless told these are expected.
+-dontwarn java.awt.**
+
 # The generated bindings and the callback interfaces the Rust side invokes.
 -keep class dev.termland.core.** { *; }
 -keep interface dev.termland.core.** { *; }
