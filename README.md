@@ -6,6 +6,14 @@ Termland streams full interactive desktop and application sessions over the netw
 
 [Screencast_20260416_143042.webm](https://github.com/user-attachments/assets/a47450a8-c8ec-4422-8ead-6d65bad59c72)
 
+**There's also a native Android app.** No server changes, no second protocol —
+it's the exact same client, just Kotlin/Compose on top of the shared Rust
+core. Sideload it on an Android tablet with a Bluetooth keyboard/mouse and
+you've got a full remote desktop terminal; sideload it on an Android TV box
+and the TV becomes one too. Grab a build from the
+[releases page](https://github.com/jboero/termland/releases/latest) — see
+[Android Client](#android-client) below — or read on for the full picture.
+
 
 ## Why This Exists
 
@@ -82,9 +90,11 @@ Each session runs an isolated headless Wayland compositor with its own screen ca
 
 ### Mobile (Android)
 A native Android client — same protocol, same server, no separate backend.
-Works as a **full thin client with an external keyboard and mouse** (the
-primary use case: turn a tablet into a terminal for a real desktop session)
-**or standalone with just the touchscreen**, no peripherals required:
+Turns any Android tablet, or an Android TV box, into a remote desktop
+terminal. Works as a **full thin client with an external keyboard and mouse**
+(the primary use case: pair a Bluetooth keyboard/mouse, or a USB-C dock on a
+tablet, and it's a real desktop terminal) **or standalone with just the
+touchscreen**, no peripherals required:
 
 - **With a keyboard/mouse** (Bluetooth or USB-C dock): real hardware input —
   `Ctrl+C`, `Alt+Tab`, `Ctrl+Alt+F2` and friends all reach the remote
@@ -173,10 +183,21 @@ termland-client --preset 8 --crf 30 --ssh user@server
 ### Android Client
 
 No server-side changes needed — the Android app speaks the same protocol as
-`termland-client`. Grab a debug APK from the
-[releases page](https://github.com/jboero/termland/releases) and sideload it
-(`adb install app-debug.apk`, or transfer + install from the device), or
-build it yourself:
+`termland-client`. Grab an APK from the
+[releases page](https://github.com/jboero/termland/releases/latest) and
+sideload it — on a tablet, an Android TV box, or an emulator, it's the same
+APK either way:
+
+- `termland-android-vX.Y.Z-debug.apk` — debug-signed, installs directly:
+  `adb install termland-android-vX.Y.Z-debug.apk`, or transfer the file to
+  the device and install it from there (enable "install unknown apps" for
+  whatever file manager/browser you use to open it).
+- `termland-android-vX.Y.Z-release-unsigned.apk` — the optimized/minified
+  release build, but **unsigned**: sign it with your own key before
+  installing (`apksigner sign --ks your.keystore ...`), or just use the
+  debug build above if you don't need a release-signed artifact.
+
+Or build it yourself:
 
 ```bash
 cd android
