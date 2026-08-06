@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.6.2
+%global version 0.6.1
 # find-debuginfo can produce an empty debugsourcefiles.list for a Rust
 # binary (unlike typical C sources), which newer Fedora's rpmbuild tolerates
 # but EL8's treats as a hard error ("Empty %%files file ... debugsourcefiles
@@ -20,7 +20,7 @@
 
 Name:           termland-server
 Version:        %{version}
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Termland remote desktop server — stream Wayland sessions via AV1/VP9/HEVC/H.264/Opus
 
 License:        LGPL-3.0-or-later
@@ -186,7 +186,7 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
-* Thu Aug 6 2026 John Boero - 0.6.2-1
+* Thu Aug 6 2026 John Boero - 0.6.1-2
 - Disable debuginfo package generation (%%global debug_package %%{nil}):
   find-debuginfo produces an empty debugsourcefiles.list for this Rust
   binary, which EL8's rpmbuild treats as a hard error.

@@ -8,14 +8,14 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.6.2
+%global version 0.6.1
 # See termland-server.spec's comment: EL8's rpmbuild fails hard on the empty
 # debugsourcefiles.list find-debuginfo can produce for a Rust binary.
 %global debug_package %{nil}
 
 Name:           termland-client
 Version:        %{version}
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Termland remote desktop client — view and interact with remote Wayland sessions
 
 License:        LGPL-3.0-or-later
@@ -138,7 +138,7 @@ install -Dm644 termland-client.fish %{buildroot}%{_datadir}/fish/vendor_completi
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
-* Thu Aug 6 2026 John Boero - 0.6.2-1
+* Thu Aug 6 2026 John Boero - 0.6.1-2
 - Same packaging fixes as termland-server 0.6.2 (debuginfo generation
   disabled for EL8, portable /usr/bin/perl BuildRequires for Mageia); no
   client behavior change.
