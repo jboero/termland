@@ -20,7 +20,7 @@ URL:            https://github.com/jboero/termland
 Source0:        https://github.com/jboero/termland/archive/v%{version}/%{crate_name}-%{version}.tar.gz
 # Vendored crate dependencies, so %%build works offline (COPR/mock build roots
 # have no network). Regenerate with: packaging/make-vendor-tarball.sh
-Source1:        %{crate_name}-%{version}-vendor.tar.xz
+Source1:        https://github.com/jboero/termland/releases/download/v%{version}/%{crate_name}-%{version}-vendor.tar.xz
 
 # ─── Build dependencies ──────────────────────────────────────────────────────
 # Rust toolchain (cargo, rustc)

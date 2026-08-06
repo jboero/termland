@@ -81,7 +81,13 @@ pub fn resolve_target_user(username: &str) -> Result<TargetUser, CompositorError
     // getpwnam_r needs a caller-supplied buffer for the strings it points
     // `pwd`'s fields into. Start reasonably large and grow on ERANGE rather
     // than trying to size it perfectly up front.
-    let mut buf: Vec<i8> = vec![0; 4096];
+    //
+    // `libc::c_char`, NOT a hardcoded `i8`: on Linux, `c_char` is signed on
+    // x86_64 but UNSIGNED on aarch64 - `getpwnam_r`'s buffer parameter type
+    // follows the platform's `c_char`, so a hardcoded `i8` compiles fine on
+    // x86_64 and fails to compile at all on aarch64 (`expected *mut u8,
+    // found *mut i8`). Caught by a real aarch64 COPR build failure.
+    let mut buf: Vec<libc::c_char> = vec![0; 4096];
 
     loop {
         let rc = unsafe {
