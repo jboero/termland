@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.6.0
+%global version 0.6.1
 
 Name:           termland-server
 Version:        %{version}
@@ -173,6 +173,15 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Wed Aug 5 2026 John Boero - 0.6.1-1
+- Fix aarch64 build failure in session isolation: getpwnam_r's buffer was
+  declared Vec<i8>, but libc's buffer type follows the platform's c_char
+  (signed on x86_64, unsigned on aarch64) - failed to compile at all on
+  aarch64. Now Vec<libc::c_char>.
+- Source1 (vendored crates, needed for the offline COPR build) is now a
+  real URL (a GitHub release asset) instead of a bare filename, so a plain
+  spec-URL COPR build submission works without a local SRPM upload.
+
 * Wed Aug 5 2026 John Boero - 0.6.0-1
 - Session isolation: setuid into the PAM-authenticated user after --auth,
   instead of every session running as the server's own (root) user; sessions

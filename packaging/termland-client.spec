@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.6.0
+%global version 0.6.1
 
 Name:           termland-client
 Version:        %{version}
@@ -134,6 +134,10 @@ install -Dm644 termland-client.fish %{buildroot}%{_datadir}/fish/vendor_completi
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Wed Aug 5 2026 John Boero - 0.6.1-1
+- Packaging fix only (COPR source-fetch + an aarch64-only server-side
+  build fix); no client behavior change.
+
 * Wed Aug 5 2026 John Boero - 0.6.0-1
 - Desktop session manager (--manager): saved multi-host connection profiles
   in a real window (egui), with a live per-host session list and
