@@ -8,7 +8,10 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.6.1
+%global version 0.6.2
+# See termland-server.spec's comment: EL8's rpmbuild fails hard on the empty
+# debugsourcefiles.list find-debuginfo can produce for a Rust binary.
+%global debug_package %{nil}
 
 Name:           termland-client
 Version:        %{version}
@@ -44,7 +47,8 @@ BuildRequires:  clang-devel
 BuildRequires:  cmake
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
-BuildRequires:  perl-interpreter
+# File-based, not `perl-interpreter`: see termland-server.spec's comment.
+BuildRequires:  /usr/bin/perl
 
 # Wayland client (winit backend, keyboard shortcut inhibit)
 BuildRequires:  wayland-devel
@@ -134,6 +138,11 @@ install -Dm644 termland-client.fish %{buildroot}%{_datadir}/fish/vendor_completi
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Thu Aug 6 2026 John Boero - 0.6.2-1
+- Same packaging fixes as termland-server 0.6.2 (debuginfo generation
+  disabled for EL8, portable /usr/bin/perl BuildRequires for Mageia); no
+  client behavior change.
+
 * Wed Aug 5 2026 John Boero - 0.6.1-1
 - Packaging fix only (COPR source-fetch + an aarch64-only server-side
   build fix); no client behavior change.

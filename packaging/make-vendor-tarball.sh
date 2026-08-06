@@ -24,7 +24,7 @@
 #   packaging/make-vendor-tarball.sh [OUTDIR]   # default: ~/rpmbuild/SOURCES
 set -e
 
-VERSION=0.6.1
+VERSION=0.6.2
 SRCDIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$HOME/rpmbuild/SOURCES}"
 mkdir -p "$OUT"

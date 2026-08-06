@@ -8,7 +8,15 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.6.1
+%global version 0.6.2
+# find-debuginfo can produce an empty debugsourcefiles.list for a Rust
+# binary (unlike typical C sources), which newer Fedora's rpmbuild tolerates
+# but EL8's treats as a hard error ("Empty %%files file ... debugsourcefiles
+# .list"). Disable debuginfo package generation outright rather than fight
+# find-debuginfo's Rust handling per-distro - standard practice for Rust RPM
+# packages, and this project doesn't rely on -debuginfo/-debugsource
+# subpackages for anything.
+%global debug_package %{nil}
 
 Name:           termland-server
 Version:        %{version}
@@ -47,7 +55,12 @@ BuildRequires:  clang-devel
 BuildRequires:  cmake
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
-BuildRequires:  perl-interpreter
+# File-based, not `perl-interpreter`: that virtual-provide name is a
+# Fedora/RHEL convention Mageia doesn't recognize ("No match for argument:
+# perl-interpreter"). Requiring the actual binary path resolves identically
+# via file-provides on every RPM-based distro regardless of how they've
+# packaged/split Perl.
+BuildRequires:  /usr/bin/perl
 
 # Wayland client libraries (screencopy, input injection, output management)
 BuildRequires:  wayland-devel
@@ -173,6 +186,14 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Thu Aug 6 2026 John Boero - 0.6.2-1
+- Disable debuginfo package generation (%%global debug_package %%{nil}):
+  find-debuginfo produces an empty debugsourcefiles.list for this Rust
+  binary, which EL8's rpmbuild treats as a hard error.
+- BuildRequires the real /usr/bin/perl binary instead of the
+  perl-interpreter virtual-provide, which is a Fedora/RHEL-only naming
+  convention Mageia doesn't recognize.
+
 * Wed Aug 5 2026 John Boero - 0.6.1-1
 - Fix aarch64 build failure in session isolation: getpwnam_r's buffer was
   declared Vec<i8>, but libc's buffer type follows the platform's c_char
