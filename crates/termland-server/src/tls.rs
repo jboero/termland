@@ -121,16 +121,16 @@ pub fn load_or_generate_cert(
 }
 
 /// Create the default keypair if it is missing, without building a rustls
-/// config around it. This is what the `termland-server-keygen.service`
-/// oneshot calls before the main service starts.
+/// config around it. Invoked as `termland-server --generate-cert`, which the
+/// RPM's `%post` runs at install time.
 ///
 /// It exists because the long-running service runs under
 /// `ProtectSystem=strict` and therefore cannot write `/etc` — the same reason
-/// `sshd` does not generate its own host keys and leaves that to
-/// `sshd-keygen@.service`, which runs unsandboxed beforehand.
+/// `mod_ssl` generates its certificate from a packaging hook rather than from
+/// httpd itself.
 ///
-/// Idempotent: an existing pair is left alone, so the unit can be re-run and
-/// the condition guard in it is only an optimisation.
+/// Idempotent: an existing pair is left alone, so `%post` can re-run on
+/// upgrade and an administrator can run it by hand to recover a lost keypair.
 pub fn generate_if_missing(
     cert_path: Option<&Path>,
     key_path: Option<&Path>,

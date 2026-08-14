@@ -40,9 +40,10 @@ struct Args {
     tls_key: Option<String>,
 
     /// Generate the self-signed TLS keypair if it is missing, then exit.
-    /// Run by termland-server-keygen.service before the main service starts,
-    /// because the service itself runs under ProtectSystem=strict and cannot
-    /// write /etc/pki/termland. Idempotent — an existing keypair is kept.
+    /// Run at install time by the RPM, because the service itself runs under
+    /// ProtectSystem=strict and cannot write /etc/pki/termland. Also the
+    /// command to run by hand if the keypair is ever missing. Idempotent — an
+    /// existing keypair is kept.
     #[arg(long)]
     generate_cert: bool,
 
