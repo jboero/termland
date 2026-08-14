@@ -566,6 +566,63 @@ impl VideoEncoder for FfmpegVideoEncoder {
     }
 }
 
+/// Encoders to try, in priority order.
+///
+/// Hardware before software; within each tier, open-source codecs first
+/// (AV1 → VP9 → VP8) then patent-encumbered (H.265 → H.264). The tier split
+/// matters: it uses whatever GPU is present (e.g. a Volta GV100's HEVC
+/// engine) before falling back to a software encoder, which would otherwise
+/// always "win" the probe by virtue of always opening successfully.
+///
+/// Every `EncoderBackend` must appear here exactly once — a variant missing
+/// from this list is silently never probed. `tests::every_backend_is_probed`
+/// enforces that.
+const ENCODER_PRIORITY: &[EncoderBackend] = &[
+    // --- Hardware encoders (open-source codecs first) ---
+    // AV1 HW
+    EncoderBackend::IntelQsv,
+    EncoderBackend::NvidiaEnc,
+    EncoderBackend::AmdAmf,
+    EncoderBackend::AmdVaapi,
+    // VP9 HW
+    EncoderBackend::Vp9Vaapi,
+    EncoderBackend::Vp9V4l2m2m,
+    // VP8 HW
+    EncoderBackend::Vp8V4l2m2m,
+    // H.265/HEVC HW (patent-encumbered)
+    EncoderBackend::H265Qsv,
+    EncoderBackend::H265Nvenc,
+    EncoderBackend::H265Amf,
+    EncoderBackend::H265Vaapi,
+    EncoderBackend::H265V4l2m2m,
+    // H.264 HW (patent-encumbered, universal)
+    EncoderBackend::H264Qsv,
+    EncoderBackend::H264Nvenc,
+    EncoderBackend::H264Amf,
+    EncoderBackend::H264Vaapi,
+    EncoderBackend::H264V4l2m2m,
+
+    // --- Software encoders (open-source codecs first) ---
+    EncoderBackend::SvtAv1,
+    EncoderBackend::SvtVp9,   // libvpx-vp9
+    EncoderBackend::Vp8Libvpx, // libvpx
+    EncoderBackend::Libx265,
+    EncoderBackend::Libx264,
+];
+
+/// The backends `probe_best_encoder` will try, in order, for a client that
+/// advertised `allowed`. An empty slice means "no restriction" — used for
+/// older clients that don't announce codec support at all.
+///
+/// Split out from the probe loop so codec negotiation can be tested without
+/// an FFmpeg context or a GPU.
+fn candidates(allowed: &[VideoCodec]) -> impl Iterator<Item = EncoderBackend> + '_ {
+    ENCODER_PRIORITY
+        .iter()
+        .copied()
+        .filter(move |b| allowed.is_empty() || allowed.contains(&b.codec()))
+}
+
 /// Probe available video encoders and return the best one.
 /// Priority (open-source first, then patent-encumbered):
 /// 1. AV1 (hardware) → AV1 (SVT-AV1 software)
@@ -582,50 +639,9 @@ pub fn probe_best_encoder(
 ) -> Result<Box<dyn VideoEncoder>, EncoderError> {
     ffmpeg_next::init().map_err(|e| EncoderError::InitFailed(format!("ffmpeg init: {e}")))?;
 
-    // Priority: hardware before software; within each tier, open-source codecs
-    // first (AV1 → VP9 → VP8) then patent-encumbered (H.265 → H.264). This uses
-    // whatever GPU is present (e.g. a Volta GV100's HEVC engine) before falling
-    // back to a software encoder that would otherwise always "win" the probe.
-    let backends = [
-        // --- Hardware encoders (open-source codecs first) ---
-        // AV1 HW
-        EncoderBackend::IntelQsv,
-        EncoderBackend::NvidiaEnc,
-        EncoderBackend::AmdAmf,
-        EncoderBackend::AmdVaapi,
-        // VP9 HW
-        EncoderBackend::Vp9Vaapi,
-        EncoderBackend::Vp9V4l2m2m,
-        // VP8 HW
-        EncoderBackend::Vp8V4l2m2m,
-        // H.265/HEVC HW (patent-encumbered)
-        EncoderBackend::H265Qsv,
-        EncoderBackend::H265Nvenc,
-        EncoderBackend::H265Amf,
-        EncoderBackend::H265Vaapi,
-        EncoderBackend::H265V4l2m2m,
-        // H.264 HW (patent-encumbered, universal)
-        EncoderBackend::H264Qsv,
-        EncoderBackend::H264Nvenc,
-        EncoderBackend::H264Amf,
-        EncoderBackend::H264Vaapi,
-        EncoderBackend::H264V4l2m2m,
-
-        // --- Software encoders (open-source codecs first) ---
-        EncoderBackend::SvtAv1,
-        EncoderBackend::SvtVp9,   // libvpx-vp9
-        EncoderBackend::Vp8Libvpx, // libvpx
-        EncoderBackend::Libx265,
-        EncoderBackend::Libx264,
-    ];
-
-    for backend in &backends {
-        // Skip codecs the client can't decode (empty `allowed` = no restriction).
-        if !allowed.is_empty() && !allowed.contains(&backend.codec()) {
-            continue;
-        }
+    for backend in candidates(allowed) {
         tracing::info!("Probing video encoder: {backend}...");
-        match FfmpegVideoEncoder::new(*backend, config) {
+        match FfmpegVideoEncoder::new(backend, config) {
             Ok(enc) => {
                 tracing::info!("Selected video encoder: {backend} (codec {})", backend.codec());
                 return Ok(Box::new(enc));
@@ -637,4 +653,226 @@ pub fn probe_best_encoder(
     }
 
     Err(EncoderError::NoEncoder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `EncoderBackend`, split by whether it runs on the GPU.
+    ///
+    /// These are hand-maintained, but `all_backends_are_accounted_for` pins
+    /// the total, so adding a variant without listing it here fails loudly
+    /// rather than silently weakening every test below.
+    const HARDWARE: &[EncoderBackend] = &[
+        EncoderBackend::IntelQsv,
+        EncoderBackend::NvidiaEnc,
+        EncoderBackend::AmdAmf,
+        EncoderBackend::AmdVaapi,
+        EncoderBackend::Vp9Vaapi,
+        EncoderBackend::Vp9V4l2m2m,
+        EncoderBackend::Vp8V4l2m2m,
+        EncoderBackend::H265Qsv,
+        EncoderBackend::H265Nvenc,
+        EncoderBackend::H265Amf,
+        EncoderBackend::H265Vaapi,
+        EncoderBackend::H265V4l2m2m,
+        EncoderBackend::H264Qsv,
+        EncoderBackend::H264Nvenc,
+        EncoderBackend::H264Amf,
+        EncoderBackend::H264Vaapi,
+        EncoderBackend::H264V4l2m2m,
+    ];
+
+    const SOFTWARE: &[EncoderBackend] = &[
+        EncoderBackend::SvtAv1,
+        EncoderBackend::SvtVp9,
+        EncoderBackend::Vp8Libvpx,
+        EncoderBackend::Libx265,
+        EncoderBackend::Libx264,
+    ];
+
+    fn all() -> Vec<EncoderBackend> {
+        HARDWARE.iter().chain(SOFTWARE).copied().collect()
+    }
+
+    /// Guards the two lists above against enum drift. `ENCODER_PRIORITY` is
+    /// the one place every variant is already required to appear, so its
+    /// length is the reference count.
+    #[test]
+    fn all_backends_are_accounted_for() {
+        assert_eq!(
+            all().len(),
+            ENCODER_PRIORITY.len(),
+            "HARDWARE + SOFTWARE in this test module have drifted from \
+             ENCODER_PRIORITY — a backend was probably added to the enum \
+             without being classified here",
+        );
+    }
+
+    /// A backend missing from `ENCODER_PRIORITY` compiles fine and is simply
+    /// never probed, so the feature silently does not exist.
+    #[test]
+    fn every_backend_is_probed() {
+        for backend in all() {
+            assert!(
+                ENCODER_PRIORITY.contains(&backend),
+                "{backend:?} is not in ENCODER_PRIORITY, so it will never be probed",
+            );
+        }
+    }
+
+    #[test]
+    fn priority_list_has_no_duplicates() {
+        let mut seen = Vec::new();
+        for backend in ENCODER_PRIORITY {
+            assert!(!seen.contains(backend), "{backend:?} appears twice in ENCODER_PRIORITY");
+            seen.push(*backend);
+        }
+    }
+
+    /// The FFmpeg encoder name and the declared wire codec are written out in
+    /// two separate 22-arm matches. The compiler catches a *missing* arm; only
+    /// a test catches a *wrong* one, e.g. `Vp9Vaapi => "vp8_vaapi"`, which
+    /// would hand the client a stream in a codec it did not negotiate.
+    ///
+    /// This checks codec *family* agreement only. A same-family slip such as
+    /// `H265Nvenc => "hevc_qsv"` passes here and is caught by
+    /// `display_names_the_ffmpeg_encoder` instead, since the two together pin
+    /// the exact string.
+    #[test]
+    fn ffmpeg_name_agrees_with_declared_codec() {
+        for backend in all() {
+            let name = backend.codec_name();
+            let ok = match backend.codec() {
+                VideoCodec::Av1 => name.contains("av1"),
+                VideoCodec::Vp9 => name.contains("vp9"),
+                // libvpx (no suffix) is VP8; libvpx-vp9 is caught above.
+                VideoCodec::Vp8 => name.contains("vp8") || name == "libvpx",
+                VideoCodec::H265 => name.contains("hevc") || name.contains("265"),
+                VideoCodec::H264 => name.contains("h264") || name.contains("264"),
+            };
+            assert!(
+                ok,
+                "{backend:?} declares codec {} but its FFmpeg encoder is {name:?}",
+                backend.codec(),
+            );
+        }
+    }
+
+    /// Every backend's `Display` embeds its FFmpeg name in parentheses; that
+    /// string is what lands in the server log when a session picks an encoder,
+    /// so drift between the two makes logs actively misleading when debugging
+    /// a user's "wrong codec" report.
+    #[test]
+    fn display_names_the_ffmpeg_encoder() {
+        for backend in all() {
+            let shown = backend.to_string();
+            assert!(
+                shown.contains(backend.codec_name()),
+                "Display for {backend:?} is {shown:?}, which does not mention {:?}",
+                backend.codec_name(),
+            );
+        }
+    }
+
+    /// Software encoders always open successfully, so if one were ordered
+    /// before a hardware backend it would win every probe and silently
+    /// disable GPU encoding everywhere.
+    #[test]
+    fn hardware_is_probed_before_software() {
+        let last_hw = ENCODER_PRIORITY.iter().rposition(|b| HARDWARE.contains(b)).unwrap();
+        let first_sw = ENCODER_PRIORITY.iter().position(|b| SOFTWARE.contains(b)).unwrap();
+        assert!(
+            last_hw < first_sw,
+            "software encoder at index {first_sw} precedes hardware encoder at {last_hw}; \
+             software always opens, so it would win every probe",
+        );
+    }
+
+    /// Within each tier the codec order must match `VideoCodec::all_preferred`
+    /// — open-source (AV1 → VP9 → VP8) ahead of patent-encumbered
+    /// (H.265 → H.264). That ordering is a licensing decision, not an
+    /// incidental one.
+    #[test]
+    fn each_tier_follows_the_documented_codec_preference() {
+        let rank = |c: VideoCodec| {
+            VideoCodec::all_preferred().iter().position(|p| *p == c).unwrap()
+        };
+        for (tier, members) in [("hardware", HARDWARE), ("software", SOFTWARE)] {
+            let ranks: Vec<_> = ENCODER_PRIORITY
+                .iter()
+                .filter(|b| members.contains(b))
+                .map(|b| rank(b.codec()))
+                .collect();
+            let mut sorted = ranks.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                ranks, sorted,
+                "{tier} tier departs from VideoCodec::all_preferred order",
+            );
+        }
+    }
+
+    /// Every codec the protocol can negotiate needs at least one encoder,
+    /// otherwise a client advertising only that codec gets `NoEncoder`.
+    #[test]
+    fn every_codec_has_an_encoder() {
+        for codec in VideoCodec::all_preferred() {
+            assert!(
+                ENCODER_PRIORITY.iter().any(|b| b.codec() == codec),
+                "no encoder backend produces {codec}",
+            );
+        }
+    }
+
+    #[test]
+    fn empty_negotiation_set_allows_everything() {
+        assert_eq!(candidates(&[]).count(), ENCODER_PRIORITY.len());
+    }
+
+    /// The negotiation filter must never hand back an encoder the client
+    /// cannot decode — that produces a session that connects and then shows
+    /// a black screen.
+    #[test]
+    fn negotiation_yields_only_allowed_codecs() {
+        let allowed = [VideoCodec::Vp9, VideoCodec::H264];
+        let picked: Vec<_> = candidates(&allowed).collect();
+
+        assert!(!picked.is_empty());
+        for backend in &picked {
+            assert!(
+                allowed.contains(&backend.codec()),
+                "{backend:?} produces {}, which the client did not advertise",
+                backend.codec(),
+            );
+        }
+    }
+
+    /// Filtering must not reshuffle the list: a client advertising everything
+    /// has to get exactly the unrestricted order back.
+    #[test]
+    fn negotiation_preserves_priority_order() {
+        let all_codecs = VideoCodec::all_preferred();
+        let picked: Vec<_> = candidates(&all_codecs).collect();
+        assert_eq!(picked, ENCODER_PRIORITY.to_vec());
+    }
+
+    /// A client that advertises a single codec must still get that codec's
+    /// full hardware-then-software fallback chain, not just one backend.
+    #[test]
+    fn single_codec_negotiation_keeps_its_fallback_chain() {
+        for codec in VideoCodec::all_preferred() {
+            let picked: Vec<_> = candidates(&[codec]).collect();
+            assert!(
+                picked.iter().all(|b| b.codec() == codec),
+                "{codec} negotiation leaked another codec",
+            );
+            assert!(
+                picked.len() > 1,
+                "{codec} has only {} backend(s), so a failure has no fallback",
+                picked.len(),
+            );
+        }
+    }
 }

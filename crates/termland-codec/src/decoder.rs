@@ -55,7 +55,7 @@ impl std::fmt::Display for DecoderBackend {
             // AV1
             DecoderBackend::IntelQsv => write!(f, "Intel QSV (av1_qsv)"),
             DecoderBackend::NvidiaCuvid => write!(f, "NVIDIA CUVID (av1_cuvid)"),
-            DecoderBackend::Dav1d => write!(f, "dav1d (software)"),
+            DecoderBackend::Dav1d => write!(f, "dav1d (libdav1d, software)"),
             
             // VP9
             DecoderBackend::Vp9Vaapi => write!(f, "VA-API (vp9_vaapi)"),
@@ -481,5 +481,168 @@ impl VideoDecoder {
         let new_decoder = Self::init_from_index(next_index, failed, self.codec_filter)?;
         *self = new_decoder;
         self.decode(data)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `DecoderBackend`, split by whether it runs on the GPU.
+    /// `all_backends_are_accounted_for` pins these against BACKEND_PRIORITY
+    /// so a new variant cannot silently weaken the tests below.
+    const HARDWARE: &[DecoderBackend] = &[
+        DecoderBackend::NvidiaCuvid,
+        DecoderBackend::IntelQsv,
+        DecoderBackend::Vp9Vaapi,
+        DecoderBackend::Vp9V4l2m2m,
+        DecoderBackend::Vp8V4l2m2m,
+        DecoderBackend::HevcCuvid,
+        DecoderBackend::HevcVaapi,
+        DecoderBackend::HevcV4l2m2m,
+        DecoderBackend::HevcQsv,
+        DecoderBackend::H264Cuvid,
+        DecoderBackend::H264Vaapi,
+        DecoderBackend::H264V4l2m2m,
+        DecoderBackend::H264Qsv,
+    ];
+
+    const SOFTWARE: &[DecoderBackend] = &[
+        DecoderBackend::Dav1d,
+        DecoderBackend::LibvpxVp9,
+        DecoderBackend::Libvpx,
+        DecoderBackend::HevcSoftware,
+        DecoderBackend::H264Software,
+    ];
+
+    fn all() -> Vec<DecoderBackend> {
+        HARDWARE.iter().chain(SOFTWARE).copied().collect()
+    }
+
+    #[test]
+    fn all_backends_are_accounted_for() {
+        assert_eq!(
+            all().len(),
+            BACKEND_PRIORITY.len(),
+            "HARDWARE + SOFTWARE here have drifted from BACKEND_PRIORITY",
+        );
+    }
+
+    #[test]
+    fn every_backend_is_probed() {
+        for backend in all() {
+            assert!(
+                BACKEND_PRIORITY.contains(&backend),
+                "{backend:?} is not in BACKEND_PRIORITY, so it will never be tried",
+            );
+        }
+    }
+
+    #[test]
+    fn priority_list_has_no_duplicates() {
+        let mut seen = Vec::new();
+        for backend in BACKEND_PRIORITY {
+            assert!(!seen.contains(backend), "{backend:?} appears twice in BACKEND_PRIORITY");
+            seen.push(*backend);
+        }
+    }
+
+    /// Family agreement between the FFmpeg decoder name and the declared wire
+    /// codec; `display_names_the_ffmpeg_decoder` pins the exact string.
+    #[test]
+    fn ffmpeg_name_agrees_with_declared_codec() {
+        for backend in all() {
+            let name = backend.codec_name();
+            let ok = match backend.codec() {
+                VideoCodec::Av1 => name.contains("av1") || name == "libdav1d",
+                VideoCodec::Vp9 => name.contains("vp9"),
+                VideoCodec::Vp8 => name.contains("vp8") || name == "libvpx",
+                VideoCodec::H265 => name.contains("hevc") || name.contains("265"),
+                VideoCodec::H264 => name.contains("h264") || name.contains("264"),
+            };
+            assert!(
+                ok,
+                "{backend:?} declares codec {} but its FFmpeg decoder is {name:?}",
+                backend.codec(),
+            );
+        }
+    }
+
+    #[test]
+    fn display_names_the_ffmpeg_decoder() {
+        for backend in all() {
+            let shown = backend.to_string();
+            assert!(
+                shown.contains(backend.codec_name()),
+                "Display for {backend:?} is {shown:?}, which does not mention {:?}",
+                backend.codec_name(),
+            );
+        }
+    }
+
+    #[test]
+    fn hardware_is_probed_before_software() {
+        let last_hw = BACKEND_PRIORITY.iter().rposition(|b| HARDWARE.contains(b)).unwrap();
+        let first_sw = BACKEND_PRIORITY.iter().position(|b| SOFTWARE.contains(b)).unwrap();
+        assert!(
+            last_hw < first_sw,
+            "software decoder at index {first_sw} precedes hardware decoder at {last_hw}",
+        );
+    }
+
+    #[test]
+    fn each_tier_follows_the_documented_codec_preference() {
+        let rank = |c: VideoCodec| {
+            VideoCodec::all_preferred().iter().position(|p| *p == c).unwrap()
+        };
+        for (tier, members) in [("hardware", HARDWARE), ("software", SOFTWARE)] {
+            let ranks: Vec<_> = BACKEND_PRIORITY
+                .iter()
+                .filter(|b| members.contains(b))
+                .map(|b| rank(b.codec()))
+                .collect();
+            let mut sorted = ranks.clone();
+            sorted.sort_unstable();
+            assert_eq!(ranks, sorted, "{tier} tier departs from VideoCodec::all_preferred order");
+        }
+    }
+
+    /// QSV opens successfully even with no Intel GPU present and only fails on
+    /// the first *packet*, unlike CUVID/VA-API/V4L2 which fail cleanly at init.
+    /// So QSV must come last among the hardware backends of its own codec,
+    /// otherwise an NVIDIA-only box burns its opening frames on a doomed QSV
+    /// context. This ordering is deliberate and easy to "tidy" away — see the
+    /// comment on BACKEND_PRIORITY.
+    #[test]
+    fn qsv_comes_after_other_hardware_of_the_same_codec() {
+        let qsv = [DecoderBackend::IntelQsv, DecoderBackend::HevcQsv, DecoderBackend::H264Qsv];
+        for backend in qsv {
+            let codec = backend.codec();
+            let at = BACKEND_PRIORITY.iter().position(|b| *b == backend).unwrap();
+            for (i, other) in BACKEND_PRIORITY.iter().enumerate() {
+                if other.codec() == codec && HARDWARE.contains(other) && *other != backend {
+                    assert!(
+                        i < at,
+                        "{other:?} (index {i}) must be probed before {backend:?} (index {at}): \
+                         QSV fails late, so it has to be the last hardware {codec} backend tried",
+                    );
+                }
+            }
+        }
+    }
+
+    /// `VideoDecoder::for_codec` filters BACKEND_PRIORITY to one codec. If a
+    /// codec had no backends the call could never succeed, so a client that
+    /// negotiated it would connect and then see nothing.
+    #[test]
+    fn every_codec_has_a_decoder() {
+        for codec in VideoCodec::all_preferred() {
+            let backends: Vec<_> =
+                BACKEND_PRIORITY.iter().filter(|b| b.codec() == codec).collect();
+            assert!(!backends.is_empty(), "no decoder backend handles {codec}");
+            assert!(
+                backends.len() > 1,
+                "{codec} has only one decoder backend, so a failure has no fallback",
+            );
+        }
     }
 }
