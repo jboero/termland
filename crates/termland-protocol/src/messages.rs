@@ -262,6 +262,11 @@ pub struct SessionCreate {
     /// (older client) means "all codecs supported".
     #[serde(default = "VideoCodec::all_preferred")]
     pub supported_codecs: Vec<VideoCodec>,
+    /// Audio codecs this client can decode, in preference order. An omitted
+    /// field (client predating audio negotiation) means Opus only — see
+    /// `AudioCodec::legacy_default`. Ignored when `audio` is false.
+    #[serde(default = "AudioCodec::legacy_default")]
+    pub supported_audio_codecs: Vec<AudioCodec>,
 }
 
 fn default_quality() -> u8 { 75 }
@@ -276,6 +281,12 @@ pub struct SessionReady {
     /// the client should fall back to auto-detecting from the frame stream.
     #[serde(default)]
     pub codec: Option<VideoCodec>,
+    /// Audio codec the server negotiated for this session, so the client can
+    /// build the matching decoder up front. `None` means either no audio, or
+    /// an older server that always sends Opus — both are handled by treating
+    /// it as Opus when audio frames arrive.
+    #[serde(default)]
+    pub audio_codec: Option<AudioCodec>,
     /// Stable id of the (persistent) session, so the client can reattach to it
     /// later after disconnecting. Empty for older servers with no persistence.
     #[serde(default)]
@@ -323,6 +334,11 @@ pub struct SessionAttach {
     pub encoder_extra_params: Option<String>,
     #[serde(default = "VideoCodec::all_preferred")]
     pub supported_codecs: Vec<VideoCodec>,
+    /// See `SessionCreate::supported_audio_codecs`. Re-advertised on attach
+    /// because a session can be resumed from a different client build than
+    /// the one that created it.
+    #[serde(default = "AudioCodec::legacy_default")]
+    pub supported_audio_codecs: Vec<AudioCodec>,
 }
 
 /// Client -> server: permanently close (terminate) a persistent session.
@@ -388,6 +404,58 @@ impl VideoCodec {
             VideoCodec::H265,
             VideoCodec::H264,
         ]
+    }
+}
+
+/// Audio codec carried by an `AudioFrame`, negotiated the same way as
+/// `VideoCodec`: the client advertises what it can decode in
+/// `SessionCreate`/`SessionAttach` and the server reports its choice in
+/// `SessionReady`.
+///
+/// Listed in preference order. Opus is first and, for now, alone: it is the
+/// only codec every current build encodes and decodes. The enum exists so
+/// that adding another (Vorbis has been asked for, for hosts where Opus is
+/// unavailable) is a variant plus a codec backend, rather than a wire
+/// format change once clients are deployed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioCodec {
+    Opus,
+}
+
+impl AudioCodec {
+    /// All codecs in preference order — what a current client advertises.
+    pub fn all_preferred() -> Vec<AudioCodec> {
+        vec![AudioCodec::Opus]
+    }
+
+    /// What to assume when a peer omits `supported_audio_codecs` entirely.
+    ///
+    /// Deliberately *not* `all_preferred()`, which is what the video field
+    /// defaults to. A client old enough to omit this field predates audio
+    /// negotiation, so the only codec it can possibly decode is Opus.
+    /// Defaulting to "everything" would let the server pick a newly-added
+    /// codec for a client that cannot decode it — silent broken audio — and
+    /// the bug would not appear until the second variant was added, long
+    /// after this line was written.
+    pub fn legacy_default() -> Vec<AudioCodec> {
+        vec![AudioCodec::Opus]
+    }
+
+    /// Pick the best codec this server can encode from what the peer
+    /// advertised, in the peer's preference order. `None` means no overlap —
+    /// the caller should run the session without audio rather than send a
+    /// stream the client cannot decode.
+    pub fn negotiate(advertised: &[AudioCodec], encodable: &[AudioCodec]) -> Option<AudioCodec> {
+        advertised.iter().copied().find(|c| encodable.contains(c))
+    }
+}
+
+impl std::fmt::Display for AudioCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            AudioCodec::Opus => "Opus",
+        };
+        f.write_str(s)
     }
 }
 
@@ -568,5 +636,260 @@ mod serde_bytes {
         }
 
         de.deserialize_any(BytesVisitor)
+    }
+}
+
+#[cfg(test)]
+mod audio_codec_tests {
+    use super::*;
+
+    /// Round-trip a value through CBOR the way the wire codec does.
+    fn reencode<T: Serialize, U: for<'de> Deserialize<'de>>(value: &T) -> U {
+        let mut buf = Vec::new();
+        ciborium::into_writer(value, &mut buf).expect("serialize");
+        ciborium::from_reader(buf.as_slice()).expect("deserialize")
+    }
+
+    /// A client predating audio negotiation omits `supported_audio_codecs`
+    /// entirely. It must be read as Opus-only, never as "supports everything":
+    /// the moment a second codec is added, an "everything" default would let
+    /// the server pick one the old client cannot decode.
+    ///
+    /// Modelled with a struct that mirrors SessionCreate minus the new field,
+    /// which is exactly what an old client puts on the wire.
+    #[test]
+    fn client_omitting_audio_codecs_is_treated_as_opus_only() {
+        #[derive(Serialize)]
+        struct OldSessionCreate {
+            mode: SessionMode,
+            width: u32,
+            height: u32,
+            audio: bool,
+            quality: u8,
+            desktop_shell: Option<String>,
+            encoder_preset: Option<String>,
+            encoder_crf: Option<u8>,
+            encoder_extra_params: Option<String>,
+            supported_codecs: Vec<VideoCodec>,
+        }
+
+        let old = OldSessionCreate {
+            mode: SessionMode::Desktop,
+            width: 1920,
+            height: 1080,
+            audio: true,
+            quality: 75,
+            desktop_shell: None,
+            encoder_preset: None,
+            encoder_crf: None,
+            encoder_extra_params: None,
+            supported_codecs: vec![VideoCodec::Av1],
+        };
+
+        let parsed: SessionCreate = reencode(&old);
+        assert_eq!(parsed.supported_audio_codecs, vec![AudioCodec::Opus]);
+        assert_eq!(
+            parsed.supported_audio_codecs,
+            AudioCodec::legacy_default(),
+            "the omitted-field default must stay legacy_default(), not all_preferred()",
+        );
+    }
+
+    /// Same for the attach path — a session can be resumed by a different
+    /// client build than the one that created it.
+    #[test]
+    fn attach_omitting_audio_codecs_is_treated_as_opus_only() {
+        #[derive(Serialize)]
+        struct OldSessionAttach {
+            session_id: String,
+            audio: bool,
+            quality: u8,
+            encoder_preset: Option<String>,
+            encoder_crf: Option<u8>,
+            encoder_extra_params: Option<String>,
+            supported_codecs: Vec<VideoCodec>,
+        }
+
+        let old = OldSessionAttach {
+            session_id: "s123".into(),
+            audio: true,
+            quality: 75,
+            encoder_preset: None,
+            encoder_crf: None,
+            encoder_extra_params: None,
+            supported_codecs: vec![VideoCodec::Av1],
+        };
+
+        let parsed: SessionAttach = reencode(&old);
+        assert_eq!(parsed.supported_audio_codecs, vec![AudioCodec::Opus]);
+    }
+
+    /// An older *server* does not send `audio_codec`. The client must still
+    /// parse SessionReady, and read the absence as "assume Opus".
+    #[test]
+    fn session_ready_without_audio_codec_still_parses() {
+        #[derive(Serialize)]
+        struct OldSessionReady {
+            width: u32,
+            height: u32,
+            xkb_keymap: Option<String>,
+            codec: Option<VideoCodec>,
+            session_id: String,
+        }
+
+        let old = OldSessionReady {
+            width: 1920,
+            height: 1080,
+            xkb_keymap: None,
+            codec: Some(VideoCodec::Av1),
+            session_id: "s123".into(),
+        };
+
+        let parsed: SessionReady = reencode(&old);
+        assert_eq!(parsed.audio_codec, None);
+        assert_eq!(parsed.codec, Some(VideoCodec::Av1));
+    }
+
+    /// A current client's advertisement survives the round trip untouched —
+    /// the default must not overwrite a field that was actually sent.
+    #[test]
+    fn explicit_audio_codecs_survive_the_round_trip() {
+        let create = SessionCreate {
+            mode: SessionMode::Desktop,
+            width: 1920,
+            height: 1080,
+            audio: true,
+            quality: 75,
+            desktop_shell: None,
+            encoder_preset: None,
+            encoder_crf: None,
+            encoder_extra_params: None,
+            supported_codecs: VideoCodec::all_preferred(),
+            supported_audio_codecs: vec![AudioCodec::Opus],
+        };
+
+        let parsed: SessionCreate = reencode(&create);
+        assert_eq!(parsed.supported_audio_codecs, vec![AudioCodec::Opus]);
+    }
+
+    /// New client -> OLD server: the added fields must be *ignorable*. An
+    /// older peer that has never heard of `supported_audio_codecs` has to
+    /// parse the message and skip the field rather than reject the frame.
+    ///
+    /// This is precisely what makes the audio-negotiation change additive
+    /// instead of a protocol break, so it is pinned here rather than assumed.
+    /// It holds because ciborium encodes structs as CBOR maps keyed by field
+    /// name, and serde skips unknown keys unless `deny_unknown_fields` is set.
+    #[test]
+    fn old_peer_ignores_the_new_audio_fields_on_session_create() {
+        #[derive(Deserialize)]
+        struct OldSessionCreate {
+            width: u32,
+            height: u32,
+            audio: bool,
+            supported_codecs: Vec<VideoCodec>,
+        }
+
+        let new = SessionCreate {
+            mode: SessionMode::Desktop,
+            width: 1920,
+            height: 1080,
+            audio: true,
+            quality: 75,
+            desktop_shell: None,
+            encoder_preset: None,
+            encoder_crf: None,
+            encoder_extra_params: None,
+            supported_codecs: vec![VideoCodec::Av1],
+            supported_audio_codecs: vec![AudioCodec::Opus],
+        };
+
+        let old: OldSessionCreate = reencode(&new);
+        assert_eq!(old.width, 1920);
+        assert_eq!(old.height, 1080);
+        assert!(old.audio);
+        assert_eq!(old.supported_codecs, vec![VideoCodec::Av1]);
+    }
+
+    /// New server -> OLD client, the mirror of the above: an old client must
+    /// still read SessionReady when the server announces an audio codec.
+    #[test]
+    fn old_client_ignores_the_new_audio_codec_in_session_ready() {
+        #[derive(Deserialize)]
+        struct OldSessionReady {
+            width: u32,
+            height: u32,
+            codec: Option<VideoCodec>,
+            session_id: String,
+        }
+
+        let new = SessionReady {
+            width: 1920,
+            height: 1080,
+            xkb_keymap: None,
+            codec: Some(VideoCodec::Av1),
+            audio_codec: Some(AudioCodec::Opus),
+            session_id: "s123".into(),
+        };
+
+        let old: OldSessionReady = reencode(&new);
+        assert_eq!(old.width, 1920);
+        assert_eq!(old.height, 1080);
+        assert_eq!(old.codec, Some(VideoCodec::Av1));
+        assert_eq!(old.session_id, "s123");
+    }
+
+    /// The forward-compatibility above only holds while structs go on the wire
+    /// as name-keyed maps. If this ever became a positional encoding, adding a
+    /// field would silently misalign every field after it on an old peer.
+    #[test]
+    fn structs_are_encoded_as_name_keyed_maps() {
+        let ready = SessionReady {
+            width: 1920,
+            height: 1080,
+            xkb_keymap: None,
+            codec: Some(VideoCodec::Av1),
+            audio_codec: Some(AudioCodec::Opus),
+            session_id: "s123".into(),
+        };
+
+        let mut buf = Vec::new();
+        ciborium::into_writer(&ready, &mut buf).expect("serialize");
+
+        let value: ciborium::Value = ciborium::from_reader(buf.as_slice()).expect("as value");
+        let map = value.as_map().expect("SessionReady must encode as a CBOR map, not an array");
+        let keys: Vec<String> = map
+            .iter()
+            .filter_map(|(k, _)| k.as_text().map(str::to_string))
+            .collect();
+
+        assert!(keys.contains(&"audio_codec".to_string()), "keys were {keys:?}");
+        assert!(keys.contains(&"session_id".to_string()), "keys were {keys:?}");
+    }
+
+    #[test]
+    fn negotiate_follows_the_clients_preference_order() {
+        let picked = AudioCodec::negotiate(&[AudioCodec::Opus], &[AudioCodec::Opus]);
+        assert_eq!(picked, Some(AudioCodec::Opus));
+    }
+
+    /// No shared codec must yield None, so the caller runs the session without
+    /// audio instead of streaming something undecodable.
+    #[test]
+    fn negotiate_returns_none_without_overlap() {
+        assert_eq!(AudioCodec::negotiate(&[], &[AudioCodec::Opus]), None);
+        assert_eq!(AudioCodec::negotiate(&[AudioCodec::Opus], &[]), None);
+    }
+
+    /// Every advertised codec must be one the server could conceivably pick;
+    /// guards against `all_preferred` listing a codec with no encoder.
+    #[test]
+    fn all_preferred_is_a_subset_of_the_known_codecs() {
+        for codec in AudioCodec::all_preferred() {
+            assert_eq!(
+                AudioCodec::negotiate(&[codec], &AudioCodec::all_preferred()),
+                Some(codec),
+            );
+        }
     }
 }

@@ -174,6 +174,8 @@ pub(crate) async fn open_session(
 ) -> Result<(Conn, Option<quinn::Connection>, SessionReadyInfo)> {
     let (mut framed, quic_connection) = connect_and_handshake(profile).await?;
     let supported_codecs = params.advertised_codecs();
+    // Android decodes Opus via MediaCodec; see the audio path in this module.
+    let supported_audio_codecs = termland_protocol::AudioCodec::all_preferred();
 
     match attach_to {
         Some(session_id) => {
@@ -187,6 +189,7 @@ pub(crate) async fn open_session(
                     encoder_crf: None,
                     encoder_extra_params: None,
                     supported_codecs,
+                    supported_audio_codecs: supported_audio_codecs.clone(),
                 }))
                 .await?;
         }
@@ -203,6 +206,7 @@ pub(crate) async fn open_session(
                     encoder_crf: None,
                     encoder_extra_params: None,
                     supported_codecs,
+                    supported_audio_codecs: supported_audio_codecs.clone(),
                 }))
                 .await?;
         }

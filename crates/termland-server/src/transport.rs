@@ -351,6 +351,12 @@ enum SessionRequest {
 /// unchanged from `handle_session`. This function (not `handle_session`) is
 /// where the video uni stream actually gets opened - see the `open_uni()`
 /// call below for why here specifically.
+/// Audio codecs this server can encode, in the order it would prefer them.
+/// Adding one is a new `AudioCodec` variant plus an encoder backend — the
+/// wire format already carries the negotiation.
+const SERVER_AUDIO_CODECS: &[termland_protocol::AudioCodec] =
+    &[termland_protocol::AudioCodec::Opus];
+
 async fn run_session<T>(
     framed: &mut Framed<T, TermlandCodec>,
     request: SessionRequest,
@@ -373,6 +379,7 @@ where
         encoder_crf,
         encoder_extra_params,
         supported_codecs,
+        supported_audio_codecs,
         audio,
         start_kind,
         is_new,
@@ -425,6 +432,11 @@ where
                 termland_protocol::VideoCodec::all_preferred()
             } else {
                 sc.supported_codecs
+            };
+            supported_audio_codecs = if sc.supported_audio_codecs.is_empty() {
+                termland_protocol::AudioCodec::legacy_default()
+            } else {
+                sc.supported_audio_codecs
             };
             audio = sc.audio;
             start_kind = StartKind::Create { log_path: crate::registry::log_path(&id) };
@@ -486,6 +498,11 @@ where
                 termland_protocol::VideoCodec::all_preferred()
             } else {
                 sa.supported_codecs
+            };
+            supported_audio_codecs = if sa.supported_audio_codecs.is_empty() {
+                termland_protocol::AudioCodec::legacy_default()
+            } else {
+                sa.supported_audio_codecs
             };
             audio = sa.audio;
             start_kind = StartKind::Attach {
@@ -598,14 +615,37 @@ where
         None => None,
     };
 
-    // Send SessionReady, announcing the negotiated codec so the client builds
-    // the matching decoder up front instead of guessing from the stream.
+    // Negotiate the audio codec: walk the client's preference order and take
+    // the first one this server can actually encode. Done before SessionReady
+    // so the choice can be announced alongside the video codec.
+    //
+    // `None` when the client asked for audio but shares no codec with us. The
+    // session then runs silently, which is the only safe outcome — sending a
+    // stream the client cannot decode looks like working audio that produces
+    // no sound, and is far harder to diagnose than no audio at all.
+    let audio_codec = if audio {
+        let picked =
+            termland_protocol::AudioCodec::negotiate(&supported_audio_codecs, SERVER_AUDIO_CODECS);
+        if picked.is_none() {
+            tracing::warn!(
+                "  Audio: client advertised {supported_audio_codecs:?}, none of which this \
+                 server can encode — continuing without audio",
+            );
+        }
+        picked
+    } else {
+        None
+    };
+
+    // Send SessionReady, announcing the negotiated codecs so the client builds
+    // the matching decoders up front instead of guessing from the stream.
     framed
         .send(Message::SessionReady(SessionReady {
             width: first_w,
             height: first_h,
             xkb_keymap: None,
             codec: Some(first_codec),
+            audio_codec,
             session_id: session_id.clone(),
         }))
         .await
@@ -624,16 +664,24 @@ where
         }
     );
 
-    // Optionally start audio capture if the client requested it.
-    let (mut audio_rx, _audio_stop_tx, _audio_handle) = if audio {
+    // Optionally start audio capture if the client requested it and we agreed
+    // on a codec.
+    let (mut audio_rx, _audio_stop_tx, _audio_handle) = if let Some(codec) = audio_codec {
         let (atx, arx) = tokio::sync::mpsc::channel::<AudioChunk>(8);
         let (astop_tx, astop_rx) = tokio::sync::oneshot::channel::<()>();
         let sid = session_id.clone();
         let h = std::thread::spawn(move || {
             audio_capture_thread(&sid, atx, astop_rx);
         });
-        tracing::info!("  Audio encoder: Opus 48kHz stereo 64kbps");
+        tracing::info!(
+            "  Audio encoder: {codec} {}Hz {} channel {}kbps",
+            termland_codec::audio::SAMPLE_RATE,
+            termland_codec::audio::CHANNELS,
+            termland_codec::audio::BITRATE / 1000,
+        );
         (Some(arx), Some(astop_tx), Some(h))
+    } else if audio {
+        (None, None, None)
     } else {
         tracing::info!("  Audio encoder: disabled (client did not request audio)");
         (None, None, None)
