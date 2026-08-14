@@ -446,6 +446,9 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
         Some(c) => vec![c],
         None => termland_protocol::VideoCodec::all_preferred(),
     };
+    // Everything this build can decode. Not user-selectable: unlike video,
+    // there is no reason to pin audio to one codec from the command line.
+    let supported_audio_codecs = termland_protocol::AudioCodec::all_preferred();
     match &params.attach {
         Some(id) => {
             tracing::info!("Attaching to session {id}");
@@ -457,6 +460,7 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                 encoder_crf: params.encoder_crf,
                 encoder_extra_params: params.encoder_extra_params,
                 supported_codecs,
+                supported_audio_codecs,
             })).await?;
         }
         None => {
@@ -471,6 +475,7 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                 encoder_crf: params.encoder_crf,
                 encoder_extra_params: params.encoder_extra_params,
                 supported_codecs,
+                supported_audio_codecs,
             })).await?;
         }
     }
