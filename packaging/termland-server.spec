@@ -144,6 +144,12 @@ install -Dm644 packaging/termland.pam %{buildroot}%{_sysconfdir}/pam.d/termland
 # SSH subsystem drop-in (sshd_config.d)
 install -Dm644 packaging/50-termland.conf %{buildroot}%{_sysconfdir}/ssh/sshd_config.d/50-termland.conf
 
+# TLS keypair directory. Owned by the package (0700 root:root) so the private
+# key is never world-readable, and so the service's ReadWritePaths= entry for
+# it resolves on a fresh install. Left empty: the cert is generated on first
+# start, or provisioned here out of band.
+install -dm700 %{buildroot}%{_sysconfdir}/pki/termland
+
 # Shell completions
 install -Dm644 termland-server.bash %{buildroot}%{_datadir}/bash-completion/completions/termland-server
 install -Dm644 _termland-server     %{buildroot}%{_datadir}/zsh/site-functions/_termland-server
@@ -151,6 +157,20 @@ install -Dm644 termland-server.fish %{buildroot}%{_datadir}/fish/vendor_completi
 
 %post
 %systemd_post termland-server.service
+
+# Generate the self-signed TLS keypair here rather than from the service:
+# termland-server.service runs under ProtectSystem=strict and so cannot write
+# /etc/pki itself. Idempotent, and guarded so an existing keypair is never
+# replaced — an upgrade must not change the fingerprint clients have pinned.
+# Never fail the transaction over this; the server can still be pointed at a
+# keypair via --tls-cert/--tls-key.
+if [ ! -s %{_sysconfdir}/pki/termland/cert.pem ] || [ ! -s %{_sysconfdir}/pki/termland/key.pem ]; then
+    if ! %{_bindir}/termland-server --generate-cert >/dev/null 2>&1; then
+        echo "  Note: could not generate a TLS keypair in %{_sysconfdir}/pki/termland."
+        echo "  Run 'termland-server --generate-cert' as root, or provision"
+        echo "  cert.pem/key.pem there yourself, before starting the service."
+    fi
+fi
 
 # Hint about setup
 echo ""
@@ -181,6 +201,7 @@ echo ""
 %config(noreplace) %{_sysconfdir}/sysconfig/termland-server
 %config(noreplace) %{_sysconfdir}/pam.d/termland
 %config(noreplace) %{_sysconfdir}/ssh/sshd_config.d/50-termland.conf
+%attr(0700,root,root) %dir %{_sysconfdir}/pki/termland
 %{_datadir}/bash-completion/completions/termland-server
 %{_datadir}/zsh/site-functions/_termland-server
 %{_datadir}/fish/vendor_completions.d/termland-server.fish

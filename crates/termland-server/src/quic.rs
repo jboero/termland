@@ -83,7 +83,7 @@ const MAX_CONCURRENT_SESSIONS: usize = 32;
 /// the exact same cert-loading path as `--tls` (`tls::load_or_generate_cert`
 /// via `tls::build_rustls_server_config`) rather than a separate
 /// implementation: pass `--tls-cert`/`--tls-key`, or let it auto-generate a
-/// self-signed cert in `~/.config/termland/` just like the TCP+TLS acceptor
+/// self-signed cert in `/etc/pki/termland/` just like the TCP+TLS acceptor
 /// does.
 pub async fn run_quic_listener(
     bind: &str,

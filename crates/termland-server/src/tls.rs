@@ -5,20 +5,67 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
-fn config_dir() -> PathBuf {
-    dirs_or_default("termland")
+/// System-wide PKI location, used when running as root (i.e. as the systemd
+/// service). Follows the distro convention of `/etc/pki/<app>/` rather than
+/// `dirs::config_dir()`, which for `User=root` resolves to `/root/.config` —
+/// a path `ProtectHome=` renders read-only for any hardened unit, and not
+/// somewhere an administrator would think to look for a server's keypair.
+const SYSTEM_PKI_DIR: &str = "/etc/pki/termland";
+
+fn running_as_root() -> bool {
+    // SAFETY: geteuid() is always successful and takes no arguments.
+    unsafe { libc::geteuid() == 0 }
 }
 
-fn dirs_or_default(name: &str) -> PathBuf {
-    if let Some(config) = dirs::config_dir() {
-        config.join(name)
+fn config_dir() -> PathBuf {
+    if running_as_root() {
+        PathBuf::from(SYSTEM_PKI_DIR)
     } else {
-        PathBuf::from(format!("/etc/{name}"))
+        user_config_dir()
     }
 }
 
-fn default_cert_path() -> PathBuf { config_dir().join("cert.pem") }
-fn default_key_path() -> PathBuf { config_dir().join("key.pem") }
+fn user_config_dir() -> PathBuf {
+    if let Some(config) = dirs::config_dir() {
+        config.join("termland")
+    } else {
+        PathBuf::from("/etc/termland")
+    }
+}
+
+/// Resolve the default cert + key pair together, so the two never come from
+/// different directories.
+///
+/// Root gets `/etc/pki/termland/`; an unprivileged server (SSH-subsystem
+/// mode, or someone running it by hand) keeps `~/.config/termland/`.
+///
+/// Installations predating the `/etc/pki` move generated their keypair under
+/// `~/.config/termland/`, which for the service meant `/root/.config/termland/`.
+/// If such a pair is still there and the system one is not, keep using it:
+/// silently generating a fresh cert would change the fingerprint out from
+/// under every client that has already pinned the old one.
+fn default_cert_key() -> (PathBuf, PathBuf) {
+    let dir = config_dir();
+    let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+
+    if running_as_root() && !(cert.exists() && key.exists()) {
+        let legacy = user_config_dir();
+        let (legacy_cert, legacy_key) = (legacy.join("cert.pem"), legacy.join("key.pem"));
+        if legacy_cert.exists() && legacy_key.exists() {
+            tracing::warn!(
+                "Using legacy TLS keypair in {} — the default is now {}. \
+                 Move cert.pem/key.pem there (or set --tls-cert/--tls-key) to \
+                 silence this; regenerating instead would change the \
+                 certificate fingerprint seen by existing clients.",
+                legacy.display(),
+                dir.display(),
+            );
+            return (legacy_cert, legacy_key);
+        }
+    }
+
+    (cert, key)
+}
 
 /// The crypto backend both the TCP+TLS acceptor and the QUIC listener
 /// (`crate::quic`) build their rustls configs against. Selected explicitly
@@ -40,13 +87,15 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// place that knows how to find/create the cert, not two.
 ///
 /// If `cert_path`/`key_path` are provided, loads those. Otherwise looks in
-/// `~/.config/termland/` and auto-generates a self-signed cert if missing.
+/// `/etc/pki/termland/` (root) or `~/.config/termland/` (unprivileged) and
+/// auto-generates a self-signed cert if missing — see `default_cert_key`.
 pub fn load_or_generate_cert(
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let cert_path = cert_path.map(PathBuf::from).unwrap_or_else(default_cert_path);
-    let key_path = key_path.map(PathBuf::from).unwrap_or_else(default_key_path);
+    let (default_cert, default_key) = default_cert_key();
+    let cert_path = cert_path.map(PathBuf::from).unwrap_or(default_cert);
+    let key_path = key_path.map(PathBuf::from).unwrap_or(default_key);
 
     if !cert_path.exists() || !key_path.exists() {
         tracing::info!("No TLS certificate found, generating self-signed...");
@@ -69,6 +118,36 @@ pub fn load_or_generate_cert(
 
     tracing::info!("TLS configured with {}", cert_path.display());
     Ok((certs, key))
+}
+
+/// Create the default keypair if it is missing, without building a rustls
+/// config around it. This is what the `termland-server-keygen.service`
+/// oneshot calls before the main service starts.
+///
+/// It exists because the long-running service runs under
+/// `ProtectSystem=strict` and therefore cannot write `/etc` — the same reason
+/// `sshd` does not generate its own host keys and leaves that to
+/// `sshd-keygen@.service`, which runs unsandboxed beforehand.
+///
+/// Idempotent: an existing pair is left alone, so the unit can be re-run and
+/// the condition guard in it is only an optimisation.
+pub fn generate_if_missing(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+) -> Result<(PathBuf, PathBuf)> {
+    let (default_cert, default_key) = default_cert_key();
+    let cert_path = cert_path.map(PathBuf::from).unwrap_or(default_cert);
+    let key_path = key_path.map(PathBuf::from).unwrap_or(default_key);
+
+    if cert_path.exists() && key_path.exists() {
+        tracing::info!("TLS keypair already present: {}", cert_path.display());
+        return Ok((cert_path, key_path));
+    }
+
+    generate_self_signed(&cert_path, &key_path)
+        .with_context(|| format!("generating self-signed keypair at {}", cert_path.display()))?;
+
+    Ok((cert_path, key_path))
 }
 
 /// Load or generate a TLS server configuration for the TCP+TLS acceptor.

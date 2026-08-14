@@ -25,8 +25,9 @@ struct Args {
     #[arg(short, long, default_value = "127.0.0.1")]
     bind: String,
 
-    /// Enable TLS for TCP connections. Auto-generates a self-signed cert
-    /// in ~/.config/termland/ if no --tls-cert/--tls-key is provided.
+    /// Enable TLS for TCP connections. Auto-generates a self-signed cert in
+    /// /etc/pki/termland/ (root) or ~/.config/termland/ (unprivileged) if no
+    /// --tls-cert/--tls-key is provided.
     #[arg(long)]
     tls: bool,
 
@@ -37,6 +38,13 @@ struct Args {
     /// Path to TLS private key PEM file (implies --tls)
     #[arg(long)]
     tls_key: Option<String>,
+
+    /// Generate the self-signed TLS keypair if it is missing, then exit.
+    /// Run by termland-server-keygen.service before the main service starts,
+    /// because the service itself runs under ProtectSystem=strict and cannot
+    /// write /etc/pki/termland. Idempotent — an existing keypair is kept.
+    #[arg(long)]
+    generate_cert: bool,
 
     /// Require PAM authentication before session creation.
     /// Uses the "termland" PAM service, falling back to "login".
@@ -117,6 +125,15 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    if args.generate_cert {
+        let cert = args.tls_cert.as_deref().map(std::path::Path::new);
+        let key = args.tls_key.as_deref().map(std::path::Path::new);
+        let (cert, key) = tls::generate_if_missing(cert, key)?;
+        tracing::info!("TLS certificate: {}", cert.display());
+        tracing::info!("TLS private key:  {}", key.display());
+        return Ok(());
+    }
 
     if args.subsystem {
         tracing::info!("Starting in SSH subsystem mode");
