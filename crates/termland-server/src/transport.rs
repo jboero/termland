@@ -215,8 +215,20 @@ where
         None
     };
 
-    // Ensure the session registry directory exists.
-    let _ = crate::registry::ensure_dir();
+    // Ensure the session registry directory exists. Do not discard the error:
+    // when this fails, the session still proceeds and dies much later with a
+    // bare "open log <path>: No such file or directory" from the compositor
+    // spawn, which names the symptom and hides the cause (issue #8). The
+    // usual culprit is unit sandboxing — ProtectHome= covers /run/user, not
+    // just /home and /root — or an XDG_RUNTIME_DIR that logind has reaped.
+    if let Err(e) = crate::registry::ensure_dir() {
+        tracing::error!(
+            "Failed to create session registry directory {}: {e} \
+             (session creation will fail; check the service unit's sandboxing \
+             and XDG_RUNTIME_DIR)",
+            crate::registry::base_dir().display(),
+        );
+    }
 
     // Session control loop. The client either manages sessions (list / close) or
     // starts one — create a new persistent session, or attach to an existing one
