@@ -731,6 +731,26 @@ where
     let mut current_width = first_w;
     let mut current_height = first_h;
 
+    // Window enumeration for the client's task list (issue #1). Optional in
+    // exactly the way OutputResizer is: a compositor without
+    // zwlr_foreign_toplevel_management_v1 simply means no window list, never a
+    // failed session.
+    let mut toplevels = match termland_compositor::ToplevelWatcher::connect(
+        &wayland_display,
+        std::path::Path::new(&compositor_runtime_dir),
+    ) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            tracing::info!("Window enumeration unavailable: {e}");
+            None
+        }
+    };
+    let mut last_windows: Vec<termland_protocol::WindowInfo> = Vec::new();
+    // Polled rather than event-driven: the Wayland connection is blocking, and
+    // half a second is well inside what a task list needs while costing
+    // nothing when nothing changes (the list is only sent on change).
+    let mut window_poll = tokio::time::interval(tokio::time::Duration::from_millis(500));
+
     // How this streaming session ends. Default: the client detached (the
     // compositor keeps running and the session stays resumable).
     let mut outcome = SessionOutcome::Detached;
@@ -738,6 +758,44 @@ where
     // Main event loop
     loop {
         tokio::select! {
+            // Window list, sent only when it differs from what the client was
+            // last told — a desktop sitting idle produces no traffic here.
+            _ = window_poll.tick(), if toplevels.is_some() => {
+                let watcher = toplevels.as_mut().expect("guarded by the branch condition");
+                match watcher.poll() {
+                    Ok(list) => {
+                        let windows: Vec<_> = list
+                            .into_iter()
+                            .map(|w| termland_protocol::WindowInfo {
+                                id: w.id,
+                                title: w.title,
+                                app_id: w.app_id,
+                                minimized: w.minimized,
+                                maximized: w.maximized,
+                                fullscreen: w.fullscreen,
+                                activated: w.activated,
+                            })
+                            .collect();
+                        if windows != last_windows {
+                            last_windows.clone_from(&windows);
+                            if let Err(e) = framed
+                                .send(Message::WindowList(termland_protocol::WindowList { windows }))
+                                .await
+                            {
+                                tracing::error!("Failed to send window list: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Losing this connection must not take the session
+                        // with it; drop the feature and keep streaming.
+                        tracing::warn!("Window enumeration stopped: {e}");
+                        toplevels = None;
+                    }
+                }
+            }
+
             frame = frame_rx.recv() => {
                 let Some(frame) = frame else {
                     // Capture thread ended because the compositor exited.

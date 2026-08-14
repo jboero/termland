@@ -40,6 +40,8 @@ pub enum MessageId {
     /// whole so the client can paste them as real files. See
     /// [`FileTransferPayload`] for the MVP size/chunking limitation.
     FileTransferData = 0x25,
+    /// Windows currently open inside the session (see [`WindowList`]).
+    WindowList = 0x26,
 
     // Client -> Server data
     KeyEvent = 0x40,
@@ -79,6 +81,7 @@ impl MessageId {
             0x23 => Some(Self::CursorUpdate),
             0x24 => Some(Self::ClipboardData),
             0x25 => Some(Self::FileTransferData),
+            0x26 => Some(Self::WindowList),
             0x40 => Some(Self::KeyEvent),
             0x41 => Some(Self::MouseMove),
             0x42 => Some(Self::MouseButton),
@@ -120,6 +123,7 @@ pub enum Message {
     CursorUpdate(CursorUpdate),
     ClipboardData(ClipboardPayload),
     FileTransferData(FileTransferPayload),
+    WindowList(WindowList),
 
     // Client -> Server input
     KeyEvent(super::input::KeyEvent),
@@ -157,6 +161,7 @@ impl Message {
             Self::CursorUpdate(_) => MessageId::CursorUpdate,
             Self::ClipboardData(_) => MessageId::ClipboardData,
             Self::FileTransferData(_) => MessageId::FileTransferData,
+            Self::WindowList(_) => MessageId::WindowList,
             Self::KeyEvent(_) => MessageId::KeyEvent,
             Self::MouseMove(_) => MessageId::MouseMove,
             Self::MouseButton(_) => MessageId::MouseButton,
@@ -569,6 +574,44 @@ pub struct FileTransferPayload {
     pub files: Vec<FileEntry>,
 }
 
+/// One window open inside the session.
+///
+/// Sourced from `zwlr_foreign_toplevel_management_v1` on the session
+/// compositor, which labwc implements. This exists because the in-session
+/// panel cannot be relied on to show a task list: KDE's taskbar speaks only
+/// `org_kde_plasma_window_management` (a KWin protocol), so on labwc it shows
+/// nothing — see issue #1. Surfacing the list here means a client can offer a
+/// window switcher regardless of which panel, if any, runs in the session,
+/// including `App` (kiosk) sessions that have no panel at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowInfo {
+    /// Stable for the window's lifetime and never reused, so a client can
+    /// hold on to it across updates. Not a compositor object id — those do
+    /// not survive being sent over the wire.
+    pub id: u32,
+    pub title: String,
+    /// Application identifier, e.g. `org.kde.konsole`. Usually but not
+    /// always a desktop-entry name, so a client that cannot resolve it to an
+    /// icon should fall back rather than treat it as an error.
+    pub app_id: String,
+    pub minimized: bool,
+    pub maximized: bool,
+    pub fullscreen: bool,
+    /// Whether this window currently has focus.
+    pub activated: bool,
+}
+
+/// Server -> client: the full window list, sent on change rather than on
+/// request.
+///
+/// Always complete, never a delta. A window absent from a later list has
+/// closed. Deltas would need sequencing to survive a dropped update, and the
+/// list is small enough that resending it is cheaper than getting that right.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowList {
+    pub windows: Vec<WindowInfo>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityHintMsg {
     pub max_fps: u8,
@@ -891,5 +934,92 @@ mod audio_codec_tests {
                 Some(codec),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod window_list_tests {
+    use super::*;
+
+    fn reencode<T: Serialize, U: for<'de> Deserialize<'de>>(value: &T) -> U {
+        let mut buf = Vec::new();
+        ciborium::into_writer(value, &mut buf).expect("serialize");
+        ciborium::from_reader(buf.as_slice()).expect("deserialize")
+    }
+
+    fn window(id: u32) -> WindowInfo {
+        WindowInfo {
+            id,
+            title: "bash — Konsole".into(),
+            app_id: "org.kde.konsole".into(),
+            minimized: false,
+            maximized: true,
+            fullscreen: false,
+            activated: true,
+        }
+    }
+
+    /// A new message id must not collide with an existing one, or an older
+    /// peer would route the frame to the wrong handler rather than skipping it.
+    #[test]
+    fn window_list_has_a_distinct_message_id() {
+        let msg = Message::WindowList(WindowList { windows: Vec::new() });
+        assert_eq!(msg.message_id(), MessageId::WindowList);
+        assert_eq!(MessageId::from_u8(0x26), Some(MessageId::WindowList));
+
+        for id in 0x01u8..=0x25 {
+            if let Some(other) = MessageId::from_u8(id) {
+                assert_ne!(other, MessageId::WindowList, "id 0x{id:02x} collides");
+            }
+        }
+    }
+
+    #[test]
+    fn window_list_round_trips() {
+        let list = WindowList { windows: vec![window(1), window(2)] };
+        let parsed: WindowList = reencode(&list);
+        assert_eq!(parsed, list);
+    }
+
+    /// A window that has mapped but not yet named itself is legitimate, and
+    /// must survive the round trip rather than being dropped — otherwise it
+    /// would flicker in and out of a client's task list as it starts up.
+    #[test]
+    fn unnamed_windows_survive_the_round_trip() {
+        let list = WindowList {
+            windows: vec![WindowInfo {
+                id: 9,
+                title: String::new(),
+                app_id: String::new(),
+                minimized: false,
+                maximized: false,
+                fullscreen: false,
+                activated: false,
+            }],
+        };
+        let parsed: WindowList = reencode(&list);
+        assert_eq!(parsed.windows.len(), 1);
+        assert_eq!(parsed.windows[0].id, 9);
+    }
+
+    /// An empty list means "everything closed" and is distinct from never
+    /// having sent one, so it must not be optimised away.
+    #[test]
+    fn empty_window_list_round_trips() {
+        let parsed: WindowList = reencode(&WindowList { windows: Vec::new() });
+        assert!(parsed.windows.is_empty());
+    }
+
+    /// Ids are what a client keys its task-list entries on, so they have to
+    /// survive serialisation exactly — a client tracking selection across
+    /// updates depends on it.
+    #[test]
+    fn window_ids_are_preserved_exactly() {
+        let list = WindowList {
+            windows: vec![window(1), window(7), window(u32::MAX)],
+        };
+        let parsed: WindowList = reencode(&list);
+        let ids: Vec<u32> = parsed.windows.iter().map(|w| w.id).collect();
+        assert_eq!(ids, vec![1, 7, u32::MAX]);
     }
 }
