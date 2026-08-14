@@ -157,6 +157,10 @@ struct App {
     bar_layout: Option<BarLayout>,
     /// Menubar item currently under the mouse (for hover highlight).
     bar_hovered: Option<BarItem>,
+    /// Windows open inside the session, as last reported by the server.
+    /// Replaced wholesale on each update: the server always sends the complete
+    /// list, never a delta.
+    session_windows: Vec<termland_protocol::WindowInfo>,
     /// Is the menubar currently visible? Off by default — toggle with F10.
     bar_visible: bool,
     /// Is the window currently fullscreen? (also hides the menubar)
@@ -198,6 +202,7 @@ impl App {
             cursor_win_x: 0.0, cursor_win_y: 0.0,
             cursor_in_window: false,
             remote_cursor: RemoteCursor::default(),
+            session_windows: Vec::new(),
             data_rate: 0,
             last_title: String::new(),
             bar_layout: None,
@@ -295,6 +300,9 @@ impl App {
             BarItem::ClientCursor => {
                 self.menu.client_cursor = !self.menu.client_cursor;
                 self.send_cmd(ClientCommand::SetCursorInFrame(!self.menu.client_cursor));
+            }
+            BarItem::Windows => {
+                self.menu.show_windows = !self.menu.show_windows;
             }
             BarItem::Fullscreen => {
                 self.toggle_fullscreen();
@@ -397,6 +405,9 @@ impl App {
                 }
                 ServerEvent::DataRate { bytes_per_sec } => {
                     self.data_rate = bytes_per_sec;
+                }
+                ServerEvent::WindowList(windows) => {
+                    self.session_windows = windows;
                 }
                 ServerEvent::CursorUpdate(cu) => {
                     self.remote_cursor = RemoteCursor {
@@ -535,14 +546,31 @@ impl App {
                     &mut buffer, ww_nz.get(), wh_nz.get(),
                     self.menu.show_data_rate,
                     self.menu.client_cursor,
+                    self.menu.show_windows,
                     self.fullscreen,
                     self.data_rate,
+                    self.session_windows.len(),
                     self.bar_hovered,
                 );
                 self.bar_layout = Some(layout);
             } else {
                 self.bar_layout = None;
                 self.bar_hovered = None;
+            }
+
+            // Window list panel. Sits under the menubar when that is showing,
+            // otherwise at the top of the screen.
+            if self.menu.show_windows {
+                let top = if self.bar_visible && !self.fullscreen {
+                    overlay::MENUBAR_HEIGHT
+                } else {
+                    0
+                };
+                overlay::draw_window_list(
+                    &mut buffer, ww_nz.get(), wh_nz.get(),
+                    &self.session_windows,
+                    top,
+                );
             }
 
             // Reconnect status banner: drawn over the frozen last frame

@@ -20,6 +20,10 @@ pub enum ServerEvent {
     /// Carries no position - see the note on `RemoteCursor` in display.rs for
     /// why position stays purely locally-tracked.
     CursorUpdate(CursorUpdate),
+    /// The set of windows open inside the session changed. Sent by the
+    /// server on change only, and always the complete list — a window absent
+    /// from a later one has closed. Drives the window list overlay.
+    WindowList(Vec<termland_protocol::WindowInfo>),
     #[allow(dead_code)]
     Pong(Pong),
     /// The server explicitly ended the session: it sent us a `SessionEnd`
@@ -583,6 +587,9 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                     Some(Ok(Message::CursorUpdate(cu))) => {
                         bytes_since_report += cu.image_rgba.len() as u64;
                         let _ = server_tx.send(ServerEvent::CursorUpdate(cu));
+                    }
+                    Some(Ok(Message::WindowList(list))) => {
+                        let _ = server_tx.send(ServerEvent::WindowList(list.windows));
                     }
                     Some(Ok(Message::ClipboardData(cp))) => {
                         tracing::debug!("Clipboard received ({} bytes)", cp.data.len());
