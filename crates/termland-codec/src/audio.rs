@@ -12,6 +12,10 @@ pub const SAMPLE_RATE: u32 = 48000;
 pub const CHANNELS: u8 = 2;
 /// Opus frame size: 20ms at 48kHz = 960 samples per channel.
 pub const FRAME_SIZE: usize = 960;
+/// Target encoder bitrate, in bits per second. Public so the server logs the
+/// rate it is actually encoding at rather than a separately-written constant
+/// that can drift from this one.
+pub const BITRATE: i32 = 32_000;
 
 pub struct OpusEncoder {
     encoder: opus::Encoder,
@@ -24,7 +28,7 @@ impl OpusEncoder {
             opus::Channels::Stereo,
             opus::Application::Audio,
         )?;
-        encoder.set_bitrate(opus::Bitrate::Bits(32000))?;
+        encoder.set_bitrate(opus::Bitrate::Bits(BITRATE))?;
         encoder.set_inband_fec(true)?;
         encoder.set_dtx(true)?;
         Ok(Self { encoder })

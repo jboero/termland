@@ -31,7 +31,7 @@ use futures::{SinkExt, StreamExt};
 use tokio_util::codec::Framed;
 
 use termland_protocol::{
-    FrameType, Hello, Message, SessionCreate, SessionMode, TermlandCodec, VideoCodec,
+    AudioCodec, FrameType, Hello, Message, SessionCreate, SessionMode, TermlandCodec, VideoCodec,
     PROTOCOL_VERSION,
 };
 
@@ -195,6 +195,7 @@ async fn quic_q2_video_stream_carries_real_frames() {
             encoder_crf: None,
             encoder_extra_params: None,
             supported_codecs: VideoCodec::all_preferred(),
+            supported_audio_codecs: AudioCodec::all_preferred(),
         }))
         .await
         .expect("send SessionCreate");
