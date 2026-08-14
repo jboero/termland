@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.6.1
+%global version 0.7.0
 # find-debuginfo can produce an empty debugsourcefiles.list for a Rust
 # binary (unlike typical C sources), which newer Fedora's rpmbuild tolerates
 # but EL8's treats as a hard error ("Empty %%files file ... debugsourcefiles
@@ -20,7 +20,7 @@
 
 Name:           termland-server
 Version:        %{version}
-Release:        2%{?dist}
+Release:        1%{?dist}
 Summary:        Termland remote desktop server — stream Wayland sessions via AV1/VP9/HEVC/H.264/Opus
 
 License:        LGPL-3.0-or-later
@@ -186,6 +186,38 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Fri Aug 14 2026 John Boero - 0.7.0-1
+- Fix service sandboxing that blocked session startup and cert generation.
+  ProtectHome=read-only covers /home, /root AND /run/user, all three of which
+  the server must write. This was the single cause of three user reports:
+  first-run TLS cert generation failing, the compositor dying before it could
+  create its Wayland socket, and a session failing with a misleading
+  "No such file or directory" for its logfile.
+- TLS keypair moves to /etc/pki/termland/ and is generated at install time via
+  the new "termland-server --generate-cert", since the hardened service cannot
+  write /etc. An existing keypair under /root/.config/termland/ is still used,
+  so upgrades do not change a fingerprint clients have already pinned.
+- Session registry and compositor logs move from /run/user/<uid> to
+  RuntimeDirectory=termland. logind creates /run/user/0 only for a real root
+  login and removes it when the last one ends, deleting live state under a
+  running service.
+- Sessions no longer hijack the machine's default audio sink. Applications in a
+  session are routed with PULSE_SINK instead, so starting a session no longer
+  silences the local desktop, and a crashed server no longer leaves the default
+  pointed at a dead sink.
+- Negotiate the audio codec instead of assuming Opus. Wire-compatible in both
+  directions; Opus remains the only codec.
+- Enumerate session windows and send them to the client, so a client can offer
+  a task list. KDE's own taskbar cannot do this on labwc: it speaks only
+  org_kde_plasma_window_management, which is a KWin protocol.
+- Document the wire protocol and its data structures in docs/protocol.md.
+- Add CI, and stop the integration tests stranding a desktop session per run.
+
+  UPGRADE NOTE: the runtime directory move means detached sessions created by a
+  pre-0.7.0 server are not visible to the new one. Their compositors keep
+  running, orphaned. Close sessions before upgrading, or terminate the
+  leftover compositor processes by hand afterwards.
+
 * Thu Aug 6 2026 John Boero - 0.6.1-2
 - Disable debuginfo package generation (%%global debug_package %%{nil}):
   find-debuginfo produces an empty debugsourcefiles.list for this Rust

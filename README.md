@@ -324,6 +324,34 @@ The client RPM installs:
 
 See [ROADMAP.md](ROADMAP.md) for the full detail behind each item.
 
+## Maintainers wanted
+
+Termland has one maintainer, which means every change is reviewed and merged by
+the person who wrote it. That has been workable while the project was small. It
+is not a good long-term arrangement for something people are now running on
+their machines: a second pair of eyes catches things the author cannot, and a
+single maintainer is also a single point of failure for security reports and
+releases.
+
+If you would like to help review and merge, please open an issue or say so on
+an existing one. Useful background, in rough order of how much it helps:
+
+- **Wayland compositor internals** — `termland-compositor` drives labwc/cage
+  over wlroots protocols (screencopy, output management, virtual input,
+  foreign-toplevel). Most of the hard bugs live here.
+- **Video/audio codecs and FFmpeg** — encoder/decoder backend selection and
+  fallback in `termland-codec`.
+- **RPM packaging and systemd** — the service unit's sandboxing has already
+  been the cause of three separate user-facing bugs.
+- **Android/Kotlin** — the mobile client and its UniFFI core.
+- **Testing** — see [#4](https://github.com/jboero/termland/issues/4) and
+  [#6](https://github.com/jboero/termland/issues/6); coverage is thin in
+  places and the honest boundary of what is worth testing is still being drawn.
+
+Reviewing a pull request or reproducing a bug report is genuinely useful and
+does not require any commitment beyond that. Contributions are AI-assisted;
+see [AGENTS.md](AGENTS.md) for how that is recorded and reviewed.
+
 ## License
 
 LGPL-3.0-or-later
