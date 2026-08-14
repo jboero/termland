@@ -18,6 +18,7 @@ pub fn launch_detached(
     app_args: &[String],
     log_path: &Path,
     run_as: Option<&str>,
+    audio_sink: Option<&str>,
 ) -> Result<DetachedBackend, CompositorError> {
     let inner = if app_args.is_empty() {
         app_cmd.to_string()
@@ -26,7 +27,7 @@ pub fn launch_detached(
     };
     tracing::info!("Launching detached cage: {inner} ({width}x{height})");
 
-    let (mut cmd, runtime_dir) = detached_compositor_command("cage", width, height, log_path, run_as)?;
+    let (mut cmd, runtime_dir) = detached_compositor_command("cage", width, height, log_path, run_as, audio_sink)?;
     cmd.arg("-d")
         .arg("--")
         .arg("sh")
