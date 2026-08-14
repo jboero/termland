@@ -43,6 +43,94 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Closes the persistent session this test creates, even if an assertion
+/// panics part-way through.
+///
+/// Killing the server child is **not** sufficient. Compositors are
+/// deliberately `setsid`-detached so they outlive the server process — that
+/// is the whole point of resumable sessions — so a test that only kills the
+/// server strands a full desktop session (labwc + the configured shell, here
+/// `plasmashell` and a terminal) on the machine for every run, forever.
+///
+/// Teardown goes through the server binary's own `--close-session` rather
+/// than the wire protocol for two reasons: `Drop` is synchronous, so it
+/// cannot await a `SessionClose` send, and it must still work on the unwind
+/// path where the connection may already be gone. Reading the registry
+/// directly is exactly what `--close-session` does, and it works whether or
+/// not the server child is still alive.
+struct SessionGuard {
+    bin: &'static str,
+    session_id: Option<String>,
+}
+
+impl SessionGuard {
+    fn new(bin: &'static str) -> Self {
+        Self { bin, session_id: None }
+    }
+
+    /// Start tracking the session announced in `SessionReady`. An empty id
+    /// means the server did not create a persistent session, so there is
+    /// nothing to clean up.
+    fn track(&mut self, session_id: &str) {
+        if !session_id.is_empty() {
+            self.session_id = Some(session_id.to_string());
+        }
+    }
+}
+
+impl SessionGuard {
+    /// Unload the session's PulseAudio null sink.
+    ///
+    /// The server creates it and unloads it on graceful shutdown, but this
+    /// harness kills the child, so that cleanup never runs and the sink is
+    /// left behind with nothing alive that owns it. Best-effort: `pactl` is
+    /// absent on headless CI, and a run with no audio never created one.
+    fn unload_null_sink(id: &str) {
+        let sink = format!("termland_{}", id.replace('-', "_"));
+        let Ok(out) = Command::new("pactl").args(["list", "short", "modules"]).output() else {
+            return;
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if !line.contains(&format!("sink_name={sink}")) {
+                continue;
+            }
+            if let Some(module_id) = line.split_whitespace().next() {
+                let _ = Command::new("pactl").args(["unload-module", module_id]).output();
+                eprintln!("[test] unloaded null sink {sink} (module {module_id})");
+            }
+        }
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let Some(id) = self.session_id.take() else {
+            return;
+        };
+        Self::unload_null_sink(&id);
+        match Command::new(self.bin).args(["--close-session", &id]).output() {
+            Ok(out) if out.status.success() => {
+                eprintln!("[test] closed session {id}");
+            }
+            Ok(out) => {
+                // Loud, because the cost of missing this is a stray desktop
+                // session that nothing will ever reap.
+                eprintln!(
+                    "[test] WARNING: failed to close session {id} — it may still be running. \
+                     stderr: {}",
+                    String::from_utf8_lossy(&out.stderr).trim(),
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[test] WARNING: could not run --close-session for {id}: {e}. \
+                     Close it by hand with: termland-server --close-session {id}",
+                );
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct AcceptAnyCert;
 impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
@@ -111,6 +199,9 @@ async fn quic_q2_video_stream_carries_real_frames() {
         .spawn()
         .expect("failed to spawn termland-server");
     let mut guard = ChildGuard(child);
+    // Declared after `guard` so it drops *first*: the session is closed while
+    // the server is still up, and before the child is reaped.
+    let mut session_guard = SessionGuard::new(bin);
 
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
@@ -214,6 +305,10 @@ async fn quic_q2_video_stream_carries_real_frames() {
         }
         other => panic!("expected SessionReady, got {other:?}"),
     };
+    // Register for teardown as early as possible — every assertion below this
+    // point can panic, and each one would otherwise leak the session.
+    session_guard.track(&ready.session_id);
+
     let negotiated_codec = ready.codec.expect("server always announces a codec in SessionReady");
 
     // --- Video plane: read one real frame off the Q2 uni stream. ---
