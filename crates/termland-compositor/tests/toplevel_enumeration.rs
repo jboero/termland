@@ -104,11 +104,19 @@ fn enumerates_a_real_window_from_labwc() {
         .expect("no terminal emulator available to open a window with");
     eprintln!("[test] using {app} as the window to find");
 
+    // The session command is a plain sleep, not the terminal. labwc exits when
+    // its -S command exits, so launching the window client here would couple
+    // the compositor's lifetime to it: any failure in the terminal killed
+    // labwc, and the test then failed with a Wayland "broken pipe" that named
+    // neither the terminal nor the reason. That was intermittent on CI and
+    // took two failed runs to characterise.
+    //
+    // With the compositor held open independently, a terminal that fails to
+    // start produces "no windows enumerated" plus the compositor log, which
+    // says what actually happened.
     let child = Command::new("labwc")
         .arg("-S")
-        .arg(format!(
-            "sh -c 'echo \"TERMLAND_SOCKET:$WAYLAND_DISPLAY\" >&2; exec {app}'"
-        ))
+        .arg("sh -c 'echo \"TERMLAND_SOCKET:$WAYLAND_DISPLAY\" >&2; exec sleep 300'")
         .env("WLR_BACKENDS", "headless")
         .env("WLR_HEADLESS_OUTPUTS", "1")
         .env("WLR_HEADLESS_OUTPUT_MODE", "1280x720")
@@ -132,6 +140,16 @@ fn enumerates_a_real_window_from_labwc() {
     };
     eprintln!("[test] labwc up on {display}");
 
+    // Now open a window *as a separate client* of that compositor.
+    let mut app_child = Command::new(&app)
+        .env("WAYLAND_DISPLAY", &display)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env_remove("DISPLAY")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {app}: {e}"));
+
     let mut watcher = ToplevelWatcher::connect(&display, &runtime_dir)
         .expect("labwc must advertise zwlr_foreign_toplevel_management_v1");
 
@@ -148,12 +166,23 @@ fn enumerates_a_real_window_from_labwc() {
 
     eprintln!("[test] enumerated {} window(s): {windows:#?}", windows.len());
 
-    assert!(
-        !windows.is_empty(),
-        "no windows enumerated — labwc advertised the protocol but reported \
-         nothing. Compositor output:\n{}",
-        dump_log(&log),
-    );
+    if windows.is_empty() {
+        // Include the window client's own stderr: if it refused to start (no
+        // font, no shm, no socket) it says so there, and that is the actual
+        // answer rather than "the list was empty".
+        let _ = app_child.kill();
+        let mut client_err = String::new();
+        if let Some(mut e) = app_child.stderr.take() {
+            use std::io::Read;
+            let _ = e.read_to_string(&mut client_err);
+        }
+        panic!(
+            "no windows enumerated after 15s.\nCompositor output:\n{}\n\
+             {app} output:\n  {}",
+            dump_log(&log),
+            if client_err.trim().is_empty() { "(none)" } else { client_err.trim() },
+        );
+    }
     assert!(
         windows.iter().any(|w| !w.app_id.is_empty() || !w.title.is_empty()),
         "a window was found but carried neither app_id nor title, so a task list \
@@ -167,6 +196,8 @@ fn enumerates_a_real_window_from_labwc() {
     let after: Vec<u32> = again.iter().map(|w| w.id).collect();
     assert_eq!(before, after, "window ids changed between polls");
 
+    let _ = app_child.kill();
+    let _ = app_child.wait();
     let _ = guard.0.kill();
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(3) {
