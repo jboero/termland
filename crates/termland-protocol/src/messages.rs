@@ -772,6 +772,101 @@ mod audio_codec_tests {
         assert_eq!(parsed.supported_audio_codecs, vec![AudioCodec::Opus]);
     }
 
+    /// New client -> OLD server: the added fields must be *ignorable*. An
+    /// older peer that has never heard of `supported_audio_codecs` has to
+    /// parse the message and skip the field rather than reject the frame.
+    ///
+    /// This is precisely what makes the audio-negotiation change additive
+    /// instead of a protocol break, so it is pinned here rather than assumed.
+    /// It holds because ciborium encodes structs as CBOR maps keyed by field
+    /// name, and serde skips unknown keys unless `deny_unknown_fields` is set.
+    #[test]
+    fn old_peer_ignores_the_new_audio_fields_on_session_create() {
+        #[derive(Deserialize)]
+        struct OldSessionCreate {
+            width: u32,
+            height: u32,
+            audio: bool,
+            supported_codecs: Vec<VideoCodec>,
+        }
+
+        let new = SessionCreate {
+            mode: SessionMode::Desktop,
+            width: 1920,
+            height: 1080,
+            audio: true,
+            quality: 75,
+            desktop_shell: None,
+            encoder_preset: None,
+            encoder_crf: None,
+            encoder_extra_params: None,
+            supported_codecs: vec![VideoCodec::Av1],
+            supported_audio_codecs: vec![AudioCodec::Opus],
+        };
+
+        let old: OldSessionCreate = reencode(&new);
+        assert_eq!(old.width, 1920);
+        assert_eq!(old.height, 1080);
+        assert!(old.audio);
+        assert_eq!(old.supported_codecs, vec![VideoCodec::Av1]);
+    }
+
+    /// New server -> OLD client, the mirror of the above: an old client must
+    /// still read SessionReady when the server announces an audio codec.
+    #[test]
+    fn old_client_ignores_the_new_audio_codec_in_session_ready() {
+        #[derive(Deserialize)]
+        struct OldSessionReady {
+            width: u32,
+            height: u32,
+            codec: Option<VideoCodec>,
+            session_id: String,
+        }
+
+        let new = SessionReady {
+            width: 1920,
+            height: 1080,
+            xkb_keymap: None,
+            codec: Some(VideoCodec::Av1),
+            audio_codec: Some(AudioCodec::Opus),
+            session_id: "s123".into(),
+        };
+
+        let old: OldSessionReady = reencode(&new);
+        assert_eq!(old.width, 1920);
+        assert_eq!(old.height, 1080);
+        assert_eq!(old.codec, Some(VideoCodec::Av1));
+        assert_eq!(old.session_id, "s123");
+    }
+
+    /// The forward-compatibility above only holds while structs go on the wire
+    /// as name-keyed maps. If this ever became a positional encoding, adding a
+    /// field would silently misalign every field after it on an old peer.
+    #[test]
+    fn structs_are_encoded_as_name_keyed_maps() {
+        let ready = SessionReady {
+            width: 1920,
+            height: 1080,
+            xkb_keymap: None,
+            codec: Some(VideoCodec::Av1),
+            audio_codec: Some(AudioCodec::Opus),
+            session_id: "s123".into(),
+        };
+
+        let mut buf = Vec::new();
+        ciborium::into_writer(&ready, &mut buf).expect("serialize");
+
+        let value: ciborium::Value = ciborium::from_reader(buf.as_slice()).expect("as value");
+        let map = value.as_map().expect("SessionReady must encode as a CBOR map, not an array");
+        let keys: Vec<String> = map
+            .iter()
+            .filter_map(|(k, _)| k.as_text().map(str::to_string))
+            .collect();
+
+        assert!(keys.contains(&"audio_codec".to_string()), "keys were {keys:?}");
+        assert!(keys.contains(&"session_id".to_string()), "keys were {keys:?}");
+    }
+
     #[test]
     fn negotiate_follows_the_clients_preference_order() {
         let picked = AudioCodec::negotiate(&[AudioCodec::Opus], &[AudioCodec::Opus]);
