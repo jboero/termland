@@ -64,6 +64,13 @@ jobs:
       - name: Run unit tests
         run: cargo test --workspace --locked --lib --bins
 
+      # Decodes wire bytes captured from every released version. Runs here
+      # rather than in the integration job because it needs no compositor —
+      # and a protocol break should fail fast, on every PR, not behind a
+      # ten-minute container build.
+      - name: Cross-version wire compatibility
+        run: cargo test --workspace --locked --test wire_compatibility
+
       - name: Check the RPM specs still parse
         run: |
           dnf install -y --setopt=install_weak_deps=False rpm-build
