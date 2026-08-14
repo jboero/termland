@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use termland_compositor::ToplevelWatcher;
@@ -53,20 +54,42 @@ fn first_on_path(names: &[&str]) -> Option<String> {
 /// Uses the same `TERMLAND_SOCKET:` marker the production launcher relies on
 /// (`backend::startup_command_with_socket_echo`) rather than trying to parse
 /// labwc's own logging, which is not a stable interface.
-fn wait_for_socket(child: &mut Child, timeout: Duration) -> Option<String> {
+fn wait_for_socket(
+    child: &mut Child,
+    timeout: Duration,
+    log: Arc<Mutex<Vec<String>>>,
+) -> Option<String> {
     use std::io::{BufRead, BufReader};
     let stderr = child.stderr.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
+    // Keep draining after the socket appears rather than returning. The
+    // interesting output is what comes *later* — the startup command dying
+    // takes labwc with it, and the test then fails on a broken pipe that says
+    // nothing about why. Everything is kept so a failure can print it.
     std::thread::spawn(move || {
+        let mut announced = false;
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            eprintln!("[labwc] {line}");
-            if let Some(name) = line.strip_prefix("TERMLAND_SOCKET:") {
-                let _ = tx.send(name.trim().to_string());
-                return;
+            log.lock().unwrap().push(line.clone());
+            if !announced {
+                if let Some(name) = line.strip_prefix("TERMLAND_SOCKET:") {
+                    announced = true;
+                    let _ = tx.send(name.trim().to_string());
+                }
             }
         }
     });
     rx.recv_timeout(timeout).ok()
+}
+
+/// Print everything the compositor said. Called on the failure paths, where
+/// the Wayland-level error ("broken pipe") is a consequence rather than a
+/// cause.
+fn dump_log(log: &Arc<Mutex<Vec<String>>>) -> String {
+    let lines = log.lock().unwrap();
+    if lines.is_empty() {
+        return "  (compositor produced no output)".to_string();
+    }
+    lines.iter().map(|l| format!("  [labwc] {l}")).collect::<Vec<_>>().join("\n")
 }
 
 #[test]
@@ -99,23 +122,37 @@ fn enumerates_a_real_window_from_labwc() {
     // an unguarded compositor would outlive the test run.
     let mut guard = LabwcGuard(child);
 
-    let display = wait_for_socket(&mut guard.0, Duration::from_secs(15))
-        .expect("labwc never announced a wayland socket");
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let display = match wait_for_socket(&mut guard.0, Duration::from_secs(15), log.clone()) {
+        Some(d) => d,
+        None => panic!(
+            "labwc never announced a wayland socket. Compositor output:\n{}",
+            dump_log(&log)
+        ),
+    };
     eprintln!("[test] labwc up on {display}");
 
     let mut watcher = ToplevelWatcher::connect(&display, &runtime_dir)
         .expect("labwc must advertise zwlr_foreign_toplevel_management_v1");
 
     // The terminal needs a moment to actually map its window.
-    let windows = watcher
-        .poll_until_any(Duration::from_secs(15))
-        .expect("polling for toplevels failed");
+    let windows = match watcher.poll_until_any(Duration::from_secs(15)) {
+        Ok(w) => w,
+        Err(e) => panic!(
+            "polling for toplevels failed: {e}\n\
+             This usually means the compositor exited, which happens when its \
+             startup command dies. Compositor output:\n{}",
+            dump_log(&log)
+        ),
+    };
 
     eprintln!("[test] enumerated {} window(s): {windows:#?}", windows.len());
 
     assert!(
         !windows.is_empty(),
-        "no windows enumerated — labwc advertised the protocol but reported nothing",
+        "no windows enumerated — labwc advertised the protocol but reported \
+         nothing. Compositor output:\n{}",
+        dump_log(&log),
     );
     assert!(
         windows.iter().any(|w| !w.app_id.is_empty() || !w.title.is_empty()),
