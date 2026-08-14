@@ -30,6 +30,24 @@ impl Drop for LabwcGuard {
     }
 }
 
+/// First of `names` that is an executable on `PATH`.
+///
+/// Resolves PATH directly rather than shelling out to `which`, which a minimal
+/// container image does not ship — the same trap that made the server fall
+/// through to a terminal that was not installed.
+fn first_on_path(names: &[&str]) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for name in names {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if std::fs::metadata(&candidate).map(|m| m.is_file()).unwrap_or(false) {
+                return Some((*name).to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Read labwc's stderr until the startup command echoes its Wayland socket.
 ///
 /// Uses the same `TERMLAND_SOCKET:` marker the production launcher relies on
@@ -59,9 +77,7 @@ fn enumerates_a_real_window_from_labwc() {
         .into();
 
     // A terminal is the least heavyweight thing guaranteed to map a toplevel.
-    let app = ["foot", "konsole", "alacritty", "xterm"]
-        .into_iter()
-        .find(|a| Command::new("which").arg(a).output().is_ok_and(|o| o.status.success()))
+    let app = first_on_path(&["foot", "konsole", "alacritty", "xterm"])
         .expect("no terminal emulator available to open a window with");
     eprintln!("[test] using {app} as the window to find");
 

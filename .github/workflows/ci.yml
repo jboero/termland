@@ -60,18 +60,7 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --locked
 
-      # Unit tests only.
-      #
-      # The integration tests under crates/termland-server/tests/ spawn a real
-      # server, which starts a real Wayland compositor (labwc/cage) and opens a
-      # PulseAudio capture stream. A headless runner has neither, so they would
-      # fail for reasons unrelated to the change under test.
-      #
-      # They are still worth running by hand on a desktop:
-      #     cargo test --workspace
-      # and they now clean up after themselves — see SessionGuard in
-      # quic_q2_planes.rs. Before that fix, running them here would have
-      # stranded a detached desktop session on the runner for every job.
+      # Unit tests only in this job; the integration job below runs the rest.
       - name: Run unit tests
         run: cargo test --workspace --locked --lib --bins
 
@@ -80,3 +69,94 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False rpm-build
           rpmspec -P packaging/termland-server.spec > /dev/null
           rpmspec -P packaging/termland-client.spec > /dev/null
+
+  integration:
+    name: Integration tests (real compositor)
+    runs-on: ubuntu-latest
+    container: fedora:44
+    # Not gated on `test`: a compositor failure and a unit-test failure are
+    # different signals and it is useful to see both from one push.
+
+    steps:
+      - name: Install build and runtime dependencies
+        # Beyond the build set, this needs an actual Wayland stack:
+        #
+        #   labwc          the compositor a Desktop session runs
+        #   Xwayland       labwc is built with +xwayland and refuses to start
+        #                  without it, even when nothing X11 is involved
+        #   foot           a terminal for the session to open a window with;
+        #                  chosen for being small, and it is first in the
+        #                  server's own detection order after konsole
+        #   mesa-dri       llvmpipe, so wlroots can render with no GPU
+        #   pulseaudio     the session audio path loads a null sink through it
+        #   dejavu mono    a monospace font. Not optional: with no monospace
+        #                  font foot fails to map a window, its exit takes
+        #                  labwc down with it, and every compositor test dies
+        #                  on a broken pipe that says nothing about fonts
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            git \
+            rust cargo \
+            clang-devel \
+            cmake gcc gcc-c++ \
+            perl \
+            ffmpeg-free-devel ffmpeg-free \
+            opus-devel opus \
+            pulseaudio-libs-devel pulseaudio-libs pulseaudio pulseaudio-utils \
+            alsa-lib-devel \
+            pam-devel \
+            wayland-devel wayland-protocols-devel \
+            labwc foot xorg-x11-server-Xwayland mesa-dri-drivers \
+            dejavu-sans-mono-fonts
+
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-fedora44-integration-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-fedora44-integration-
+
+      - name: Start a headless session environment
+        run: |
+          # XDG_RUNTIME_DIR must exist and be 0700 or the Wayland socket is
+          # refused. A container has no logind to create it.
+          echo "XDG_RUNTIME_DIR=/tmp/xdg" >> "$GITHUB_ENV"
+          mkdir -p /tmp/xdg && chmod 700 /tmp/xdg
+
+          # wlroots' headless backend needs no GPU or seat; pixman keeps
+          # rendering entirely in software so llvmpipe is not even required to
+          # be fast, only present.
+          echo "WLR_BACKENDS=headless"      >> "$GITHUB_ENV"
+          echo "WLR_RENDERER=pixman"        >> "$GITHUB_ENV"
+          echo "WLR_HEADLESS_OUTPUTS=1"     >> "$GITHUB_ENV"
+
+      - name: Start PulseAudio
+        # exit-idle-time=-1 stops it exiting between tests. Not fatal if it
+        # fails: the audio plane degrades to "not independently verified" and
+        # the tests still assert everything else.
+        run: |
+          export XDG_RUNTIME_DIR=/tmp/xdg
+          pulseaudio --start --exit-idle-time=-1 --daemonize=yes || true
+          sleep 1
+          pactl info | head -3 || echo "PulseAudio unavailable — audio plane will be skipped"
+
+      # --include-ignored also runs the tests that need a live compositor,
+      # which is the entire point of this job.
+      - name: Run integration tests
+        run: cargo test --workspace --locked --test '*' -- --include-ignored --test-threads=1
+
+      # A leaked session on a throwaway runner is harmless, but a non-empty
+      # list here means teardown regressed — which on a developer's own
+      # machine strands a desktop session that nothing will ever reap.
+      - name: Assert no sessions were leaked
+        if: always()
+        run: |
+          export XDG_RUNTIME_DIR=/tmp/xdg
+          left=$(ls /tmp/xdg/termland/sessions/*.session 2>/dev/null | wc -l)
+          echo "sessions left behind: $left"
+          test "$left" -eq 0
