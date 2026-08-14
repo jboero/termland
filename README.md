@@ -277,7 +277,7 @@ termland/
   android/                Kotlin/Compose app built on termland-mobile-core
 ```
 
-**Wire protocol**: length-delimited binary framing (`[Magic "TL"][MsgID][Length][CBOR]`) carrying control messages (handshake, auth, session lifecycle, resize, ping) and data messages (AV1 video, Opus audio, cursor image, clipboard, key/pointer input, Unicode text input). Runs over TCP, TLS, an embedded SSH subsystem channel (`russh` on mobile, since app sandboxes forbid spawning the `ssh` binary), or QUIC — Q1 (single-stream drop-in) plus Q2 (video and audio split onto their own QUIC stream/datagrams so a lossy link doesn't stall control/input).
+**Wire protocol**: length-delimited binary framing (`[Magic "TL"][MsgID][Length][CBOR]`) carrying control messages (handshake, auth, session lifecycle, resize, ping) and data messages (AV1 video, Opus audio, cursor image, clipboard, key/pointer input, Unicode text input). Runs over TCP, TLS, an embedded SSH subsystem channel (`russh` on mobile, since app sandboxes forbid spawning the `ssh` binary), or QUIC — Q1 (single-stream drop-in) plus Q2 (video and audio split onto their own QUIC stream/datagrams so a lossy link doesn't stall control/input). Full reference, including every message and the rules for changing them compatibly: [docs/protocol.md](docs/protocol.md).
 
 **Encoder pipeline**: compositor buffer capture via wlr-screencopy-unstable-v1, RGBA-to-YUV conversion respecting ffmpeg's 32-byte row alignment, hardware encoder probing at startup with automatic fallback.
 
