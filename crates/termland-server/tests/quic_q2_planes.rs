@@ -189,10 +189,16 @@ fn decode_video_codec_tag(tag: u8) -> Option<VideoCodec> {
 async fn quic_q2_video_stream_carries_real_frames() {
     let port: u16 = 27868;
 
+    // An explicit --port matters: without it the spawned server falls back
+    // to the default 7867, which collides with any termland-server the
+    // developer already has running — a normal state to be in — and the
+    // bind failure kills the child before QUIC ever starts, surfacing as an
+    // unrelated-looking handshake timeout.
     let bin = env!("CARGO_BIN_EXE_termland-server");
     eprintln!("[test] spawning {bin} --quic --quic-port {port}");
     let child = Command::new(bin)
-        .args(["--bind", "127.0.0.1", "--quic", "--quic-port", &port.to_string()])
+        .args(["--bind", "127.0.0.1", "--port", "27865",
+               "--quic", "--quic-port", &port.to_string()])
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
