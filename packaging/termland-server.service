@@ -44,12 +44,37 @@ ExecStart=/usr/bin/termland-server \
 Restart=on-failure
 RestartSec=5
 
-# Security hardening
+# Security hardening.
+#
+# Scope note: this sandbox is inherited by everything the service spawns —
+# which here means whole user desktop sessions, not just a network daemon.
+# Whatever the sandbox forbids, a remote user's desktop cannot do either.
+#
+# ProtectHome= is deliberately NOT set. Per systemd.exec(5) it covers /home,
+# /root *and* /run/user, and this service must write all three: sessions
+# write to the user's home directory, the first-run TLS cert used to land
+# under /root, and each isolated session needs its own /run/user/<uid> for
+# the Wayland socket. ProtectHome=read-only broke session startup outright.
 NoNewPrivileges=false
 ProtectSystem=strict
-ProtectHome=read-only
 ReadWritePaths=/run /tmp /home
+
+# Note there is deliberately no write access to /etc here: the TLS keypair is
+# created at package install time (the RPM's %post runs
+# "termland-server --generate-cert"), so the daemon only ever reads it. If it
+# is ever missing, regenerate with that same command rather than loosening
+# the sandbox.
 PrivateTmp=true
+
+# Session registry + compositor logs. These used to land in /run/user/0,
+# which logind creates only for a real root login and removes when the last
+# one ends — deleting live state under a running service. RuntimeDirectory
+# gives us a dir that is ours unconditionally; Preserve=yes keeps detached
+# sessions trackable across a server restart (they outlive it by design),
+# while still clearing on reboot.
+RuntimeDirectory=termland
+RuntimeDirectoryPreserve=yes
+Environment=XDG_RUNTIME_DIR=/run/termland
 
 # Allow binding to privileged ports if needed
 AmbientCapabilities=CAP_NET_BIND_SERVICE

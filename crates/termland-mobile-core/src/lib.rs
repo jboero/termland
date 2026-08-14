@@ -315,6 +315,7 @@ mod tests {
             encoder_crf: None,
             encoder_extra_params: None,
             supported_codecs: p.advertised_codecs(),
+            supported_audio_codecs: termland_protocol::AudioCodec::all_preferred(),
         });
 
         let mut codec = TermlandCodec;
