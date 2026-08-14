@@ -1,6 +1,20 @@
+<div align="center">
+
+<img src="docs/logo.svg" alt="" width="128" height="128">
+
 # Termland
 
 **A Wayland remote desktop server that actually works.**
+
+[![Latest release](https://img.shields.io/github/v/release/jboero/termland?label=release&color=89B4FA)](https://github.com/jboero/termland/releases/latest)
+[![COPR build](https://copr.fedorainfracloud.org/coprs/boeroboy/mawenzy/package/termland-server/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/boeroboy/mawenzy/package/termland-server/)
+[![License: LGPL-3.0-or-later](https://img.shields.io/badge/license-LGPL--3.0--or--later-blue)](LICENSE)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-B7410E)](Cargo.toml)
+[![Platform: Linux · Wayland](https://img.shields.io/badge/platform-Linux%20%C2%B7%20Wayland-89B4FA)](#why-this-exists)
+[![Android client](https://img.shields.io/badge/Android-client-3DDC84)](docs/mobile-clients.md)
+[![Built with Claude](https://img.shields.io/badge/built%20with-Claude-D97757)](AGENTS.md)
+
+</div>
 
 Termland streams full interactive desktop and application sessions over the network using AV1 video, Opus audio, and modern transport security. It exists because Wayland broke remote desktop workflows and nobody fixed them.
 
@@ -326,4 +340,25 @@ See [ROADMAP.md](ROADMAP.md) for the full detail behind each item.
 
 ## License
 
-LGPL-3.0-or-later
+**LGPL-3.0-or-later** — see [LICENSE](LICENSE) for the full text.
+
+In short: you can use, modify and redistribute Termland, including inside
+proprietary products, provided changes *to Termland itself* are published
+under the same licence and users can replace the Termland components. Linking
+against it does not make your own code LGPL. This is the standard copyleft
+arrangement for a library-and-tools project, chosen so downstream distributions
+and desktop environments can adopt it without friction.
+
+Termland bundles no third-party code in-tree; dependencies keep their own
+licences, resolved by Cargo (`cargo tree` / `Cargo.lock` for the current set).
+
+## AI assistance
+
+Termland is written with AI assistance, primarily Anthropic's Claude, directed
+by the maintainer. Attribution is recorded per commit as `Co-Authored-By`
+trailers rather than left to be inferred.
+
+[AGENTS.md](AGENTS.md) documents how that works, what is and is not reproducible
+about it, and why the code should be reviewed on its merits like any other
+contribution — being AI-assisted is not a claim of correctness. Raised
+originally in [#7](https://github.com/jboero/termland/issues/7).

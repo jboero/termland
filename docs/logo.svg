@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Termland logo: a display showing a terminal prompt above a streaming wave">
+  <title>Termland</title>
+
+  <!--
+    Palette is the client's own overlay palette (crates/termland-client/src/
+    overlay.rs): tile #181825, accent #89B4FA, text #CDD6F4. The mark and the
+    running application therefore look like the same product.
+
+    Motif: a terminal prompt above a wave — a shell session, and Wayland,
+    inside one display. Deliberately only four elements: this has to stay
+    readable as a 16px favicon, and an earlier draft with radiating "signal"
+    arcs turned to mush at that size.
+
+    Drawn on a filled tile so it holds up on GitHub's light and dark themes
+    rather than depending on the page background.
+  -->
+
+  <defs>
+    <linearGradient id="bezel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#89B4FA"/>
+      <stop offset="100%" stop-color="#CBA6F7"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Tile -->
+  <rect width="512" height="512" rx="96" fill="#181825"/>
+
+  <!-- Display -->
+  <rect x="72" y="108" width="368" height="252" rx="28"
+        fill="#11111B" stroke="url(#bezel)" stroke-width="16"/>
+
+  <!-- Stand -->
+  <path d="M216 360 h80 v36 h48 a13 13 0 0 1 0 26 H168 a13 13 0 0 1 0-26 h48 z"
+        fill="#CDD6F4"/>
+
+  <!-- Prompt: chevron + cursor bar, upper half, clear of the wave -->
+  <path d="M128 168 l40 34 -40 34" fill="none" stroke="#CDD6F4"
+        stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M196 236 h84" stroke="#CDD6F4" stroke-width="18" stroke-linecap="round"/>
+
+  <!-- Wave: lower half, full width of the panel -->
+  <path d="M112 300 q34 -56 68 0 t68 0 t68 0 t68 0"
+        fill="none" stroke="#89B4FA" stroke-width="20"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
