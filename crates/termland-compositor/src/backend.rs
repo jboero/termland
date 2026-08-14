@@ -452,16 +452,26 @@ pub fn wait_socket_ready(wayland_display: &str, runtime_dir: &Path) {
 /// plasmashell branch of `detect_desktop_shell`, downgrading a desktop session
 /// to a bare terminal with no explanation.
 fn has_program(name: &str) -> bool {
+    has_program_in(name, std::env::var_os("PATH").as_deref())
+}
+
+/// `has_program` with the search path passed in.
+///
+/// Split out purely so it can be tested: the alternative is a test that
+/// mutates `PATH` for the whole process, which races every other test in the
+/// binary because they run on parallel threads. That is not theoretical — the
+/// first version of this did exactly that and made a sibling test fail.
+fn has_program_in(name: &str, path: Option<&std::ffi::OsStr>) -> bool {
     // A name with a separator is a path, not something to search for — matching
     // how a shell treats `./foo` versus `foo`.
     if name.contains('/') {
         return is_executable_file(Path::new(name));
     }
 
-    let Some(path) = std::env::var_os("PATH") else {
+    let Some(path) = path else {
         return false;
     };
-    std::env::split_paths(&path).any(|dir| is_executable_file(&dir.join(name)))
+    std::env::split_paths(path).any(|dir| is_executable_file(&dir.join(name)))
 }
 
 /// Does `path` exist, is it a regular file, and is any execute bit set?
@@ -551,16 +561,31 @@ mod program_lookup_tests {
 
     /// With no PATH at all, a bare name resolves to nothing rather than
     /// panicking or falling back to a guess.
+    ///
+    /// Passes the path in rather than unsetting the process's own: mutating
+    /// PATH here would race the other tests in this binary, which run on
+    /// parallel threads.
     #[test]
     fn missing_path_variable_yields_no_match() {
-        let saved = std::env::var_os("PATH");
-        // SAFETY: single-threaded test; PATH is restored before returning.
-        unsafe { std::env::remove_var("PATH") };
-        let found = has_program("sh");
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("PATH", v) };
+        assert!(!has_program_in("sh", None));
+    }
+
+    /// An empty PATH is not the same as an absent one, and must also match
+    /// nothing rather than searching the current directory.
+    #[test]
+    fn empty_path_matches_nothing() {
+        assert!(!has_program_in("sh", Some(std::ffi::OsStr::new(""))));
+    }
+
+    /// An explicit path still resolves even with no PATH to search.
+    #[test]
+    fn explicit_paths_ignore_the_search_path() {
+        let sh = ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .find(|p| is_executable_file(Path::new(p)));
+        if let Some(sh) = sh {
+            assert!(has_program_in(sh, None));
         }
-        assert!(!found, "no PATH must mean no match");
     }
 
     /// detect_terminal must return something that actually exists when any
