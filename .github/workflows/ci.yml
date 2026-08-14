@@ -1,0 +1,82 @@
+name: CI
+
+# Runs on the target distro rather than ubuntu-latest so the dependency list
+# below can be the same one the RPMs already build against
+# (packaging/*.spec BuildRequires), instead of a hand-translated Debian
+# equivalent that drifts from what actually ships.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on warnings in our own crates. Vendored dependencies are
+  # not built with this.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    container: fedora:43
+
+    steps:
+      - name: Install build dependencies
+        # Kept in sync with BuildRequires in packaging/termland-server.spec and
+        # packaging/termland-client.spec — this is the union of the two, plus
+        # git, which the checkout action needs inside a container.
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            git \
+            rust cargo \
+            clang-devel \
+            cmake gcc gcc-c++ \
+            perl \
+            ffmpeg-free-devel \
+            opus-devel \
+            pulseaudio-libs-devel \
+            alsa-lib-devel \
+            pam-devel \
+            wayland-devel wayland-protocols-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-fedora43-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-fedora43-cargo-
+
+      - name: Show toolchain
+        run: cargo --version && rustc --version
+
+      - name: Build workspace
+        run: cargo build --workspace --locked
+
+      # Unit tests only.
+      #
+      # The integration tests under crates/termland-server/tests/ spawn a real
+      # server, which starts a real Wayland compositor (labwc/cage) and opens a
+      # PulseAudio capture stream. A headless runner has neither, so they would
+      # fail for reasons unrelated to the change under test.
+      #
+      # They are still worth running by hand on a desktop:
+      #     cargo test --workspace
+      # and they now clean up after themselves — see SessionGuard in
+      # quic_q2_planes.rs. Before that fix, running them here would have
+      # stranded a detached desktop session on the runner for every job.
+      - name: Run unit tests
+        run: cargo test --workspace --locked --lib --bins
+
+      - name: Check the RPM specs still parse
+        run: |
+          dnf install -y --setopt=install_weak_deps=False rpm-build
+          rpmspec -P packaging/termland-server.spec > /dev/null
+          rpmspec -P packaging/termland-client.spec > /dev/null
