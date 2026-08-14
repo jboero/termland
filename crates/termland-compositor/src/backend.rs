@@ -212,6 +212,7 @@ pub fn detached_compositor_command(
     height: u32,
     log_path: &Path,
     run_as: Option<&str>,
+    audio_sink: Option<&str>,
 ) -> Result<(Command, PathBuf), CompositorError> {
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -231,7 +232,17 @@ pub fn detached_compositor_command(
         .env("WLR_BACKENDS", "headless")
         .env("WLR_HEADLESS_OUTPUTS", "1")
         .env("WLR_HEADLESS_OUTPUT_MODE", format!("{width}x{height}"))
-        .env("XDG_SESSION_TYPE", "wayland")
+        .env("XDG_SESSION_TYPE", "wayland");
+
+    // Route this session's audio to its own sink, for this process tree only.
+    // Setting the *global* default sink instead would silence the local
+    // desktop for as long as the session runs, and strand it on a dead sink
+    // if the server exits without unloading the null sink.
+    if let Some(sink) = audio_sink {
+        cmd.env("PULSE_SINK", sink);
+    }
+
+    cmd
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));

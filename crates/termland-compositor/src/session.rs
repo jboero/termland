@@ -26,6 +26,16 @@ pub struct CompositorConfig {
     /// For Desktop mode: the startup command to run inside labwc.
     /// If None, we auto-detect a terminal emulator.
     pub desktop_shell: Option<String>,
+    /// PulseAudio sink that applications inside this session should play to,
+    /// exported to the compositor as `PULSE_SINK` and inherited by everything
+    /// it launches. `None` when the session has no audio.
+    ///
+    /// This is deliberately per-process rather than a `pactl set-default-sink`
+    /// call: the default sink is global to the user, so setting it would take
+    /// the audio of the *local* desktop hostage for as long as a remote
+    /// session is running — and leave it pointed at a dead sink if the server
+    /// exits without cleaning up.
+    pub audio_sink: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,11 +103,17 @@ impl Compositor {
                     .clone()
                     .unwrap_or_else(detect_desktop_shell);
                 tracing::info!("Desktop shell: {shell}");
-                let d = backend::labwc::launch_detached(config.width, config.height, &shell, log_path, run_as)?;
+                let d = backend::labwc::launch_detached(
+                    config.width, config.height, &shell, log_path, run_as,
+                    config.audio_sink.as_deref(),
+                )?;
                 (d.pid, d.wayland_display, "labwc", d.runtime_dir)
             }
             SessionMode::App { command, args } => {
-                let d = backend::cage::launch_detached(config.width, config.height, command, args, log_path, run_as)?;
+                let d = backend::cage::launch_detached(
+                    config.width, config.height, command, args, log_path, run_as,
+                    config.audio_sink.as_deref(),
+                )?;
                 (d.pid, d.wayland_display, "cage", d.runtime_dir)
             }
         };

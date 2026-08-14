@@ -357,6 +357,15 @@ enum SessionRequest {
 const SERVER_AUDIO_CODECS: &[termland_protocol::AudioCodec] =
     &[termland_protocol::AudioCodec::Opus];
 
+/// PulseAudio sink name for a session's null sink.
+///
+/// Single source of truth: `audio_capture_thread` creates the sink under this
+/// name and the compositor is pointed at it via `PULSE_SINK`, so the two must
+/// agree exactly or session audio silently goes to the wrong place.
+fn session_sink_name(session_id: &str) -> String {
+    format!("termland_{}", session_id.replace('-', "_"))
+}
+
 async fn run_session<T>(
     framed: &mut Framed<T, TermlandCodec>,
     request: SessionRequest,
@@ -530,10 +539,13 @@ where
     // Cloned before the move into capture_thread below: also needed to
     // populate the registry record's `owner` field once the compositor is up.
     let record_owner = run_as.clone();
+    // Only when audio was requested; the sink itself is created by
+    // `audio_capture_thread` once the capture stream opens.
+    let capture_audio_sink = audio.then(|| session_sink_name(&session_id));
     let capture_handle = std::thread::spawn(move || {
         capture_thread(width, height, quality, mode, desktop_shell,
                        encoder_preset, encoder_crf, encoder_extra_params,
-                       capture_codecs, start_kind, run_as,
+                       capture_codecs, start_kind, capture_audio_sink, run_as,
                        overlay_cursor_capture, resize_rx, frame_tx, display_tx, stop_rx);
     });
 
@@ -1066,6 +1078,9 @@ fn capture_thread(
     encoder_extra_params: Option<String>,
     supported_codecs: Vec<termland_protocol::VideoCodec>,
     start_kind: StartKind,
+    // Sink that session applications should play to, exported as
+    // `PULSE_SINK`. `None` when the client did not request audio.
+    audio_sink: Option<String>,
     // The PAM-authenticated username to isolate a freshly-created session's
     // compositor into (session isolation), or `None` when the server is
     // running without `--auth`. Only consulted for `StartKind::Create` - an
@@ -1078,7 +1093,9 @@ fn capture_thread(
     display_tx: tokio::sync::oneshot::Sender<(String, u32, std::path::PathBuf)>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    let config = termland_compositor::CompositorConfig { width, height, mode, desktop_shell };
+    let config = termland_compositor::CompositorConfig {
+        width, height, mode, desktop_shell, audio_sink,
+    };
     let (mut compositor, comp_pid) = match start_kind {
         StartKind::Create { log_path } => {
             match termland_compositor::Compositor::create(config, &log_path, run_as.as_deref()) {
@@ -1289,7 +1306,7 @@ fn audio_capture_thread(
     audio_tx: tokio::sync::mpsc::Sender<AudioChunk>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    let sink_name = format!("termland_{}", session_id.replace('-', "_"));
+    let sink_name = session_sink_name(session_id);
     let monitor_source = format!("{sink_name}.monitor");
 
     // Load a null sink so apps in this session have somewhere to output audio.
@@ -1315,10 +1332,13 @@ fn audio_capture_thread(
         }
     };
 
-    // Set this sink as the default so apps in the session use it.
-    let _ = std::process::Command::new("pactl")
-        .args(["set-default-sink", &sink_name])
-        .output();
+    // NOTE: deliberately no `pactl set-default-sink` here. The default sink is
+    // global to the user, so pointing it at this session's null sink silences
+    // the local desktop for as long as the session runs, and leaves it aimed
+    // at a dead sink if the server exits without unloading the module (a kill
+    // -9, a crash, or a test harness reaping the child). Session applications
+    // are routed with `PULSE_SINK` on the compositor process instead — see
+    // `CompositorConfig::audio_sink` — which affects only that process tree.
 
     // Open a PulseAudio recording stream from the monitor source.
     let spec = pulse::sample::Spec {

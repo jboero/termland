@@ -19,6 +19,7 @@ pub fn launch_detached(
     shell_cmd: &str,
     log_path: &Path,
     run_as: Option<&str>,
+    audio_sink: Option<&str>,
 ) -> Result<DetachedBackend, CompositorError> {
     tracing::info!("Launching detached labwc: {shell_cmd} ({width}x{height})");
     let config_dir = write_minimal_config(width, height)?;
@@ -26,7 +27,7 @@ pub fn launch_detached(
     let wrapper = socket_wrapper_cmd(shell_cmd);
     let sh_arg = format!("sh -c '{}'", wrapper.replace('\'', r"'\''"));
 
-    let (mut cmd, runtime_dir) = detached_compositor_command("labwc", width, height, log_path, run_as)?;
+    let (mut cmd, runtime_dir) = detached_compositor_command("labwc", width, height, log_path, run_as, audio_sink)?;
     cmd.arg("-C").arg(&config_dir)
         .arg("-S").arg(&sh_arg)
         .env("XCURSOR_THEME", "Adwaita")
