@@ -21,6 +21,10 @@ const CURSOR_FILL: u32    = 0xFFFFFF;
 pub struct MenuState {
     pub show_data_rate: bool,
     pub client_cursor: bool,
+    /// Show the session's window list. Off by default: it covers part of the
+    /// remote screen, so it is something you open to look at, not a permanent
+    /// fixture.
+    pub show_windows: bool,
 }
 
 impl MenuState {
@@ -28,6 +32,7 @@ impl MenuState {
         Self {
             show_data_rate: true,
             client_cursor: true,
+            show_windows: false,
         }
     }
 }
@@ -356,6 +361,7 @@ const BAR_ON_FG: u32    = 0xA6E3A1; // green for enabled toggles
 pub enum BarItem {
     DataRate,
     ClientCursor,
+    Windows,
     Fullscreen,
     Quit,
 }
@@ -364,12 +370,13 @@ pub enum BarItem {
 pub const BAR_ITEMS: &[BarItem] = &[
     BarItem::DataRate,
     BarItem::ClientCursor,
+    BarItem::Windows,
     BarItem::Fullscreen,
     BarItem::Quit,
 ];
 
 impl BarItem {
-    fn label(&self, show_data_rate: bool, client_cursor: bool, fullscreen: bool, rate: u64) -> String {
+    fn label(&self, show_data_rate: bool, client_cursor: bool, show_windows: bool, fullscreen: bool, rate: u64, window_count: usize) -> String {
         match self {
             Self::DataRate => {
                 if show_data_rate {
@@ -384,6 +391,10 @@ impl BarItem {
                 } else {
                     " [ ] Local cursor ".to_string()
                 }
+            }
+            Self::Windows => {
+                let mark = if show_windows { "x" } else { " " };
+                format!(" [{mark}] Windows ({window_count}) ")
             }
             Self::Fullscreen => {
                 if fullscreen {
@@ -410,8 +421,10 @@ pub fn draw_menubar(
     fb_height: u32,
     show_data_rate: bool,
     client_cursor: bool,
+    show_windows: bool,
     fullscreen: bool,
     data_rate: u64,
+    window_count: usize,
     hovered: Option<BarItem>,
 ) -> BarLayout {
     let stride = fb_width as usize;
@@ -430,7 +443,7 @@ pub fn draw_menubar(
     let mut item_rects: Vec<(BarItem, u32, u32)> = Vec::new();
 
     for item in BAR_ITEMS {
-        let label = item.label(show_data_rate, client_cursor, fullscreen, data_rate);
+        let label = item.label(show_data_rate, client_cursor, show_windows, fullscreen, data_rate, window_count);
         let text_w = label.chars().count() * char_w;
         let item_w = text_w;
 
@@ -443,6 +456,7 @@ pub fn draw_menubar(
         let color = match item {
             BarItem::DataRate if show_data_rate => BAR_ON_FG,
             BarItem::ClientCursor if client_cursor => BAR_ON_FG,
+            BarItem::Windows if show_windows => BAR_ON_FG,
             _ => BAR_TEXT,
         };
         draw_text(buf, stride, x, 4, &label, color);
@@ -470,4 +484,158 @@ pub fn hit_test_menubar(layout: &BarLayout, x: f64, y: f64) -> Option<BarItem> {
         }
     }
     None
+}
+
+// ─── Window list ──────────────────────────────────────────────────────────
+
+/// Draw the session's window list as a panel under the menubar.
+///
+/// This exists because the *in-session* taskbar cannot show it. KDE's task
+/// manager speaks only `org_kde_plasma_window_management`, a KWin protocol, so
+/// on labwc it lists nothing no matter what the session is running (issue #1).
+/// The server reads the standard `zwlr_foreign_toplevel_management_v1` list
+/// instead and sends it over, so the client can render it locally — which also
+/// means it works for `App` (kiosk) sessions that have no panel at all.
+pub fn draw_window_list(
+    buf: &mut [u32],
+    fb_width: u32,
+    fb_height: u32,
+    windows: &[termland_protocol::WindowInfo],
+    top_offset: u32,
+) {
+    let stride = fb_width as usize;
+    let char_w = 8 * 2usize;
+    let line_h = 20usize;
+
+    let title = if windows.is_empty() {
+        "No windows".to_string()
+    } else {
+        format!("Windows ({})", windows.len())
+    };
+
+    // Width tracks the longest line so long titles are not clipped, but stays
+    // within a third of the screen — this overlays the remote desktop, and a
+    // panel wide enough to hide what you are working on defeats the point.
+    let max_chars = windows
+        .iter()
+        .map(|w| display_line(w).chars().count())
+        .chain(std::iter::once(title.chars().count()))
+        .max()
+        .unwrap_or(10);
+    let max_w = (fb_width as usize / 3).max(200);
+    let panel_w = ((max_chars * char_w) + 24).min(max_w);
+    let panel_h = 12 + line_h + (windows.len().max(1) * line_h) + 8;
+
+    let x = 8usize;
+    let y = top_offset as usize + 8;
+    if y + panel_h >= fb_height as usize || panel_w >= fb_width as usize {
+        return; // Not enough room; drawing a clipped panel is worse than none.
+    }
+
+    fill_rect_alpha(buf, stride, x, y, panel_w, panel_h, BAR_BG, 220);
+    draw_rect_outline(buf, stride, x, y, panel_w, panel_h, BAR_BORDER);
+    draw_text(buf, stride, x + 10, y + 8, &title, 0x89B4FA);
+
+    let usable_chars = (panel_w.saturating_sub(24)) / char_w;
+    for (i, w) in windows.iter().enumerate() {
+        let row_y = y + 10 + line_h + (i * line_h);
+        // The focused window is the one a user is looking for, so mark it
+        // rather than relying on colour alone.
+        let color = if w.activated { BAR_ON_FG } else { BAR_TEXT };
+        let line = truncate(&display_line(w), usable_chars);
+        draw_text(buf, stride, x + 10, row_y, &line, color);
+    }
+}
+
+/// One window's row: focus marker, state, then title (falling back to app id).
+fn display_line(w: &termland_protocol::WindowInfo) -> String {
+    let marker = if w.activated { ">" } else { " " };
+    let state = if w.minimized {
+        "_ "
+    } else if w.fullscreen {
+        "[] "
+    } else if w.maximized {
+        "^ "
+    } else {
+        ""
+    };
+    // A window that has mapped but not yet set a title is normal during
+    // startup; showing the app id beats showing an empty row.
+    let name = if !w.title.is_empty() {
+        w.title.as_str()
+    } else if !w.app_id.is_empty() {
+        w.app_id.as_str()
+    } else {
+        "(untitled)"
+    };
+    format!("{marker} {state}{name}")
+}
+
+/// Truncate to `max` characters, marking that it was cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max || max < 2 {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max - 1).collect();
+    format!("{kept}…")
+}
+
+#[cfg(test)]
+mod window_list_tests {
+    use super::*;
+    use termland_protocol::WindowInfo;
+
+    fn win(title: &str, app_id: &str, activated: bool) -> WindowInfo {
+        WindowInfo {
+            id: 1,
+            title: title.into(),
+            app_id: app_id.into(),
+            minimized: false,
+            maximized: false,
+            fullscreen: false,
+            activated,
+        }
+    }
+
+    /// A window that has mapped but not yet titled itself must still produce a
+    /// readable row — an empty line looks like a rendering bug.
+    #[test]
+    fn untitled_window_falls_back_to_app_id() {
+        let line = display_line(&win("", "org.kde.konsole", false));
+        assert!(line.contains("org.kde.konsole"), "got {line:?}");
+    }
+
+    #[test]
+    fn window_with_neither_title_nor_app_id_still_renders() {
+        let line = display_line(&win("", "", false));
+        assert!(line.contains("(untitled)"), "got {line:?}");
+    }
+
+    #[test]
+    fn focused_window_is_marked() {
+        assert!(display_line(&win("Konsole", "x", true)).starts_with('>'));
+        assert!(!display_line(&win("Konsole", "x", false)).starts_with('>'));
+    }
+
+    #[test]
+    fn truncation_marks_that_it_cut() {
+        let long = "a".repeat(100);
+        let out = truncate(&long, 10);
+        assert_eq!(out.chars().count(), 10);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn short_lines_are_left_alone() {
+        assert_eq!(truncate("konsole", 40), "konsole");
+    }
+
+    /// Multi-byte titles are common (CJK, emoji in window titles). Truncation
+    /// is by character, so it must not split a codepoint.
+    #[test]
+    fn truncation_is_character_wise_not_byte_wise() {
+        let s = "日本語のウィンドウタイトル";
+        let out = truncate(s, 5);
+        assert_eq!(out.chars().count(), 5);
+    }
 }
