@@ -438,13 +438,51 @@ pub fn wait_socket_ready(wayland_display: &str, runtime_dir: &Path) {
 }
 
 /// Check if a program exists in PATH.
+/// Is `name` an executable somewhere on `PATH`?
+///
+/// Resolves `PATH` directly rather than shelling out to `which`. That binary is
+/// not guaranteed to exist — a minimal Fedora container does not ship it, and
+/// distributions have been dropping it from default installs — and when it is
+/// missing, `status()` fails and *every* lookup here quietly returns false.
+///
+/// The failure that exposed this is worth recording, because nothing about it
+/// pointed at program detection: `detect_terminal` fell through every candidate
+/// to its last-resort `xterm`, and the session died with
+/// `sh: exec: xterm: not found`. The same silent-false would also skip the
+/// plasmashell branch of `detect_desktop_shell`, downgrading a desktop session
+/// to a bare terminal with no explanation.
 fn has_program(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
+    has_program_in(name, std::env::var_os("PATH").as_deref())
+}
+
+/// `has_program` with the search path passed in.
+///
+/// Split out purely so it can be tested: the alternative is a test that
+/// mutates `PATH` for the whole process, which races every other test in the
+/// binary because they run on parallel threads. That is not theoretical — the
+/// first version of this did exactly that and made a sibling test fail.
+fn has_program_in(name: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    // A name with a separator is a path, not something to search for — matching
+    // how a shell treats `./foo` versus `foo`.
+    if name.contains('/') {
+        return is_executable_file(Path::new(name));
+    }
+
+    let Some(path) = path else {
+        return false;
+    };
+    std::env::split_paths(path).any(|dir| is_executable_file(&dir.join(name)))
+}
+
+/// Does `path` exist, is it a regular file, and is any execute bit set?
+///
+/// Checks the mode rather than calling `access(X_OK)` because this only needs
+/// to be right about the common case, and a file we can see but not execute is
+/// indistinguishable from absent for the purpose of picking a default.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
 }
 
@@ -481,6 +519,90 @@ pub fn detect_desktop_shell() -> String {
 
 pub mod cage;
 pub mod labwc;
+
+#[cfg(test)]
+mod program_lookup_tests {
+    use super::*;
+
+    /// The regression this guards: `which` is absent from minimal images, and
+    /// the old implementation shelled out to it, so every lookup returned
+    /// false and terminal detection fell through to a fallback that was not
+    /// installed either.
+    #[test]
+    fn finds_a_program_that_is_definitely_on_path() {
+        assert!(has_program("sh"), "sh must be found via PATH");
+    }
+
+    #[test]
+    fn does_not_find_a_program_that_does_not_exist() {
+        assert!(!has_program("termland-definitely-not-a-real-binary-xyzzy"));
+    }
+
+    /// A name containing a separator is a path, as in a shell.
+    #[test]
+    fn absolute_paths_are_used_directly() {
+        assert!(has_program("/bin/sh") || has_program("/usr/bin/sh"));
+        assert!(!has_program("/nonexistent/path/to/nothing"));
+    }
+
+    /// A directory on PATH sharing a candidate's name must not count as a
+    /// match — exec would fail on it.
+    #[test]
+    fn directories_are_not_executables() {
+        assert!(!is_executable_file(Path::new("/usr")));
+        assert!(!is_executable_file(Path::new("/tmp")));
+    }
+
+    /// A readable but non-executable file is not a program.
+    #[test]
+    fn non_executable_files_are_rejected() {
+        assert!(!is_executable_file(Path::new("/etc/hostname")));
+    }
+
+    /// With no PATH at all, a bare name resolves to nothing rather than
+    /// panicking or falling back to a guess.
+    ///
+    /// Passes the path in rather than unsetting the process's own: mutating
+    /// PATH here would race the other tests in this binary, which run on
+    /// parallel threads.
+    #[test]
+    fn missing_path_variable_yields_no_match() {
+        assert!(!has_program_in("sh", None));
+    }
+
+    /// An empty PATH is not the same as an absent one, and must also match
+    /// nothing rather than searching the current directory.
+    #[test]
+    fn empty_path_matches_nothing() {
+        assert!(!has_program_in("sh", Some(std::ffi::OsStr::new(""))));
+    }
+
+    /// An explicit path still resolves even with no PATH to search.
+    #[test]
+    fn explicit_paths_ignore_the_search_path() {
+        let sh = ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .find(|p| is_executable_file(Path::new(p)));
+        if let Some(sh) = sh {
+            assert!(has_program_in(sh, None));
+        }
+    }
+
+    /// detect_terminal must return something that actually exists when any
+    /// candidate is installed — the old bug made it return a name that was
+    /// not present, which only failed later at exec time.
+    #[test]
+    fn detected_terminal_is_a_real_program_when_one_exists() {
+        let candidates = ["konsole", "foot", "alacritty", "xfce4-terminal", "xterm"];
+        if candidates.iter().any(|c| has_program(c)) {
+            let picked = detect_terminal();
+            assert!(
+                has_program(&picked),
+                "detect_terminal returned {picked:?}, which is not on PATH",
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod target_user_tests {

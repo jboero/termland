@@ -25,6 +25,20 @@ use termland_protocol::{
     PROTOCOL_VERSION,
 };
 
+/// First of `names` that is an executable on `PATH`. Resolves PATH directly
+/// rather than shelling out to `which`, which minimal container images omit.
+fn first_on_path(names: &[&str]) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for name in names {
+        for dir in std::env::split_paths(&path) {
+            if std::fs::metadata(dir.join(name)).map(|m| m.is_file()).unwrap_or(false) {
+                return Some((*name).to_string());
+            }
+        }
+    }
+    None
+}
+
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -66,6 +80,10 @@ async fn a_real_session_delivers_a_window_list() {
     let port: u16 = 27871;
     let bin = env!("CARGO_BIN_EXE_termland-server");
 
+    let terminal = first_on_path(&["foot", "konsole", "alacritty", "xterm"])
+        .expect("no terminal emulator available to open a window with");
+    eprintln!("[test] using {terminal} as the session shell");
+
     let child = Command::new(bin)
         .args(["--bind", "127.0.0.1", "--port", &port.to_string()])
         .env("RUST_LOG", "info")
@@ -101,8 +119,10 @@ async fn a_real_session_delivers_a_window_list() {
             audio: false,
             quality: 30,
             // A bare terminal: enough to map one window, without dragging in a
-            // whole Plasma session.
-            desktop_shell: Some("konsole".into()),
+            // whole Plasma session. Picked from what is actually installed —
+            // hardcoding one name fails on any image that ships a different
+            // terminal, which is most of them.
+            desktop_shell: Some(terminal),
             encoder_preset: None,
             encoder_crf: None,
             encoder_extra_params: None,
