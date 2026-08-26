@@ -9,6 +9,5 @@ rust-version.workspace = true
 serde = { workspace = true }
 ciborium = { workspace = true }
 bytes = { workspace = true }
-tokio-util = { workspace = true }
-tokio = { workspace = true }
+tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
 thiserror = { workspace = true }
