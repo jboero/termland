@@ -40,7 +40,8 @@ jobs:
             pulseaudio-libs-devel \
             alsa-lib-devel \
             pam-devel \
-            wayland-devel wayland-protocols-devel
+            wayland-devel wayland-protocols-devel \
+            rust-std-static-wasm32-unknown-unknown
 
       - uses: actions/checkout@v4
 
@@ -70,6 +71,14 @@ jobs:
       # ten-minute container build.
       - name: Cross-version wire compatibility
         run: cargo test --workspace --locked --test wire_compatibility
+
+      # A browser client runs termland-protocol as wasm rather than
+      # reimplementing the framing in another language (see #20). Nothing else
+      # here would notice a dependency creeping back in that breaks that —
+      # tokio's default features pull in mio, which does not build for wasm at
+      # all, and that is exactly how this crate started out.
+      - name: Check termland-protocol still builds for wasm32
+        run: cargo build -p termland-protocol --locked --target wasm32-unknown-unknown
 
       - name: Check the RPM specs still parse
         run: |
