@@ -112,7 +112,7 @@ async fn resolve_identity(
 /// Print the SHA-256 digest a browser passes as `serverCertificateHashes`.
 fn print_cert_hash(chain: &[Certificate]) {
     let Some(leaf) = chain.first() else { return };
-    let hex = leaf.hash().fmt(Sha256DigestFmt::BytesArray);
+    let hex = leaf.hash().fmt(Sha256DigestFmt::DottedHex);
     tracing::info!(
         "WebTransport development certificate (valid {DEV_CERT_VALIDITY_DAYS} days). \
          Pass this to the browser as serverCertificateHashes:\n  {hex}"

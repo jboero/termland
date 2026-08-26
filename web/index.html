@@ -1,0 +1,60 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Termland — WebTransport spike</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 46rem;
+         background: #181825; color: #cdd6f4; }
+  h1 { font-size: 1.2rem; color: #89b4fa; }
+  label { display: block; margin: .75rem 0 .2rem; color: #a6adc8; }
+  input { width: 100%; padding: .4rem; background: #11111b; color: #cdd6f4;
+          border: 1px solid #313244; border-radius: 4px; font-family: monospace; }
+  button { margin-top: 1rem; padding: .5rem 1rem; background: #89b4fa; color: #11111b;
+           border: 0; border-radius: 4px; font-weight: 600; cursor: pointer; }
+  pre { background: #11111b; border: 1px solid #313244; border-radius: 4px;
+        padding: .75rem; white-space: pre-wrap; margin-top: 1rem; }
+  .note { color: #a6adc8; font-size: 13px; }
+</style>
+
+<h1>Termland — WebTransport transport spike</h1>
+
+<p class="note">
+  Completes a real <code>Hello</code>/<code>HelloAck</code> against
+  <code>termland-server --webtransport</code>. The framing and CBOR are the
+  server's own implementation compiled to WebAssembly, not a JavaScript port.
+</p>
+
+<label for="url">Server URL</label>
+<input id="url" value="https://localhost:7868/termland">
+
+<label for="hash">Certificate SHA-256 (from the server log; leave empty if the certificate is trusted)</label>
+<input id="hash" placeholder="e.g. a1:b2:c3:...">
+
+<button id="go">Connect</button>
+<pre id="out">Not connected.</pre>
+
+<script type="module">
+  import init, { connect } from './pkg/termland_web.js';
+
+  const out = document.getElementById('out');
+  await init();
+
+  document.getElementById('go').addEventListener('click', async () => {
+    const url = document.getElementById('url').value.trim();
+    const hash = document.getElementById('hash').value.trim();
+    out.textContent = `Connecting to ${url} …`;
+    try {
+      const greeting = await connect(url, hash === '' ? undefined : hash);
+      out.textContent =
+        `Connected.\n\n` +
+        `  server:           ${greeting.server_name}\n` +
+        `  protocol version: ${greeting.protocol_version}\n` +
+        `  session id:       ${greeting.session_id}\n` +
+        `  auth required:    ${greeting.auth_required}\n`;
+    } catch (e) {
+      out.textContent = `Failed: ${e}\n\n` +
+        `If the browser reports a certificate error, the server's development\n` +
+        `certificate is not trusted — paste its SHA-256 from the server log above.\n` +
+        `If it reports 403, this page's origin is not in --webtransport-origin.`;
+    }
+  });
+</script>

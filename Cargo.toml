@@ -7,6 +7,12 @@ members = [
     "crates/termland-client",
     "crates/termland-mobile-core",
 ]
+# termland-web is deliberately excluded: it only builds for wasm32, so having
+# it in `members` would break `cargo build --workspace` on a normal host.
+# Build it with:
+#   cargo build -p termland-web --target wasm32-unknown-unknown \
+#     --manifest-path crates/termland-web/Cargo.toml
+exclude = ["crates/termland-web"]
 resolver = "2"
 
 [workspace.package]
