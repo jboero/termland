@@ -1,5 +1,6 @@
 mod auth;
 mod quic;
+mod webtransport;
 mod registry;
 mod tls;
 mod transport;
@@ -65,6 +66,29 @@ struct Args {
     /// --port — that's fine, they're different protocols/sockets.
     #[arg(long)]
     quic_port: Option<u16>,
+
+    /// Also listen for browser WebTransport (HTTP/3) connections.
+    ///
+    /// Separate from --quic on purpose: a browser cannot speak the raw QUIC
+    /// listener's protocol, and the native client cannot speak HTTP/3
+    /// extended CONNECT. See crates/termland-server/src/webtransport.rs.
+    #[arg(long)]
+    webtransport: bool,
+
+    /// UDP port for the WebTransport listener. Defaults to --port + 1, since
+    /// HTTP/3 and raw QUIC cannot share a socket (different ALPN).
+    #[arg(long)]
+    webtransport_port: Option<u16>,
+
+    /// Browser origin permitted to open WebTransport sessions, e.g.
+    /// https://desktop.example.com. Repeat for several.
+    ///
+    /// With none given, every browser request is refused. That is deliberate:
+    /// without it, any page a user visits could reach a Termland server on
+    /// their network and — on a server running without --auth — create and
+    /// drive a desktop session.
+    #[arg(long = "webtransport-origin", value_name = "ORIGIN")]
+    webtransport_origins: Vec<String>,
 
     /// Generate shell completion script and exit.
     /// Usage: termland-server --completions bash > /etc/bash_completion.d/termland-server
@@ -167,23 +191,55 @@ async fn main() -> Result<()> {
             if args.quic { "enabled" } else { "disabled" },
         );
 
-        if args.quic {
-            let quic_port = args.quic_port.unwrap_or(args.port);
-            let tcp_fut = transport::run_tcp_listener(&args.bind, args.port, acceptor, args.auth);
-            let quic_fut = quic::run_quic_listener(
-                &args.bind,
-                quic_port,
-                args.tls_cert.as_deref().map(std::path::Path::new),
-                args.tls_key.as_deref().map(std::path::Path::new),
-                args.auth,
-            );
-            tokio::try_join!(tcp_fut, quic_fut)?;
-        } else {
-            transport::run_tcp_listener(&args.bind, args.port, acceptor, args.auth).await?;
+        // Each listener is an independent future; whichever are enabled run
+        // together and any one failing brings the server down, which is the
+        // existing behaviour for TCP+QUIC.
+        let tcp_fut = transport::run_tcp_listener(&args.bind, args.port, acceptor, args.auth);
+
+        match (args.quic, args.webtransport) {
+            (false, false) => tcp_fut.await?,
+            (true, false) => {
+                tokio::try_join!(tcp_fut, quic_listener(&args))?;
+            }
+            (false, true) => {
+                tokio::try_join!(tcp_fut, webtransport_listener(&args))?;
+            }
+            (true, true) => {
+                tokio::try_join!(tcp_fut, quic_listener(&args), webtransport_listener(&args))?;
+            }
         }
     }
 
     Ok(())
+}
+
+/// The raw-QUIC listener future for the current arguments.
+fn quic_listener(args: &Args) -> impl std::future::Future<Output = Result<()>> + '_ {
+    let port = args.quic_port.unwrap_or(args.port);
+    quic::run_quic_listener(
+        &args.bind,
+        port,
+        args.tls_cert.as_deref().map(std::path::Path::new),
+        args.tls_key.as_deref().map(std::path::Path::new),
+        args.auth,
+    )
+}
+
+/// The browser WebTransport listener future for the current arguments.
+///
+/// Defaults to `--port + 1` rather than sharing the QUIC port: both are UDP
+/// but they negotiate different ALPN (`h3` vs `termland/1`), so one socket
+/// cannot serve both.
+fn webtransport_listener(args: &Args) -> impl std::future::Future<Output = Result<()>> + '_ {
+    let port = args.webtransport_port.unwrap_or(args.port.saturating_add(1));
+    webtransport::run_webtransport_listener(
+        &args.bind,
+        port,
+        args.tls_cert.as_deref().map(std::path::Path::new),
+        args.tls_key.as_deref().map(std::path::Path::new),
+        args.webtransport_origins.clone(),
+        args.auth,
+    )
 }
 
 /// `--list-sessions`: print all live sessions from the registry and exit.
