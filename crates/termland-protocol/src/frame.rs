@@ -288,4 +288,112 @@ mod tests {
             other => panic!("expected Ping, got {:?}", other),
         }
     }
+
+    #[test]
+    fn three_byte_prefix_is_not_yet_a_frame() {
+        let mut codec = TermlandCodec;
+        let mut buf = BytesMut::from(&b"TL\x01"[..]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert_eq!(&buf[..], b"TL\x01", "partial header must not be consumed");
+    }
+
+    #[test]
+    fn invalid_magic_is_rejected() {
+        let mut codec = TermlandCodec;
+        let mut buf = BytesMut::from(&b"XX\x01\x00\x00\x00\x00"[..]);
+        match codec.decode(&mut buf) {
+            Err(CodecError::InvalidMagic) => {}
+            other => panic!("expected InvalidMagic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payload_over_16_mib_is_rejected_from_the_header_alone() {
+        let mut codec = TermlandCodec;
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&FRAME_MAGIC);
+        buf.put_u8(0x01);
+        buf.put_u32_le(MAX_PAYLOAD_SIZE + 1);
+        match codec.decode(&mut buf) {
+            Err(CodecError::PayloadTooLarge(n)) => assert_eq!(n, MAX_PAYLOAD_SIZE + 1),
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_plane_messages_round_trip() {
+        let messages = vec![
+            Message::Hello(crate::Hello {
+                protocol_version: crate::PROTOCOL_VERSION,
+                client_name: "web".into(),
+            }),
+            Message::HelloAck(crate::HelloAck {
+                protocol_version: crate::PROTOCOL_VERSION,
+                server_name: "termland-server".into(),
+                session_id: "s".into(),
+                auth_required: false,
+            }),
+            Message::AuthRequest(crate::AuthRequest {
+                methods: vec!["password".into()],
+            }),
+            Message::AuthResponse(crate::AuthResponse {
+                username: "a".into(),
+                credential: "b".into(),
+            }),
+            Message::AuthResult(crate::AuthResult {
+                success: true,
+                message: "ok".into(),
+            }),
+            Message::SessionList(crate::SessionList {}),
+            Message::SessionListResult(crate::SessionListResult { sessions: vec![] }),
+            Message::SessionCreate(crate::SessionCreate {
+                mode: crate::SessionMode::Desktop,
+                width: 1280,
+                height: 720,
+                audio: false,
+                quality: 75,
+                desktop_shell: None,
+                encoder_preset: None,
+                encoder_crf: None,
+                encoder_extra_params: None,
+                supported_codecs: crate::VideoCodec::all_preferred(),
+                supported_audio_codecs: crate::AudioCodec::legacy_default(),
+            }),
+            Message::SessionAttach(crate::SessionAttach {
+                session_id: "abc".into(),
+                audio: false,
+                quality: 75,
+                encoder_preset: None,
+                encoder_crf: None,
+                encoder_extra_params: None,
+                supported_codecs: vec![crate::VideoCodec::Av1],
+                supported_audio_codecs: crate::AudioCodec::legacy_default(),
+            }),
+            Message::SessionClose(crate::SessionClose {
+                session_id: "abc".into(),
+            }),
+            Message::SessionReady(crate::SessionReady {
+                width: 1280,
+                height: 720,
+                xkb_keymap: None,
+                codec: Some(crate::VideoCodec::Av1),
+                audio_codec: None,
+                session_id: "abc".into(),
+            }),
+            Message::SessionEnd(crate::SessionEnd {
+                reason: "bye".into(),
+            }),
+            Message::Ping(crate::Ping { timestamp_us: 1 }),
+            Message::Pong(crate::Pong { timestamp_us: 1 }),
+        ];
+        for msg in messages {
+            let id = msg.message_id();
+            let mut codec = TermlandCodec;
+            let mut buf = BytesMut::new();
+            Encoder::encode(&mut codec, msg, &mut buf).unwrap();
+            let decoded = codec.decode(&mut buf).unwrap().unwrap();
+            assert_eq!(decoded.message_id(), id, "round-trip lost {id:?}");
+            assert!(buf.is_empty());
+        }
+    }
 }

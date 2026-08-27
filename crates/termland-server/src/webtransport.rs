@@ -19,14 +19,14 @@
 //! list/create/attach/close lifecycle, input, clipboard and codec negotiation
 //! are the existing implementations, not parallel ones.
 //!
-//! # Scope of this first pass
+//! # Media planes
 //!
-//! `handle_session` is called with `None` for the QUIC connection, so video
-//! and audio travel as CBOR messages on the control stream — the pre-Q2
-//! arrangement that TCP still uses. Splitting them onto a WebTransport uni
-//! stream and datagrams needs the `Option<quinn::Connection>` coupling in
-//! `run_session` generalised first, which is a larger change and deliberately
-//! not attempted here.
+//! Once a session is attached, video travels on a server-opened unidirectional
+//! stream with the same 18-byte Q2 header the native QUIC listener uses, and
+//! audio (when requested) as datagrams. That reuse is why `handle_session` is
+//! given a `MediaConnection::WebTransport` rather than `None`: `None` would
+//! put encoded frames on the control stream as CBOR, which a browser using
+//! WebCodecs does not want.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -38,6 +38,13 @@ use anyhow::{Context, Result};
 use wtransport::endpoint::IncomingSession;
 use wtransport::tls::{Certificate, Sha256DigestFmt};
 use wtransport::{Endpoint, Identity, ServerConfig};
+
+use crate::media::MediaConnection;
+
+/// Path browsers (and tests) open. Anything else is a 404 — this is a
+/// session endpoint, not a general HTTP/3 server, and a typo should not
+/// accidentally attach to a desktop.
+const SESSION_PATH: &str = "/termland";
 
 /// How long a generated development certificate is valid.
 ///
@@ -78,6 +85,15 @@ fn header_origin(headers: &HashMap<String, String>) -> Option<&str> {
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("origin"))
         .map(|(_, v)| v.as_str())
+}
+
+/// Is this HTTP/3 `:path` the Termland control endpoint?
+///
+/// Query strings are ignored; a trailing slash is folded. The comparison is
+/// otherwise exact — `/termland.evil` must not pass.
+fn path_allowed(path: &str) -> bool {
+    let without_query = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    without_query.trim_end_matches('/') == SESSION_PATH
 }
 
 /// Load the configured certificate, or generate a short-lived development one
@@ -178,6 +194,15 @@ async fn handle_incoming(
     let remote = request.remote_address();
     let origin = header_origin(request.headers()).map(str::to_string);
 
+    if !path_allowed(request.path()) {
+        tracing::warn!(
+            "Rejecting WebTransport session from {remote}: path {:?} is not {SESSION_PATH}",
+            request.path(),
+        );
+        request.not_found().await;
+        return Ok(());
+    }
+
     if !origin_allowed(origin.as_deref(), &allowed) {
         tracing::warn!(
             "Rejecting WebTransport session from {remote}: origin {:?} is not allowed",
@@ -205,7 +230,7 @@ async fn handle_incoming(
         .context("client did not open a control stream")?;
 
     let io = tokio::io::join(recv, send);
-    crate::transport::handle_session(io, require_auth, None).await
+    crate::transport::handle_session(io, require_auth, MediaConnection::WebTransport(connection)).await
 }
 
 #[cfg(test)]
@@ -291,5 +316,21 @@ mod tests {
     fn literal_null_origin_is_treated_as_an_origin() {
         assert!(!origin_allowed(Some("null"), &allowlist(&[])));
         assert!(origin_allowed(Some("null"), &allowlist(&["null"])));
+    }
+
+    #[test]
+    fn control_path_is_accepted_with_or_without_trailing_slash() {
+        assert!(path_allowed("/termland"));
+        assert!(path_allowed("/termland/"));
+        assert!(path_allowed("/termland?x=1"));
+    }
+
+    /// A CONNECT to the wrong path must not become a session. This is the
+    /// check that was missing: logging `request.path()` is not a check.
+    #[test]
+    fn other_paths_are_rejected() {
+        for hostile in ["/", "/echo", "/termland.evil", "/Termland", "/termland/extra"] {
+            assert!(!path_allowed(hostile), "{hostile} was allowed");
+        }
     }
 }

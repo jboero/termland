@@ -1,4 +1,5 @@
 mod auth;
+mod media;
 mod quic;
 mod webtransport;
 mod registry;

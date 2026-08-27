@@ -1,0 +1,49 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebTransport echo spike</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 40rem;
+         background: #181825; color: #cdd6f4; }
+  input, button { font: inherit; padding: .4rem; }
+  input { width: 100%; background: #11111b; color: #cdd6f4; border: 1px solid #313244; }
+  button { margin-top: 1rem; background: #89b4fa; color: #11111b; border: 0; font-weight: 600; }
+  pre { background: #11111b; padding: .75rem; white-space: pre-wrap; }
+</style>
+<p>Disposable echo against <code>termland-server --example webtransport_echo</code>.
+No Termland framing — just bytes on one bidi stream.</p>
+<label>Certificate SHA-256</label>
+<input id="hash" placeholder="aa:bb:... from the server log">
+<button id="go">Echo Hello</button>
+<pre id="out">Not connected.</pre>
+<script type="module">
+  document.getElementById('go').onclick = async () => {
+    const out = document.getElementById('out');
+    const hex = document.getElementById('hash').value.trim().replace(/[:\s-]/g, '');
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    const hash = { algorithm: 'sha-256', value: bytes };
+    out.textContent = 'connecting…';
+    try {
+      const t = new WebTransport('https://127.0.0.1:4433/echo', { serverCertificateHashes: [hash] });
+      await t.ready;
+      const stream = await t.createBidirectionalStream();
+      const writer = stream.writable.getWriter();
+      await writer.write(new TextEncoder().encode('Hello'));
+      await writer.close();
+      const reader = stream.readable.getReader();
+      const chunks = [];
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+      const n = chunks.reduce((a, c) => a + c.byteLength, 0);
+      const buf = new Uint8Array(n);
+      let o = 0;
+      for (const c of chunks) { buf.set(c, o); o += c.byteLength; }
+      out.textContent = 'echoed: ' + new TextDecoder().decode(buf);
+    } catch (e) {
+      out.textContent = 'failed: ' + e;
+    }
+  };
+</script>

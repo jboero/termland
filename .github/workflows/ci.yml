@@ -72,13 +72,26 @@ jobs:
       - name: Cross-version wire compatibility
         run: cargo test --workspace --locked --test wire_compatibility
 
-      # A browser client runs termland-protocol as wasm rather than
-      # reimplementing the framing in another language (see #20). Nothing else
-      # here would notice a dependency creeping back in that breaks that —
-      # tokio's default features pull in mio, which does not build for wasm at
-      # all, and that is exactly how this crate started out.
+      # Rust↔TypeScript CBOR fixtures. No compositor; a protocol break in
+      # web/src/messages.ts should fail here, not only after npm test.
+      - name: Cross-language TypeScript fixtures
+        run: cargo test --workspace --locked --test web_cross_language
+
+      # The TypeScript client in web/ reimplements framing; crates/termland-web
+      # is the leftover wasm spike and still depends on this crate targeting
+      # wasm32. Tokio's default features pull in mio, which does not build for
+      # wasm at all, and that is exactly how this crate started out.
       - name: Check termland-protocol still builds for wasm32
         run: cargo build -p termland-protocol --locked --target wasm32-unknown-unknown
+
+      # TypeScript client: framing, CBOR, Q2 headers, and the cross-language
+      # fixtures. Node is not otherwise a build dependency of this repo.
+      - name: TypeScript protocol tests
+        run: |
+          dnf install -y --setopt=install_weak_deps=False nodejs npm
+          cd web
+          npm ci
+          npm test
 
       - name: Check the RPM specs still parse
         run: |

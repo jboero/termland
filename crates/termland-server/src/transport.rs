@@ -10,12 +10,12 @@ use libpulse_binding as pulse;
 use libpulse_simple_binding as psimple;
 
 /// Run the server in SSH subsystem mode: protocol over stdin/stdout. Never a
-/// QUIC connection, so there's no `quinn::Connection` to hand down.
+/// split-plane media connection, so video stays on the control stream.
 pub async fn run_subsystem() -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let io = tokio::io::join(stdin, stdout);
-    handle_session(io, false, None).await
+    handle_session(io, false, crate::media::MediaConnection::None).await
 }
 
 const MAX_CONCURRENT_SESSIONS: usize = 32;
@@ -48,13 +48,13 @@ pub async fn run_tcp_listener(
         let acceptor = tls_acceptor.clone();
         let auth = require_auth;
         tokio::spawn(async move {
-            // Never a QUIC connection (that's `quic.rs`'s listener), so
-            // there's no `quinn::Connection` to hand down here.
+            // Never a QUIC/WebTransport connection (those have their own
+            // listeners), so media stays on the control stream.
             let result = if let Some(acceptor) = acceptor {
                 match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
                         tracing::info!("TLS handshake complete for {addr}");
-                        handle_session(tls_stream, auth, None).await
+                        handle_session(tls_stream, auth, crate::media::MediaConnection::None).await
                     }
                     Err(e) => {
                         tracing::warn!("TLS handshake failed for {addr}: {e}");
@@ -62,7 +62,7 @@ pub async fn run_tcp_listener(
                     }
                 }
             } else {
-                handle_session(socket, auth, None).await
+                handle_session(socket, auth, crate::media::MediaConnection::None).await
             };
             if let Err(e) = result {
                 tracing::error!("Session error for {addr}: {e}");
@@ -90,28 +90,25 @@ enum InputCommand {
     /// Already-composed Unicode from a soft keyboard / IME. Injected via a
     /// temporary xkb keymap rather than scancodes.
     Text(String),
-    PointerMove { x: f64, y: f64, width: u32, height: u32 },
+    PointerMove { x: f64, y: f64, width: u32, height: u32, absolute: bool },
     PointerButton { button: u32, pressed: bool },
     Scroll { dx: f64, dy: f64 },
     Stop,
 }
 
 /// Handle a single client session over any AsyncRead+AsyncWrite transport.
-/// `pub(crate)` so `crate::quic`'s listener (a sibling entry point, not a
-/// fork of this logic) can reuse it as-is for QUIC streams, exactly like
-/// `run_tcp_listener` below does for TCP/TLS sockets.
+/// `pub(crate)` so the QUIC and WebTransport listeners (sibling entry points,
+/// not forks of this logic) can reuse it as-is, exactly like
+/// `run_tcp_listener` does for TCP/TLS sockets.
 ///
-/// `quic_connection` is `Some` only when `io` is a QUIC control bidi stream
-/// (`crate::quic::handle_quic_connection`'s caller) — every other transport
-/// passes `None`, which keeps this function's behavior byte-for-byte
-/// unchanged for TCP/TLS/SSH. It is just handed further down to
-/// `run_session`, which is where the actual decision to open Q2's video/audio
-/// planes gets made (see that function's doc comment for why not here).
+/// `media` is `None` for TCP/TLS/SSH (video stays on the control stream) and
+/// the matching connection handle for `--quic` / `--webtransport`, which is
+/// where `run_session` opens Q2's video uni stream. See `media.rs`.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn handle_session<T>(
     io: T,
     require_auth: bool,
-    quic_connection: Option<quinn::Connection>,
+    media: crate::media::MediaConnection,
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -247,6 +244,22 @@ where
         };
 
         match msg {
+            // Keepalive is valid before SessionCreate/Attach. The browser
+            // client starts Ping after HelloAck while the user is still on
+            // the session list; rejecting it here closed the WebTransport
+            // session with STOP_SENDING five seconds after connect.
+            Message::Ping(p) => {
+                framed
+                    .send(Message::Pong(Pong {
+                        timestamp_us: p.timestamp_us,
+                    }))
+                    .await
+                    .context("failed to send Pong")?;
+            }
+            Message::SessionEnd(se) => {
+                tracing::info!("Client ended before selecting a session: {}", se.reason);
+                return Ok(());
+            }
             Message::SessionList(_) => {
                 // Once --auth is on, only show the caller's own sessions -
                 // otherwise any authenticated user could enumerate every
@@ -302,11 +315,11 @@ where
                     .ok();
             }
             Message::SessionCreate(sc) => {
-                run_session(&mut framed, SessionRequest::Create(sc), authenticated_user.clone(), quic_connection).await?;
+                run_session(&mut framed, SessionRequest::Create(sc), authenticated_user.clone(), media).await?;
                 return Ok(());
             }
             Message::SessionAttach(sa) => {
-                run_session(&mut framed, SessionRequest::Attach(sa), authenticated_user.clone(), quic_connection).await?;
+                run_session(&mut framed, SessionRequest::Attach(sa), authenticated_user.clone(), media).await?;
                 return Ok(());
             }
             other => {
@@ -347,10 +360,10 @@ enum SessionRequest {
 /// `--auth`. Deliberately NOT sourced from `request` - the client must never
 /// get to say who the session runs as.
 ///
-/// `quic_connection`: `Some` only for a QUIC control stream, passed through
-/// unchanged from `handle_session`. This function (not `handle_session`) is
-/// where the video uni stream actually gets opened - see the `open_uni()`
-/// call below for why here specifically.
+/// `media`: how (if at all) this session opens Q2 video/audio planes. `None`
+/// for TCP/TLS/SSH; a live connection handle for `--quic` / `--webtransport`.
+/// This function (not `handle_session`) is where the video uni stream actually
+/// gets opened — see the `open_planes()` call below for why here specifically.
 /// Audio codecs this server can encode, in the order it would prefer them.
 /// Adding one is a new `AudioCodec` variant plus an encoder backend — the
 /// wire format already carries the negotiation.
@@ -370,7 +383,7 @@ async fn run_session<T>(
     framed: &mut Framed<T, TermlandCodec>,
     request: SessionRequest,
     run_as: Option<String>,
-    quic_connection: Option<quinn::Connection>,
+    media: crate::media::MediaConnection,
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -605,27 +618,18 @@ where
     // Q2: open the video uni stream now, right as the encoder has produced
     // its first frame and the session is about to be declared ready.
     //
-    // Not eagerly, back in `handle_quic_connection` at connection-accept
-    // time: at that point we don't yet know whether this connection will
-    // even reach a live session - Hello/auth/SessionCreate can still fail,
-    // or the client might only be listing/closing sessions - and an
-    // eagerly-opened stream would just be wasted (and need explicit
-    // teardown) on every path that doesn't end in streaming.
+    // Not eagerly, back at connection-accept time: at that point we don't
+    // yet know whether this connection will even reach a live session —
+    // Hello/auth/SessionCreate can still fail, or the client might only be
+    // listing/closing sessions — and an eagerly-opened stream would just be
+    // wasted (and need explicit teardown) on every path that doesn't end in
+    // streaming.
     //
     // Not any later than here either: the first video frame is sent
     // moments below, so the stream has to exist before that send or the
-    // client's `accept_uni()` would race an as-yet-unopened stream right at
-    // the most latency-sensitive moment (session startup).
-    let mut quic_planes: Option<crate::quic::QuicPlanes> = match quic_connection {
-        Some(connection) => {
-            let video = connection
-                .open_uni()
-                .await
-                .context("failed to open QUIC video stream")?;
-            Some(crate::quic::QuicPlanes { video, connection })
-        }
-        None => None,
-    };
+    // client's incoming-uni accept would race an as-yet-unopened stream
+    // right at the most latency-sensitive moment (session startup).
+    let mut media_planes = media.open_planes().await?;
 
     // Negotiate the audio codec: walk the client's preference order and take
     // the first one this server can actually encode. Done before SessionReady
@@ -669,11 +673,10 @@ where
     tracing::info!("  Video codec: {first_codec}");
     tracing::info!(
         "  Transport: {}",
-        if quic_planes.is_some() {
-            "QUIC (Q2: split video uni stream + audio datagrams)"
-        } else {
-            "single control stream (TCP/TLS/SSH)"
-        }
+        media_planes
+            .as_ref()
+            .map(|p| p.transport_name())
+            .unwrap_or("single control stream (TCP/TLS/SSH)")
     );
 
     // Optionally start audio capture if the client requested it and we agreed
@@ -739,11 +742,11 @@ where
     };
 
     // Send the first frame
-    match quic_planes.as_mut() {
+    match media_planes.as_mut() {
         Some(planes) => {
-            send_video_frame_quic(&mut planes.video, &first_frame)
+            send_video_frame_split(planes, &first_frame)
                 .await
-                .context("failed to send first frame (QUIC video stream)")?;
+                .context("failed to send first frame (split video stream)")?;
         }
         None => {
             let first_msg = frame_to_message(&first_frame);
@@ -837,10 +840,10 @@ where
                 current_width = fw;
                 current_height = fh;
 
-                match quic_planes.as_mut() {
+                match media_planes.as_mut() {
                     Some(planes) => {
-                        if let Err(e) = send_video_frame_quic(&mut planes.video, &frame).await {
-                            tracing::error!("Failed to send frame (QUIC video stream): {e}");
+                        if let Err(e) = send_video_frame_split(planes, &frame).await {
+                            tracing::error!("Failed to send frame (split video stream): {e}");
                             break;
                         }
                     }
@@ -866,8 +869,8 @@ where
                 }
             } => {
                 if let Some(chunk) = audio {
-                    match quic_planes.as_ref() {
-                        Some(planes) => send_audio_datagram_quic(&planes.connection, &chunk),
+                    match media_planes.as_ref() {
+                        Some(planes) => planes.send_audio(&chunk),
                         None => {
                             if let Err(e) = framed.send(Message::AudioChunk(chunk)).await {
                                 tracing::error!("Failed to send audio: {e}");
@@ -947,6 +950,7 @@ where
                                     y: mm.y,
                                     width: current_width,
                                     height: current_height,
+                                    absolute: mm.absolute,
                                 });
                             }
                             Message::MouseButton(mb) => {
@@ -1341,8 +1345,12 @@ fn input_thread(
                     tracing::error!("Text injection failed: {e}");
                 }
             }
-            InputCommand::PointerMove { x, y, width, height } => {
-                injector.pointer_motion_absolute(x, y, width, height);
+            InputCommand::PointerMove { x, y, width, height, absolute } => {
+                if absolute {
+                    injector.pointer_motion_absolute(x, y, width, height);
+                } else {
+                    injector.pointer_motion_relative(x, y);
+                }
             }
             InputCommand::PointerButton { button, pressed } => {
                 injector.pointer_button(button, pressed);
@@ -2026,59 +2034,16 @@ fn set_remote_clipboard(wayland_display: &str, runtime_dir: &str, data: &[u8], m
     let _ = child.wait();
 }
 
-/// Write one video frame to the Q2 video uni stream: the 18-byte fixed
-/// header (`crate::quic::video_header_bytes`) followed immediately by the
-/// raw encoded frame bytes. Not the CBOR `Message` envelope - see
-/// `crate::quic`'s module doc comment for why this stream uses a lighter,
-/// fixed-shape framing instead.
-async fn send_video_frame_quic(video: &mut quinn::SendStream, frame: &CapturedFrame) -> Result<()> {
+/// Write one video frame to the Q2 video uni stream (raw QUIC or WebTransport).
+async fn send_video_frame_split(
+    planes: &mut crate::media::MediaPlanes,
+    frame: &CapturedFrame,
+) -> Result<()> {
     let CapturedFrame::Video { data, keyframe, width, height, timestamp_us, codec } = frame;
     let frame_type = if *keyframe { FrameType::Keyframe } else { FrameType::Inter };
-    let header = crate::quic::video_header_bytes(
-        *codec,
-        frame_type,
-        *width,
-        *height,
-        *timestamp_us,
-        data.len() as u32,
-    );
-    video.write_all(&header).await.context("failed to write QUIC video header")?;
-    video.write_all(data).await.context("failed to write QUIC video frame data")?;
-    Ok(())
-}
-
-/// Send one Opus chunk as a single QUIC datagram - Q2's audio plane. Safe
-/// without fragmentation: a 20ms@48kHz-stereo Opus frame is roughly
-/// 100-200 bytes, comfortably under any real-world QUIC datagram MTU. Still
-/// defensive: checks the connection's actual negotiated max datagram size
-/// and logs+drops rather than send something the peer would reject or that
-/// would arrive truncated/corrupt. A dropped audio chunk is inaudible for
-/// 20ms and never worth blocking or panicking the session over.
-fn send_audio_datagram_quic(connection: &quinn::Connection, chunk: &AudioChunk) {
-    let header = crate::quic::audio_header_bytes(chunk.sample_rate, chunk.channels);
-    let total_len = crate::quic::AUDIO_HEADER_LEN + chunk.data.len();
-
-    match connection.max_datagram_size() {
-        Some(max) if total_len > max => {
-            tracing::warn!(
-                "dropping audio datagram: {total_len} bytes exceeds negotiated max datagram size {max}"
-            );
-            return;
-        }
-        Some(_) => {}
-        None => {
-            tracing::warn!("dropping audio datagram: peer does not support QUIC datagrams");
-            return;
-        }
-    }
-
-    let mut buf = Vec::with_capacity(total_len);
-    buf.extend_from_slice(&header);
-    buf.extend_from_slice(&chunk.data);
-
-    if let Err(e) = connection.send_datagram(buf.into()) {
-        tracing::warn!("failed to send audio datagram: {e}");
-    }
+    planes
+        .send_video(*codec, frame_type, *width, *height, *timestamp_us, data)
+        .await
 }
 
 /// Convert a captured frame (video) into a protocol message.

@@ -157,3 +157,140 @@ async fn empty_allowlist_refuses_browser_origins() -> Result<()> {
     );
     Ok(())
 }
+
+/// A CONNECT to the wrong path must not become a session. The listener logs
+/// `request.path()`; logging is not a check.
+#[tokio::test]
+#[ignore = "spawns a real server; run with --ignored"]
+async fn unknown_path_is_rejected() -> Result<()> {
+    let _server = spawn_server(28807, 28808, &["https://app.example"]);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let endpoint = client_endpoint();
+    let result = endpoint
+        .connect(
+            wtransport::endpoint::ConnectOptions::builder("https://127.0.0.1:28808/not-termland")
+                .add_header("origin", "https://app.example")
+                .build(),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a session was established on a path other than /termland",
+    );
+    Ok(())
+}
+
+/// SessionList after HelloAck must work on WebTransport the same as on TCP:
+/// no compositor, no video stream, just the control plane.
+#[tokio::test]
+#[ignore = "spawns a real server; run with --ignored"]
+async fn hello_then_session_list_on_webtransport() -> Result<()> {
+    let _server = spawn_server(28809, 28810, &["https://app.example"]);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let endpoint = client_endpoint();
+    let connection = endpoint
+        .connect(
+            wtransport::endpoint::ConnectOptions::builder("https://127.0.0.1:28810/termland")
+                .add_header("origin", "https://app.example")
+                .build(),
+        )
+        .await?;
+
+    let (send, recv) = connection.open_bi().await?.await?;
+    let mut framed = Framed::new(tokio::io::join(recv, send), TermlandCodec);
+
+    framed
+        .send(Message::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "webtransport-list".into(),
+        }))
+        .await?;
+
+    let hello_ack = tokio::time::timeout(Duration::from_secs(10), framed.next())
+        .await
+        .expect("timed out waiting for HelloAck")
+        .expect("stream closed before HelloAck")?;
+    assert!(matches!(hello_ack, Message::HelloAck(_)));
+
+    framed
+        .send(Message::SessionList(termland_protocol::SessionList {}))
+        .await?;
+
+    let list = tokio::time::timeout(Duration::from_secs(10), framed.next())
+        .await
+        .expect("timed out waiting for SessionListResult")
+        .expect("stream closed before SessionListResult")?;
+    match list {
+        Message::SessionListResult(_) => {}
+        other => panic!("expected SessionListResult, got {:?}", other.message_id()),
+    }
+    Ok(())
+}
+
+/// The browser client starts Ping after HelloAck, before SessionCreate. That
+/// keepalive must not tear the control stream down — a regression here is
+/// exactly "Connect works for five seconds, then STOP_SENDING".
+#[tokio::test]
+#[ignore = "spawns a real server; run with --ignored"]
+async fn ping_before_session_create_gets_pong() -> Result<()> {
+    let _server = spawn_server(28811, 28812, &["https://app.example"]);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let endpoint = client_endpoint();
+    let connection = endpoint
+        .connect(
+            wtransport::endpoint::ConnectOptions::builder("https://127.0.0.1:28812/termland")
+                .add_header("origin", "https://app.example")
+                .build(),
+        )
+        .await?;
+
+    let (send, recv) = connection.open_bi().await?.await?;
+    let mut framed = Framed::new(tokio::io::join(recv, send), TermlandCodec);
+
+    framed
+        .send(Message::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "webtransport-ping".into(),
+        }))
+        .await?;
+
+    let hello_ack = tokio::time::timeout(Duration::from_secs(10), framed.next())
+        .await
+        .expect("timed out waiting for HelloAck")
+        .expect("stream closed before HelloAck")?;
+    assert!(matches!(hello_ack, Message::HelloAck(_)));
+
+    framed
+        .send(Message::Ping(termland_protocol::Ping {
+            timestamp_us: 42,
+        }))
+        .await?;
+
+    let pong = tokio::time::timeout(Duration::from_secs(10), framed.next())
+        .await
+        .expect("timed out waiting for Pong — Ping before SessionCreate was likely rejected")
+        .expect("stream closed before Pong — Ping must be accepted in the session-control loop")?;
+    match pong {
+        Message::Pong(p) => assert_eq!(p.timestamp_us, 42),
+        other => panic!("expected Pong, got {:?}", other.message_id()),
+    }
+
+    // And the stream must still accept SessionList afterwards.
+    framed
+        .send(Message::SessionList(termland_protocol::SessionList {}))
+        .await?;
+    let list = tokio::time::timeout(Duration::from_secs(10), framed.next())
+        .await
+        .expect("timed out waiting for SessionListResult after Ping")
+        .expect("stream closed after Ping")?;
+    assert!(
+        matches!(list, Message::SessionListResult(_)),
+        "expected SessionListResult after Ping, got {:?}",
+        list.message_id()
+    );
+    Ok(())
+}

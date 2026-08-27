@@ -231,6 +231,23 @@ you create or resume there show up in the same resumable-session list the
 desktop `--manager`/`--tray` see, since they're the same server-side
 sessions.
 
+### Browser client (experimental)
+
+A Chromium or recent Firefox tab can attach over HTTP/3 WebTransport. This is
+a second UDP listener, not a change to `--quic`. Origin allowlisting is
+closed by default.
+
+```bash
+./web/build.sh
+python3 -m http.server 8080 --directory web
+termland-server --webtransport --webtransport-origin http://localhost:8080
+```
+
+Open `http://localhost:8080/` and paste the certificate SHA-256 the server
+logs if you are not using a normally trusted certificate. Details, browser
+support, and what is deliberately not implemented yet:
+[docs/webtransport.md](docs/webtransport.md).
+
 ## Building from Source
 
 ### Dependencies
@@ -334,7 +351,8 @@ The client RPM installs:
 - [ ] iOS client
 - [ ] Audio bitrate configuration
 - [ ] Multi-monitor support
-- [ ] Web client (WebCodecs + WebTransport)
+- [x] Experimental web client (WebCodecs + WebTransport) — see
+      [docs/webtransport.md](docs/webtransport.md)
 
 See [ROADMAP.md](ROADMAP.md) for the full detail behind each item.
 

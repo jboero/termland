@@ -1,8 +1,9 @@
-# WebTransport (browser) transport — spike
+# WebTransport (browser) transport
 
-Status: **transport spike**. A browser establishes a session, opens the control
-stream and completes a real `Hello`/`HelloAck` against an unmodified server.
-Video, audio, input and session management are not wired up yet.
+Status: **experimental**. A browser establishes an HTTP/3 WebTransport session,
+speaks the existing control protocol, and (once a session is attached) receives
+Q2 video on a server-opened unidirectional stream for WebCodecs. Audio is not
+sent on this path — see below.
 
 Tracking issue: [#20](https://github.com/jboero/termland/issues/20).
 
@@ -16,94 +17,118 @@ No browser API opens a bare QUIC connection.
 
 So `--webtransport` is additive. `--quic` and its Android client are untouched.
 
-## What is shared, and what is not
+## Architecture
 
-Everything above the transport is shared. Once the control stream exists, its
-halves are joined into one `AsyncRead + AsyncWrite` and handed to the same
-`handle_session` that TCP, TLS, the SSH subsystem and raw QUIC use. Hello, PAM
-auth, the session lifecycle, input and codec negotiation are the existing
-implementations.
+```
+Browser (TypeScript in web/)
+  │  HTTP/3 WebTransport  (`--webtransport`, default port = --port + 1)
+  ├─ bidi stream  →  existing handle_session (Hello / auth / Session*)
+  └─ uni stream   ←  Q2 video (same 18-byte header as native QUIC)
+```
 
-The browser side shares them too, which is the part worth spelling out. The
-usual approach is to reimplement the wire format in JavaScript and then keep
-the two in step — the cross-language fixtures proposed in #20 exist precisely
-to catch that drift. Instead, `termland-protocol` compiles to
-`wasm32-unknown-unknown`, so `crates/termland-web` runs the *same*
-`TermlandCodec`, the same `Message` enum and the same serde derives as the
-server. There is no second implementation to drift. A protocol change is a
-recompile, not a port.
+Rust stays on the server. The browser client is TypeScript because
+WebTransport and WebCodecs are JavaScript APIs; compiling the protocol crate
+to wasm would not remove that work. `web/src/` encodes the 7-byte `TL` frame
+and serde's externally-tagged CBOR, pinned by fixtures in `web/fixtures/`
+that Rust encodes and TypeScript decodes, and the other way around.
 
-What JavaScript is left holding is genuine browser API surface: obtaining a
-`WebTransport`, feeding `VideoDecoder`, painting a canvas.
+`crates/termland-web` is the earlier Hello-only wasm spike. It is still
+buildable; the page in `web/` no longer loads it.
 
-## Origin checking
+`handle_session` takes a `MediaConnection` (`None` / `Quic` /
+`WebTransport`) instead of `Option<quinn::Connection>`, so `run_session`
+can open a video uni stream on either UDP listener.
+
+## Running
+
+```
+# TypeScript client
+./web/build.sh
+python3 -m http.server 8080 --directory web
+
+# Server. The page origin must be listed or every browser is refused.
+termland-server --webtransport --webtransport-origin http://localhost:8080
+```
+
+Open `http://localhost:8080/`. If the server minted a development certificate
+(no `--tls-cert`), paste the SHA-256 it logged into the page.
+
+A disposable echo with no Termland framing:
+
+```
+cargo run -p termland-server --example webtransport_echo
+```
+
+then `web/spike/echo.html`. That is the certificate-hash / Origin check
+before any protocol is involved.
+
+The static files are **not** embedded in `termland-server`. Serving them from
+the same process is a later packaging decision.
+
+## Origin, path, certificates
 
 Browser requests carry an `Origin`; native clients do not, and a page cannot
-suppress its own. The listener therefore treats a **missing** origin as "not a
-browser" and allows it, and an origin that is **present** must appear in
-`--webtransport-origin`.
+suppress its own. A **missing** origin is treated as "not a browser" and
+allowed. A **present** origin must appear in `--webtransport-origin`.
 
-The allowlist is empty by default, which refuses every browser. That is
-deliberate. Without it, any page a user visits could open a session to a
-Termland server on their network — and on a server running without `--auth`,
-create and drive a desktop session on it.
+The allowlist is empty by default, which refuses every browser. Without that,
+any page a user visits could open a session to a Termland server on their
+network — and on a server running without `--auth`, create and drive a
+desktop session on it.
 
-The header is read case-insensitively rather than through
-`SessionRequest::origin()`, which looks up the exact lowercase key in a map
-that does no case folding. A browser always sends it lowercase, so this is
-belt-and-braces, but a check that depends on the peer's spelling is not much of
-a check.
+`:path` must be `/termland` (trailing slash and query string folded). Anything
+else is 404.
 
-## Certificates
+WebTransport is secure-context only. Two deployments work:
 
-WebTransport is secure-context only and browsers offer no equivalent of the
-native client's `--accept-invalid-certs`. Two deployments work:
-
-1. **A normally trusted certificate** — pass `--tls-cert`/`--tls-key`. Nothing
-   else is needed and this is the production path.
-2. **`serverCertificateHashes`** — for development and LAN use. Browsers accept
-   a hash only for a certificate valid **two weeks or less**, so the server's
-   ordinary long-lived self-signed certificate cannot be reused here. With no
-   certificate configured, `--webtransport` mints a 13-day one and logs its
-   SHA-256 for pasting into the client.
-
-Origin allowlisting applies either way.
+1. **A normally trusted certificate** — `--tls-cert` / `--tls-key`. Production.
+2. **`serverCertificateHashes`** — development and LAN. Browsers accept a hash
+   only for a certificate valid **two weeks or less**, so the server's ordinary
+   long-lived self-signed certificate cannot be reused. With no certificate
+   configured, `--webtransport` mints a 13-day one and logs its SHA-256.
 
 ## Ports
 
 `--webtransport-port` defaults to `--port + 1`. HTTP/3 and raw QUIC are both
 UDP but negotiate different ALPN, so one socket cannot serve both.
 
+## Browser compatibility
+
+| Browser | WebTransport | WebCodecs `VideoDecoder` | This client |
+|---|---|---|---|
+| Chromium / Chrome | yes | yes | primary target; `web/test-browser.sh` |
+| Firefox (recent) | yes | yes | expected to work; not in CI |
+| Safari | incomplete | incomplete | not targeted |
+
+`VideoDecoder.isConfigSupported()` is probed at connect time. Only codecs that
+succeed are advertised in `SessionCreate`.
+
+FFmpeg's packets are used as an elementary stream (AV1 OBUs, VP9 frames,
+Annex-B H.264/H.265). WebCodecs configs are given **without** a `description`
+box. If an encoder emitted avcC/hvcC instead, Chromium would reject the chunk
+— advertise a different codec rather than guessing a string.
+
 ## Testing
 
 | Test | Covers |
 |---|---|
-| `crates/termland-server/src/webtransport.rs` unit tests | origin matching, header casing, the closed-by-default rule |
-| `crates/termland-server/tests/webtransport_handshake.rs` | the listener end-to-end via a Rust WebTransport client, including origin rejection |
+| `webtransport.rs` unit tests | origin matching, path allowlist, header casing, closed-by-default |
+| `tests/webtransport_handshake.rs` | HTTP/3 session, Hello/HelloAck, origin and path rejection |
+| `tests/webtransport_q2.rs` | real compositor keyframe on the Q2 uni stream |
+| `termland-protocol` `web_cross_language` | Rust↔TypeScript CBOR fixtures |
+| `web/` vitest | framing (partial headers, 16 MiB cap, LE lengths), Q2 header, evdev map |
 | `web/test-browser.sh` | a real Chrome completing the handshake |
 
-The Rust client tests can send an arbitrary `Origin` — including none — which a
-browser can never do, so they cover the rejection paths a browser cannot reach.
-They do **not** show that a browser interoperates; only `test-browser.sh` does.
-
-One trap worth recording: driving headless Chrome with
-`--virtual-time-budget` **breaks this**. It fast-forwards timers, the QUIC
-handshake never completes, and the symptom is a session that appears
-server-side while the browser's `ready` promise hangs forever with no error.
-`test-browser.sh` uses wall-clock time and reports its result by fetching a URL,
-so the outcome is visible without guessing when the handshake finished.
+One trap: headless Chrome `--virtual-time-budget` fast-forwards timers, the
+QUIC handshake never completes, and the browser's `ready` promise hangs with
+no error. `test-browser.sh` uses wall-clock time.
 
 ## Not done
 
-- **Media planes.** `handle_session` is called with `None` for the QUIC
-  connection, so video and audio travel as CBOR on the control stream — the
-  pre-Q2 arrangement TCP still uses. Splitting them onto a WebTransport uni
-  stream and datagrams needs the `Option<quinn::Connection>` coupling in
-  `run_session` generalised first.
-- **WebCodecs decode, input, session management.** The `web-sys` bindings for
-  `VideoDecoder` compile (checked), but nothing is wired up.
-- **Audio timestamps.** Q2's 5-byte audio datagram header carries sample rate
-  and channels but not `AudioChunk.timestamp_us`, which `EncodedAudioChunk`
-  requires. That header needs extending or a WebTransport-specific one, without
-  breaking the Android Q2 reader.
-- **Safari.** Not supported, and not targeted.
+- **Audio.** Q2's 5-byte datagram header carries sample rate and channels but
+  not `AudioChunk.timestamp_us`, which `EncodedAudioChunk` requires. This path
+  does not send audio rather than inventing a clock. Extending that header
+  must not break the Android Q2 reader.
+- **Clipboard, cursor bitmaps, file transfer, window list UI, touch.**
+- **Embedding the static build in `termland-server`.**
+- **Safari.**

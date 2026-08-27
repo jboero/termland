@@ -60,7 +60,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use termland_protocol::{FrameType, VideoCodec};
 
 /// ALPN identifier for the termland QUIC transport. QUIC requires ALPN — it's
 /// how the handshake picks a protocol and defends against version-downgrade
@@ -159,88 +158,24 @@ async fn handle_quic_connection(incoming: quinn::Incoming, require_auth: bool) -
     // them back into one AsyncRead+AsyncWrite the same way `run_subsystem`
     // already combines stdin/stdout for the SSH-subsystem entry point.
     let io = tokio::io::join(recv, send);
-    crate::transport::handle_session(io, require_auth, Some(connection)).await
+    crate::transport::handle_session(
+        io,
+        require_auth,
+        crate::media::MediaConnection::Quic(connection),
+    )
+    .await
 }
 
-/// The Q2 video/audio planes for one QUIC session, assembled by
-/// `run_session` once it actually needs them (see that call site).
-pub(crate) struct QuicPlanes {
-    /// Server-opened uni stream carrying one Q2-framed video frame after
-    /// another (`video_header_bytes` + raw encoded bytes).
-    pub(crate) video: quinn::SendStream,
-    /// Kept for `Connection::send_datagram` (audio) — sending a datagram
-    /// needs only the connection, not a stream object.
-    pub(crate) connection: quinn::Connection,
-}
-
-/// Fixed binary header prefixing every frame on the Q2 video uni stream.
-/// All multi-byte fields little-endian:
-/// `[codec: u8][frame_type: u8][width: u16][height: u16][timestamp_us: u64][data_len: u32]`
-/// = 1+1+2+2+8+4 = 18 bytes. Followed immediately by `data_len` bytes of the
-/// encoded frame — standard length-prefixed framing, nothing fancier.
-pub(crate) const VIDEO_HEADER_LEN: usize = 18;
-
-/// Fixed binary header prefixing the Opus payload in every Q2 audio
-/// datagram: `[sample_rate: u32][channels: u8]`, little-endian = 5 bytes.
-/// No length field: a QUIC datagram is already message-delimited (one
-/// `send_datagram()`/`read_datagram()` call is exactly one complete
-/// datagram, never partial) — everything after these 5 bytes IS the
-/// payload.
-pub(crate) const AUDIO_HEADER_LEN: usize = 5;
-
-/// Encode one video frame's 18-byte Q2 header. Must match
-/// `termland-mobile-core`'s client-side decoder byte-for-byte — see this
-/// module's tests for the exact layout.
-pub(crate) fn video_header_bytes(
-    codec: VideoCodec,
-    frame_type: FrameType,
-    width: u16,
-    height: u16,
-    timestamp_us: u64,
-    data_len: u32,
-) -> [u8; VIDEO_HEADER_LEN] {
-    let mut buf = [0u8; VIDEO_HEADER_LEN];
-    buf[0] = codec_tag(codec);
-    buf[1] = frame_type_tag(frame_type);
-    buf[2..4].copy_from_slice(&width.to_le_bytes());
-    buf[4..6].copy_from_slice(&height.to_le_bytes());
-    buf[6..14].copy_from_slice(&timestamp_us.to_le_bytes());
-    buf[14..18].copy_from_slice(&data_len.to_le_bytes());
-    buf
-}
-
-/// Encode one audio datagram's 5-byte Q2 header.
-pub(crate) fn audio_header_bytes(sample_rate: u32, channels: u8) -> [u8; AUDIO_HEADER_LEN] {
-    let mut buf = [0u8; AUDIO_HEADER_LEN];
-    buf[0..4].copy_from_slice(&sample_rate.to_le_bytes());
-    buf[4] = channels;
-    buf
-}
-
-/// Matches `termland_protocol::VideoCodec::all_preferred()`'s declared
-/// preference order exactly (Av1 best/most-open first) — this is a fixed
-/// wire tag, not derived from the enum's declaration order, so it can't
-/// silently drift if `VideoCodec`'s variants are ever reordered.
-fn codec_tag(codec: VideoCodec) -> u8 {
-    match codec {
-        VideoCodec::Av1 => 0,
-        VideoCodec::Vp9 => 1,
-        VideoCodec::Vp8 => 2,
-        VideoCodec::H265 => 3,
-        VideoCodec::H264 => 4,
-    }
-}
-
-fn frame_type_tag(frame_type: FrameType) -> u8 {
-    match frame_type {
-        FrameType::Inter => 0,
-        FrameType::Keyframe => 1,
-    }
-}
+// Q2 header encode/decode lives in `termland-protocol::q2` so the TypeScript
+// client, the wasm spike, and this listener cannot drift. Tests below import
+// those helpers from the protocol crate directly.
 
 #[cfg(test)]
 mod header_tests {
-    use super::*;
+    use termland_protocol::{
+        audio_header_bytes, video_header_bytes, AUDIO_HEADER_LEN, FrameType, VIDEO_HEADER_LEN,
+        VideoCodec,
+    };
 
     /// Mirrors the client-side decoder this header must match: unpack the 18
     /// bytes back into fields the same way `termland-mobile-core`'s

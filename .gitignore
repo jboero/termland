@@ -12,4 +12,8 @@
 
 # Generated wasm bundle for the browser client (web/build.sh output).
 /web/pkg/
+/web/node_modules/
+/web/dist/
+/web/headless.html
+/web/bun.lock
 /crates/termland-web/target/

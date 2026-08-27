@@ -20,12 +20,9 @@
 //!
 //! # Scope
 //!
-//! This is the transport spike for the browser client: establish a
-//! WebTransport session, open the control stream, and complete the real
-//! `Hello`/`HelloAck` exchange against an unmodified server. Video decode,
-//! input and session management are deliberately not here yet — the point is
-//! to prove the transport and the shared-codec approach before building on
-//! them.
+//! This crate is the original Hello-only wasm spike. The product browser
+//! client is TypeScript in `web/` (see `docs/webtransport.md`). `connect()`
+//! still completes Hello/HelloAck against `--webtransport`.
 
 use bytes::BytesMut;
 use futures::StreamExt;

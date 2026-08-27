@@ -1,60 +1,51 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Termland — WebTransport spike</title>
+<title>Termland</title>
 <style>
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 46rem;
-         background: #181825; color: #cdd6f4; }
-  h1 { font-size: 1.2rem; color: #89b4fa; }
-  label { display: block; margin: .75rem 0 .2rem; color: #a6adc8; }
-  input { width: 100%; padding: .4rem; background: #11111b; color: #cdd6f4;
-          border: 1px solid #313244; border-radius: 4px; font-family: monospace; }
-  button { margin-top: 1rem; padding: .5rem 1rem; background: #89b4fa; color: #11111b;
-           border: 0; border-radius: 4px; font-weight: 600; cursor: pointer; }
-  pre { background: #11111b; border: 1px solid #313244; border-radius: 4px;
-        padding: .75rem; white-space: pre-wrap; margin-top: 1rem; }
-  .note { color: #a6adc8; font-size: 13px; }
+  :root { color-scheme: dark; }
+  body { font: 14px/1.45 system-ui, sans-serif; margin: 0; background: #11111b; color: #cdd6f4; }
+  header { padding: .75rem 1rem; background: #181825; border-bottom: 1px solid #313244; }
+  h1 { font-size: 1rem; margin: 0 0 .5rem; color: #89b4fa; }
+  .row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: end; }
+  label { display: flex; flex-direction: column; font-size: 12px; color: #a6adc8; }
+  input { background: #11111b; color: #cdd6f4; border: 1px solid #313244; border-radius: 4px;
+          padding: .35rem .5rem; font-family: ui-monospace, monospace; min-width: 12rem;
+          height: 2rem; box-sizing: border-box; }
+  #url { width: 22rem; }
+  #hash { width: 36rem; }
+  button { background: #89b4fa; color: #11111b; border: 0; border-radius: 4px; padding: .4rem .8rem;
+           font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost { background: #313244; color: #cdd6f4; }
+  #stage { position: relative; display: grid; place-items: center; min-height: calc(100vh - 14rem);
+           background: #000; }
+  canvas { max-width: 100%; max-height: calc(100vh - 14rem); background: #000; outline: none; }
+  #banner { position: absolute; top: 1rem; background: #f9e2af; color: #11111b; padding: .4rem .8rem;
+            border-radius: 4px; font-weight: 600; }
+  #out, #sessions { padding: .5rem 1rem; font-size: 12px; }
+  #out { background: #181825; border-bottom: 1px solid #313244; }
+  pre { margin: 0; white-space: pre-wrap; }
+  .session { margin: .25rem 0; }
+  .note { color: #a6adc8; }
 </style>
-
-<h1>Termland — WebTransport transport spike</h1>
-
-<p class="note">
-  Completes a real <code>Hello</code>/<code>HelloAck</code> against
-  <code>termland-server --webtransport</code>. The framing and CBOR are the
-  server's own implementation compiled to WebAssembly, not a JavaScript port.
-</p>
-
-<label for="url">Server URL</label>
-<input id="url" value="https://localhost:7868/termland">
-
-<label for="hash">Certificate SHA-256 (from the server log; leave empty if the certificate is trusted)</label>
-<input id="hash" placeholder="e.g. a1:b2:c3:...">
-
-<button id="go">Connect</button>
-<pre id="out">Not connected.</pre>
-
-<script type="module">
-  import init, { connect } from './pkg/termland_web.js';
-
-  const out = document.getElementById('out');
-  await init();
-
-  document.getElementById('go').addEventListener('click', async () => {
-    const url = document.getElementById('url').value.trim();
-    const hash = document.getElementById('hash').value.trim();
-    out.textContent = `Connecting to ${url} …`;
-    try {
-      const greeting = await connect(url, hash === '' ? undefined : hash);
-      out.textContent =
-        `Connected.\n\n` +
-        `  server:           ${greeting.server_name}\n` +
-        `  protocol version: ${greeting.protocol_version}\n` +
-        `  session id:       ${greeting.session_id}\n` +
-        `  auth required:    ${greeting.auth_required}\n`;
-    } catch (e) {
-      out.textContent = `Failed: ${e}\n\n` +
-        `If the browser reports a certificate error, the server's development\n` +
-        `certificate is not trusted — paste its SHA-256 from the server log above.\n` +
-        `If it reports 403, this page's origin is not in --webtransport-origin.`;
-    }
-  });
-</script>
+<header>
+  <h1>Termland — browser client</h1>
+  <div class="row">
+    <label>Server URL<input id="url" value="https://127.0.0.1:7868/termland"></label>
+    <label>Certificate SHA-256<input id="hash" placeholder="from the server log, or empty if trusted"></label>
+    <label>Username<input id="user" autocomplete="username"></label>
+    <label>Password<input id="pass" type="password" autocomplete="current-password"></label>
+    <button id="connect">Connect</button>
+    <button id="new-session" class="ghost" disabled>New session</button>
+    <button id="pointer-lock" class="ghost">Pointer lock</button>
+  </div>
+  <p class="note">Experimental. Origin must be listed in <code>--webtransport-origin</code>.
+    Click the canvas for keyboard; pointer lock for relative mouse.</p>
+  <pre id="out">Not connected.</pre>
+</header>
+<div id="sessions"></div>
+<div id="stage">
+  <div id="banner" hidden></div>
+  <canvas id="screen" tabindex="0" width="1280" height="720"></canvas>
+</div>
+<script type="module" src="./dist/main.js"></script>
