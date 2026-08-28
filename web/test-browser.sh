@@ -13,8 +13,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CHROME=${CHROME:-$(command -v google-chrome || command -v chromium || true)}
-[ -n "$CHROME" ] || { echo "no chrome/chromium found; set CHROME=..." >&2; exit 1; }
+# chromium-browser is what Fedora (and so the CI container) installs; the
+# other two are what a developer machine is likely to have.
+CHROME=${CHROME:-$(command -v chromium-browser \
+                || command -v google-chrome \
+                || command -v chromium \
+                || true)}
+[ -n "$CHROME" ] || { echo "no chromium/chrome found; set CHROME=..." >&2; exit 1; }
 [ -f web/dist/index.js ] || { echo "run ./web/build.sh first" >&2; exit 1; }
 
 WORK=$(mktemp -d)
