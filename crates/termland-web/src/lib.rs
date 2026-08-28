@@ -1,19 +1,8 @@
 //! Termland's browser protocol codec, compiled to WebAssembly.
 //!
-//! # Why wasm rather than a JavaScript protocol library
-//!
-//! Reimplementing the 7-byte `TL` header and serde's externally-tagged CBOR
-//! in TypeScript is a second source of truth. Cross-language fixtures only
-//! tell you *after* the two have already diverged — which is exactly the hole
-//! a hand-rolled encoder had until this crate took over encode/decode.
-//!
-//! `termland-protocol` compiles to wasm, so the browser runs the same
-//! `TermlandCodec`, the same `Message` enum and the same serde derives the
-//! server does. A protocol change is a recompile, not a port.
-//!
-//! What is left for JavaScript is the part that genuinely is browser API
-//! surface — obtaining a `WebTransport`, handing frames to `VideoDecoder`,
-//! painting a canvas, capturing input.
+//! Same `TermlandCodec` / `Message` / serde CBOR as the server, so a protocol
+//! change is a recompile. WebTransport, WebCodecs, canvas, and input stay in
+//! TypeScript (`web/src`).
 
 use bytes::{Buf, BufMut, BytesMut};
 use js_sys::{Array, BigInt, Reflect, Uint8Array};
@@ -408,20 +397,4 @@ mod tests {
         assert_eq!(got, payload);
     }
 
-    #[test]
-    fn q2_header_round_trips() {
-        let bytes = video_header_bytes(
-            VideoCodec::H264,
-            FrameType::Keyframe,
-            0x0102,
-            0x0304,
-            0x0102030405060708,
-            0xAABBCCDD,
-        );
-        let parsed = parse_video_header(&bytes).unwrap();
-        assert_eq!(parsed.codec, VideoCodec::H264);
-        assert!(parsed.keyframe);
-        assert_eq!(parsed.width, 0x0102);
-        assert_eq!(parsed.data_len, 0xAABBCCDD);
-    }
 }

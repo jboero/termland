@@ -78,8 +78,9 @@ struct Args {
     webtransport_port: Option<u16>,
 
     /// Browser origin permitted to open WebTransport sessions, e.g.
-    /// https://desktop.example.com. Repeat for several. With none given,
-    /// every browser request is refused.
+    /// https://desktop.example.com. Repeat for several. Empty (the default)
+    /// refuses every browser Origin — otherwise any page on the LAN could
+    /// open a session, and without --auth, create and drive a desktop.
     #[arg(long = "webtransport-origin", value_name = "ORIGIN")]
     webtransport_origins: Vec<String>,
 

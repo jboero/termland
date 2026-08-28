@@ -1,9 +1,7 @@
 //! Probe WebCodecs for the codecs this browser can actually decode.
 //!
-//! The strings are concrete configurations, not codec families: `av01` alone
-//! is not enough for `VideoDecoder.isConfigSupported`. Preference order
-//! matches `VideoCodec::all_preferred` so the server still picks AV1 first
-//! when both sides support it.
+//! Strings are concrete configs (`av01` alone is not enough for
+//! `isConfigSupported`). Order matches `VideoCodec::all_preferred`.
 
 import type { VideoCodec } from './messages.js';
 
@@ -12,8 +10,6 @@ export interface CodecConfig {
   webcodecs: string;
 }
 
-/** WebCodecs `VideoDecoderConfig.codec` strings to probe, in the same
- * preference order as `VideoCodec::all_preferred`. */
 const CANDIDATES: { codec: VideoCodec; strings: string[] }[] = [
   { codec: 'Av1', strings: ['av01.0.04M.08', 'av01.0.08M.08', 'av01.0.13M.08'] },
   { codec: 'Vp9', strings: ['vp09.00.10.08', 'vp09.00.40.08', 'vp09.00.51.08'] },

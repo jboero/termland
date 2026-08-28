@@ -1,10 +1,9 @@
 //! Browser input → Termland messages.
 //!
-//! Keyboard: `event.code` (layout-independent) maps to evdev scancodes, the
-//! same table the desktop client uses. Printable IME output goes as
-//! `TextInput`. On blur or when the tab is hidden, every currently-pressed
-//! key *and* mouse button is released so a lost key-up or mouse-up cannot
-//! leave labwc with a stuck modifier or BTN_LEFT (clicks then do nothing).
+//! Keyboard: `event.code` maps to evdev scancodes (same table as the desktop
+//! client). Printable IME output goes as `TextInput`. On blur or hide, release
+//! every pressed key and mouse button so a lost key-up / mouse-up cannot leave
+//! labwc with a stuck modifier or BTN_LEFT.
 //!
 //! Pointer: canvas coordinates are scaled to the remote framebuffer.
 //! Pointer-lock uses `movementX/Y` with `absolute: false`.
@@ -78,9 +77,7 @@ export class InputCapture {
     el.addEventListener('blur', this.releaseAll);
     el.addEventListener('compositionend', this.onComposition);
     window.addEventListener('blur', this.releaseAll);
-    // mouseup on the canvas is lost if the pointer leaves the tab or the
-    // page is hidden mid-click — labwc then keeps BTN_LEFT down and the
-    // desktop stops receiving ordinary clicks.
+    // mouseup is lost if the pointer leaves the tab mid-click.
     window.addEventListener('mouseup', this.onWindowMouseUp);
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', this.onVisibility);

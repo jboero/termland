@@ -1,6 +1,4 @@
-//! Browser APIs used by the client. TypeScript's shipped DOM lib still
-//! treats some of these as experimental, so the shapes we actually call
-//! are declared here rather than pulling in a second @types package.
+//! Browser APIs the shipped DOM lib still treats as experimental.
 
 interface WebTransportHash {
   algorithm: string;

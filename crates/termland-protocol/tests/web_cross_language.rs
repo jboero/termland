@@ -1,21 +1,15 @@
 //! Canonical CBOR fixtures for the browser protocol codec.
 //!
-//! `web/fixtures/from-rust/*.cbor` are encoded here. The wasm client
-//! (`crates/termland-web`) must emit the same bytes — `web/tests/fixtures.test.ts`
-//! byte-compares `encodePayload` against these files. There is no second
-//! TypeScript encoder.
-//!
-//! Set `UPDATE_WEB_FIXTURES=1` to rewrite the files after a deliberate
-//! protocol change.
+//! `web/fixtures/from-rust/*.cbor` are encoded here. wasm `encodePayload`
+//! must emit the same bytes (`web/tests/fixtures.test.ts`).
+//! Set `UPDATE_WEB_FIXTURES=1` to rewrite after a deliberate protocol change.
 
 use std::path::{Path, PathBuf};
 
 use termland_protocol::*;
 
-fn fixtures_dir(which: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../web/fixtures")
-        .join(which)
+fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/fixtures/from-rust")
 }
 
 fn canonical_messages() -> Vec<(&'static str, Message)> {
@@ -182,7 +176,7 @@ fn canonical_messages() -> Vec<(&'static str, Message)> {
 /// exist) match what is committed for TypeScript to decode.
 #[test]
 fn rust_fixtures_round_trip_and_match_committed() {
-    let dir = fixtures_dir("from-rust");
+    let dir = fixtures_dir();
     if std::env::var("UPDATE_WEB_FIXTURES").is_ok() {
         std::fs::create_dir_all(&dir).unwrap();
     }

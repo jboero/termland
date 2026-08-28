@@ -1,8 +1,8 @@
 //! wasm-bindgen glue for `crates/termland-web`.
 //!
-//! The glue lives in `web/pkg/` (outside `src/`) so this module loads it at
-//! runtime from a URL relative to the compiled file. `TermlandClient.start`
-//! calls `initProtocol()`; tests call it in `tests/setup-wasm.ts`.
+//! Glue lives in `web/pkg/` (outside `src/`) and is loaded relative to the
+//! compiled file. `TermlandClient.start` calls `initProtocol()`; tests use
+//! `tests/setup-wasm.ts`.
 
 import { fromWire, toWire, type FrameType, type Message, type VideoCodec } from './messages.js';
 

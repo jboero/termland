@@ -16,9 +16,6 @@ description = "Browser protocol codec for Termland, compiled to WebAssembly"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# The point of this crate: the browser speaks the protocol by running the same
-# TermlandCodec / Message / serde derives the server does, rather than a
-# reimplementation in another language that has to be kept in step.
 termland-protocol = { path = "../termland-protocol" }
 
 wasm-bindgen = "=0.2.114"

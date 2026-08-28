@@ -1,15 +1,10 @@
 //! Decode Q2 frames with WebCodecs and paint them to a canvas.
 //!
-//! Bounded queues: at most a handful of encoded chunks wait to decode, and
-//! only the latest decoded VideoFrame is kept for render. Stale inter frames
-//! are dropped rather than played late.
+//! Bounded queues: a handful of encoded chunks, only the latest VideoFrame
+//! for render. Stale inter frames are dropped rather than played late.
 //!
-//! Chromium freezes a background tab after a few minutes (Page Lifecycle).
-//! A frozen tab drops the pending `requestAnimationFrame` without running it,
-//! which latches `drawing` and stops painting even after the user comes back.
-//! Hardware `VideoDecoder` can also enter the closed/error state across that
-//! freeze. `resume()` unlatches rAF and, after a long hide, rebuilds the
-//! decoder so the next keyframe paints.
+//! A frozen tab drops the pending rAF (latching `drawing`) and can close the
+//! decoder. `resume()` unlatches paint and rebuilds if needed.
 
 import type { Q2Frame } from './q2.js';
 import { webCodecsString, type CodecConfig } from './codecs.js';
@@ -102,10 +97,7 @@ export class VideoPipeline {
     this.drain();
   }
 
-  /**
-   * Called when the tab is visible again. Always unlatches a dropped rAF;
-   * rebuilds the decoder after a long hide or if WebCodecs already died.
-   */
+  /** Unlatch a dropped rAF; rebuild the decoder after a long hide or if it died. */
   resume(): void {
     if (this.closed) return;
     const hiddenMs = this.hiddenAt == null ? 0 : Date.now() - this.hiddenAt;

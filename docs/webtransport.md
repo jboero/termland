@@ -25,20 +25,10 @@ Browser
     └─ uni stream   ←  Q2 video (same 18-byte header as native QUIC)
 ```
 
-The protocol codec is Rust compiled to wasm so the browser runs the same
-`TermlandCodec` / `Message` / serde CBOR as the server. A protocol change is
-a recompile, not a port. TypeScript stays for the parts that are actually
-browser APIs: `WebTransport`, `VideoDecoder`, canvas, pointer lock, and the
-sample page.
-
-`web/src/` is the embeddable client; `web/index.html` plus `web/app.js` is
-the sample UI. `web/fixtures/from-rust/` pins the wasm encoder against the
-canonical CBOR the protocol crate emits.
-
-`handle_session` takes a `MediaConnection` so `run_session` can open a video
-uni stream on either UDP listener.
-
-Static files are not embedded in `termland-server`.
+`web/src/` is the embeddable client; `index.html` + `app.js` is the sample UI.
+The wasm crate is the protocol codec so encode/decode cannot drift.
+`handle_session` takes a `MediaConnection` so both UDP listeners open Q2 video
+the same way. Static files are not embedded in `termland-server`.
 
 ## Running
 
@@ -98,10 +88,8 @@ byte-compares wasm `encodePayload` against `web/fixtures/from-rust/`.
 Headless Chrome `--virtual-time-budget` fast-forwards timers and hangs the
 QUIC handshake; `test-browser.sh` uses wall-clock time.
 
-A Chromium tab left in the background is frozen after a few minutes (Page
-Lifecycle). The client unlatches a dropped `requestAnimationFrame`, rebuilds
-a dead `VideoDecoder` on the next keyframe, releases stuck mouse buttons, and
-re-attaches the session if the tab was hidden for more than a minute.
+A frozen background tab is recovered in the TypeScript client (rebuild
+decoder, release stuck buttons, re-attach after a long hide).
 
 ## Not done
 

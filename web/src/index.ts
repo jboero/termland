@@ -1,5 +1,3 @@
-/** Public API of the Termland TypeScript client. */
-
 export { TermlandClient, backoffDelay, shouldReconnectAfterHidden } from './client.js';
 export type { ClientEvent, ConnectOptions } from './client.js';
 

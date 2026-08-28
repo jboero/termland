@@ -236,10 +236,9 @@ where
         };
 
         match msg {
-            // Keepalive is valid before SessionCreate/Attach. The browser
-            // client starts Ping after HelloAck while the user is still on
-            // the session list; rejecting it here closed the WebTransport
-            // session with STOP_SENDING five seconds after connect.
+            // Ping is valid before SessionCreate: the browser sends it from
+            // the session list. Rejecting it closed the session with
+            // STOP_SENDING five seconds after connect.
             Message::Ping(p) => {
                 framed
                     .send(Message::Pong(Pong {
@@ -343,22 +342,7 @@ enum SessionRequest {
     Attach(SessionAttach),
 }
 
-/// Run one streaming session (freshly created or resumed) until the client
-/// detaches or closes it. On plain disconnect the compositor is left running
-/// (the session persists); on an explicit close/compositor-exit it is removed.
-///
-/// `run_as`: the PAM-authenticated username from `handle_session`'s auth
-/// block (server-side truth), or `None` if the server isn't running with
-/// `--auth`. Deliberately NOT sourced from `request` - the client must never
-/// get to say who the session runs as.
-///
-/// `media`: how (if at all) this session opens Q2 video/audio planes. `None`
-/// for TCP/TLS/SSH; a live connection handle for `--quic` / `--webtransport`.
-/// This function (not `handle_session`) is where the video uni stream actually
-/// gets opened — see the `open_planes()` call below for why here specifically.
-/// Audio codecs this server can encode, in the order it would prefer them.
-/// Adding one is a new `AudioCodec` variant plus an encoder backend — the
-/// wire format already carries the negotiation.
+/// Audio codecs this server can encode, in preference order.
 const SERVER_AUDIO_CODECS: &[termland_protocol::AudioCodec] =
     &[termland_protocol::AudioCodec::Opus];
 
@@ -371,6 +355,19 @@ fn session_sink_name(session_id: &str) -> String {
     format!("termland_{}", session_id.replace('-', "_"))
 }
 
+/// Run one streaming session (freshly created or resumed) until the client
+/// detaches or closes it. On plain disconnect the compositor is left running
+/// (the session persists); on an explicit close/compositor-exit it is removed.
+///
+/// `run_as`: the PAM-authenticated username from `handle_session`'s auth
+/// block (server-side truth), or `None` if the server isn't running with
+/// `--auth`. Deliberately NOT sourced from `request` - the client must never
+/// get to say who the session runs as.
+///
+/// `media`: how (if at all) this session opens Q2 video/audio planes. `None`
+/// for TCP/TLS/SSH; a live connection handle for `--quic` / `--webtransport`.
+/// The video uni stream is opened here (not in `handle_session`) — see the
+/// `open_planes()` call below for why.
 async fn run_session<T>(
     framed: &mut Framed<T, TermlandCodec>,
     request: SessionRequest,
@@ -531,8 +528,7 @@ where
 
     // WebTransport cannot carry Opus today: Q2's 5-byte audio header has no
     // `timestamp_us`, which `EncodedAudioChunk` requires. Refuse here so we
-    // do not spawn Pulse capture, encode live Opus, and then drop it on the
-    // floor with nothing in the logs.
+    // do not spawn Pulse capture and then drop the packets.
     let audio = if audio && matches!(media, crate::media::MediaConnection::WebTransport(_)) {
         tracing::warn!(
             "client requested audio, but WebTransport does not send it \

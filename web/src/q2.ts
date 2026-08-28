@@ -1,8 +1,7 @@
 //! Q2 video uni-stream: 18-byte header plus payload pump.
 //!
-//! Header encode/decode is the wasm protocol crate so the layout cannot drift
-//! from `termland_protocol::q2`. `readQ2Frames` stays here: it is a
-//! `ReadableStream` pump, which is browser API surface.
+//! Header encode/decode is wasm (`termland_protocol::q2`). `readQ2Frames` is
+//! a `ReadableStream` pump, so it stays in TypeScript.
 
 import type { VideoCodec } from './messages.js';
 import { parseVideoHeader } from './protocol.js';

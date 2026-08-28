@@ -1,15 +1,9 @@
 //! WebTransport (HTTP/3) listener for browser clients.
 //!
-//! A browser cannot speak to the raw QUIC listener in `quic.rs` (ALPN
-//! `termland/1`). WebTransport is a session on HTTP/3: ALPN `h3`, then an
-//! extended-CONNECT carrying `:path` and `Origin`. This is a second listener
-//! so `--quic` and the Android client stay untouched.
-//!
-//! Once the client opens its control stream, the halves are joined into one
-//! `AsyncRead + AsyncWrite` and handed to the same `handle_session` as every
-//! other transport. Video goes on a server-opened uni stream with the Q2
-//! header (`MediaConnection::WebTransport`); `None` would put CBOR frames on
-//! the control stream, which WebCodecs does not want.
+//! A second listener: browsers cannot speak `--quic` (ALPN `termland/1`).
+//! After extended-CONNECT, the control bidi stream is joined into
+//! `AsyncRead + AsyncWrite` and handed to the same `handle_session`. Video
+//! is Q2 on a server-opened uni stream (`MediaConnection::WebTransport`).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -34,9 +28,8 @@ const DEV_CERT_VALIDITY_DAYS: u32 = 13;
 /// Fail closed for browsers: an empty allowlist rejects every request that
 /// carries an `Origin`. A missing origin is not a browser (native clients and
 /// tests omit it; a page cannot suppress it) and is allowed. Without that
-/// default, any page a user happens to visit could open a session to a
-/// Termland server on their LAN and — on a server running without `--auth`
-/// — create and drive a desktop session.
+/// default, any page on the LAN could open a session — and without `--auth`,
+/// create and drive a desktop.
 fn origin_allowed(origin: Option<&str>, allowed: &HashSet<String>) -> bool {
     match origin {
         None => true,
@@ -46,12 +39,9 @@ fn origin_allowed(origin: Option<&str>, allowed: &HashSet<String>) -> bool {
 
 /// Read the `Origin` header without depending on its casing.
 ///
-/// `SessionRequest::origin()` looks up the exact key `"origin"` in a map that
-/// does no case folding, so a request spelling it `Origin` reads back as
-/// absent — and absent means "not a browser", which this module allows. A
-/// browser cannot exploit that (HTTP/3 header names are lowercase, and the
-/// browser, not the page, writes them), but a check whose correctness rests
-/// on the peer's good manners is not much of a check.
+/// `SessionRequest::origin()` looks up the exact key `"origin"` with no case
+/// folding, so `Origin` would look absent — and absent is allowed. HTTP/3
+/// names are lowercase in practice, but the check must not depend on that.
 fn header_origin(headers: &HashMap<String, String>) -> Option<&str> {
     headers
         .iter()

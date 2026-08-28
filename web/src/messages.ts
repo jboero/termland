@@ -1,8 +1,5 @@
-//! Termland control-plane message types, plus the reshape between the
-//! TypeScript tagged union (`{ type: 'Hello', ... }`) and serde's externally
-//! tagged form (`{ Hello: { ... } }`) that the wasm codec speaks.
-//!
-//! This file does not encode or decode CBOR. That is `crates/termland-web`.
+//! Control-plane types, plus the reshape between `{ type: 'Hello', ... }` and
+//! serde's `{ Hello: { ... } }` that the wasm codec speaks. CBOR is wasm.
 
 export const PROTOCOL_VERSION = 1;
 

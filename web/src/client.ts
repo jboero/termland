@@ -50,11 +50,10 @@ export function backoffDelay(attempt: number): number {
   return Math.min(1000 * (1 << shift), 30_000);
 }
 
-/** Close a live WebTransport after this long in the background.
+/** Close the transport after this long hidden.
  *
- * Chromium freezes a hidden page after a few minutes: JS and WebCodecs
- * stop, while QUIC keep-alives can keep the session looking connected.
- * Re-attaching is cheaper than a stuck canvas that no longer paints. */
+ * QUIC keep-alives can outlive a frozen tab; re-attach is cheaper than a
+ * canvas that no longer paints. */
 export const RECONNECT_AFTER_HIDDEN_MS = 60_000;
 
 export function shouldReconnectAfterHidden(hiddenMs: number): boolean {

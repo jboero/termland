@@ -15,17 +15,17 @@ describe('reconnect backoff', () => {
 });
 
 describe('idle / background tab', () => {
-  it('does not tear down the transport for a short tab switch', () => {
+  it('does not reconnect for a short hide', () => {
     expect(shouldReconnectAfterHidden(5_000)).toBe(false);
     expect(shouldReconnectAfterHidden(59_999)).toBe(false);
   });
 
-  it('reconnects after a minute in the background so a frozen decoder cannot stick', () => {
+  it('reconnects after 60s hidden', () => {
     expect(shouldReconnectAfterHidden(60_000)).toBe(true);
     expect(shouldReconnectAfterHidden(5 * 60_000)).toBe(true);
   });
 
-  it('rebuilds the VideoDecoder after a few seconds hidden or if it already died', () => {
+  it('rebuilds the decoder if hidden long or already closed', () => {
     expect(shouldReconfigureDecoder(0, 'configured')).toBe(false);
     expect(shouldReconfigureDecoder(4_999, 'configured')).toBe(false);
     expect(shouldReconfigureDecoder(5_000, 'configured')).toBe(true);
