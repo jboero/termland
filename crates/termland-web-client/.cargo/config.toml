@@ -2,5 +2,14 @@
 # this the `web_sys::WebTransport` and `web_sys::VideoDecoder` bindings simply
 # do not exist. Crate-local so the flag cannot leak into the workspace build,
 # where it would be meaningless.
+#
+# Two traps, both of which have already bitten:
+#
+#   1. Cargo finds this file relative to the working directory, NOT to
+#      --manifest-path. Building this crate from the repo root silently drops
+#      the flag.
+#   2. A RUSTFLAGS environment variable REPLACES build.rustflags entirely, it
+#      does not merge. Any caller that sets RUSTFLAGS (CI sets `-D warnings`)
+#      must add --cfg=web_sys_unstable_apis itself; web/build-wasm.sh does.
 [build]
 rustflags = ["--cfg=web_sys_unstable_apis"]

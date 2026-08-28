@@ -147,13 +147,15 @@ jobs:
       # implementation to web/src. Its unit tests run on the host; the crate
       # itself only builds for wasm32.
       #
-      # `cd` into the crate is required, not stylistic: WebTransport and
-      # WebCodecs need --cfg=web_sys_unstable_apis, which the crate declares in
-      # its own .cargo/config.toml, and cargo finds that file relative to the
-      # working directory rather than --manifest-path.
+      # --cfg=web_sys_unstable_apis is added to RUSTFLAGS explicitly rather
+      # than left to the crate's .cargo/config.toml: the workflow-level
+      # RUSTFLAGS (`-D warnings`) REPLACES build.rustflags rather than merging,
+      # so the config alone would be silently dropped here and every web-sys
+      # WebTransport/WebCodecs binding would go missing.
       - name: Rust browser client tests
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
+          export RUSTFLAGS="$RUSTFLAGS --cfg=web_sys_unstable_apis"
           (cd crates/termland-web-client && cargo test --lib)
           ./web/build-wasm.sh
 

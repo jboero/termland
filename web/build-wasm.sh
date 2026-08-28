@@ -7,11 +7,12 @@
 #
 # Requires: rustc with wasm32-unknown-unknown, wasm-bindgen-cli.
 #
-# NOTE the `cd` into the crate. WebTransport and WebCodecs need
-# `--cfg=web_sys_unstable_apis`, which the crate declares in its own
-# .cargo/config.toml -- and cargo discovers that file relative to the working
-# directory, not to --manifest-path. Building from anywhere else silently drops
-# the flag and the web-sys bindings vanish.
+# WebTransport and WebCodecs need `--cfg=web_sys_unstable_apis`. The crate
+# declares it in its own .cargo/config.toml, but that is not enough on its own:
+# a RUSTFLAGS environment variable REPLACES build.rustflags rather than merging
+# with it, so any caller exporting RUSTFLAGS (CI exports `-D warnings`) would
+# drop the flag and the web-sys bindings would vanish. Set it here, preserving
+# whatever the caller asked for.
 set -euo pipefail
 cd "$(dirname "$0")"
 WEB_DIR=$PWD
@@ -45,6 +46,7 @@ if [ "$INSTALLED" != "$WASM_BINDGEN_VERSION" ]; then
 fi
 
 echo "Building crates/termland-web-client for wasm32…"
+export RUSTFLAGS="${RUSTFLAGS:-} --cfg=web_sys_unstable_apis"
 ( cd "$CRATE_DIR" && cargo build --target wasm32-unknown-unknown --release )
 wasm-bindgen --target web --out-dir "$WEB_DIR/wasm/pkg" \
   "$CRATE_DIR/target/wasm32-unknown-unknown/release/termland_web_client.wasm"
