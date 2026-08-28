@@ -1,0 +1,34 @@
+# Standalone, not a member of the parent workspace: this crate only builds for
+# wasm32, so including it would break `cargo build --workspace` on any normal
+# host. The empty [workspace] table below makes it its own root despite living
+# inside the repo tree.
+[workspace]
+
+[package]
+name = "termland-web"
+version = "0.7.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+rust-version = "1.85"
+description = "Browser protocol codec for Termland, compiled to WebAssembly"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The point of this crate: the browser speaks the protocol by running the same
+# TermlandCodec / Message / serde derives the server does, rather than a
+# reimplementation in another language that has to be kept in step.
+termland-protocol = { path = "../termland-protocol" }
+
+wasm-bindgen = "=0.2.114"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+bytes = "1"
+ciborium = "0.2"
+tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
+# Turns a Rust panic into a readable console error. Without it a panic is a
+# wasm trap: the JS promise simply never settles and the page hangs with no
+# message.
+console_error_panic_hook = "0.1"

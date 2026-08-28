@@ -1,7 +1,10 @@
 //! Q2 media-plane framing: the 18-byte video header and 5-byte audio header.
 //!
 //! Shared by the native QUIC listener, the WebTransport listener, and the
-//! TypeScript client so the layout cannot drift.
+//! wasm protocol codec (`crates/termland-web`) so the layout cannot drift.
+//!
+//! Audio datagrams stay native-QUIC-only: this 5-byte header omits
+//! `AudioChunk.timestamp_us`, which WebCodecs `EncodedAudioChunk` requires.
 
 use crate::messages::{FrameType, VideoCodec};
 

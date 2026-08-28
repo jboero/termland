@@ -529,6 +529,20 @@ where
     }
     tracing::info!("Client supports codecs: {supported_codecs:?}");
 
+    // WebTransport cannot carry Opus today: Q2's 5-byte audio header has no
+    // `timestamp_us`, which `EncodedAudioChunk` requires. Refuse here so we
+    // do not spawn Pulse capture, encode live Opus, and then drop it on the
+    // floor with nothing in the logs.
+    let audio = if audio && matches!(media, crate::media::MediaConnection::WebTransport(_)) {
+        tracing::warn!(
+            "client requested audio, but WebTransport does not send it \
+             (Q2 datagram header has no timestamp_us) — continuing without capture"
+        );
+        false
+    } else {
+        audio
+    };
+
     // Spawn the compositor + capture loop on a blocking thread.
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(2);
     let (display_tx, display_rx) = tokio::sync::oneshot::channel::<(String, u32, std::path::PathBuf)>();

@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decodeMessage, encodeMessage, type Message } from '../src/messages.js';
+import { decodeMessage, encodePayload } from '../src/protocol.ts';
+import type { Message } from '../src/messages.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const rustDir = join(here, '../fixtures/from-rust');
-const tsDir = join(here, '../fixtures/from-ts');
 
 function canonical(): [string, Message][] {
   return [
@@ -100,7 +100,7 @@ function canonical(): [string, Message][] {
   ];
 }
 
-describe('cross-language fixtures', () => {
+describe('wasm protocol codec', () => {
   it('decodes every Rust-originated fixture', () => {
     if (!existsSync(rustDir)) {
       throw new Error(
@@ -129,24 +129,21 @@ describe('cross-language fixtures', () => {
       if (decoded.type === 'KeyEvent' && expected.type === 'KeyEvent') {
         expect(decoded.scancode).toBe(30);
       }
+      if (decoded.type === 'MouseMove' && expected.type === 'MouseMove') {
+        expect(decoded.x).toBeCloseTo(expected.x);
+        expect(decoded.absolute).toBe(true);
+      }
     }
   });
 
-  it('encodes TypeScript fixtures the Rust tests can decode', () => {
-    if (process.env.UPDATE_WEB_FIXTURES) {
-      mkdirSync(tsDir, { recursive: true });
-    }
+  it('encodes the same CBOR bytes as the committed Rust fixtures', () => {
     for (const [name, msg] of canonical()) {
-      const encoded = encodeMessage(msg);
-      const path = join(tsDir, `${name}.cbor`);
-      if (process.env.UPDATE_WEB_FIXTURES) {
-        writeFileSync(path, encoded);
-        continue;
-      }
-      expect(existsSync(path), `missing ${name}.cbor — run UPDATE_WEB_FIXTURES=1 npm test`).toBe(
+      const encoded = encodePayload(msg);
+      const path = join(rustDir, `${name}.cbor`);
+      const committed = readFileSync(path);
+      expect(Buffer.from(encoded).equals(committed), `${name}.cbor drifted from wasm encode`).toBe(
         true,
       );
-      // Round-trip through our own decoder at minimum.
       expect(decodeMessage(encoded).type).toBe(msg.type);
     }
   });

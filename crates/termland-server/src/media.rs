@@ -61,7 +61,10 @@ enum VideoSink {
 enum AudioSink {
     Quic(quinn::Connection),
     /// Held so dropping `MediaPlanes` does not close the WebTransport session.
-    /// Datagrams are not sent — see the module doc.
+    /// Datagrams are not sent: Q2's 5-byte audio header omits
+    /// `AudioChunk.timestamp_us`, which WebCodecs `EncodedAudioChunk` requires.
+    /// `run_session` refuses audio during negotiation so Pulse capture is not
+    /// started for this arm; `send_audio` still warns if a caller races that.
     #[allow(dead_code)]
     WebTransportHeld(wtransport::Connection),
 }
@@ -100,7 +103,19 @@ impl MediaPlanes {
 
     pub(crate) fn send_audio(&self, chunk: &AudioChunk) {
         match &self.audio {
-            AudioSink::WebTransportHeld(_) => {}
+            AudioSink::WebTransportHeld(_) => {
+                // One-time: a client that negotiated audio on this path
+                // still hits this arm if capture was started. The usual
+                // path refuses audio during negotiation (see `run_session`).
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "dropping WebTransport audio: Q2's 5-byte datagram header \
+                         has no timestamp_us, which EncodedAudioChunk requires"
+                    );
+                }
+            }
             AudioSink::Quic(connection) => send_audio_datagram_quic(connection, chunk),
         }
     }

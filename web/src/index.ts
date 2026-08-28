@@ -3,10 +3,15 @@
 export { TermlandClient, backoffDelay } from './client.js';
 export type { ClientEvent, ConnectOptions } from './client.js';
 
-export { encodeMessage, decodeMessage, encodeWire } from './messages.js';
+export {
+  encodeWire,
+  encodePayload,
+  decodeMessage,
+  encodeFrame,
+  FrameDecoder,
+  initProtocol,
+} from './protocol.js';
 export type { Message, SessionInfo, VideoCodec } from './messages.js';
-
-export { FrameDecoder, encodeFrame } from './frame.js';
 
 export { VideoPipeline } from './video.js';
 export { probeSupportedCodecs } from './codecs.js';

@@ -1,13 +1,12 @@
-//! Cross-language fixtures for the TypeScript browser client.
+//! Canonical CBOR fixtures for the browser protocol codec.
 //!
-//! - `web/fixtures/from-rust/*.cbor` are encoded here and decoded in
-//!   `web/tests/fixtures.test.ts`.
-//! - `web/fixtures/from-ts/*.cbor` are encoded by TypeScript and decoded
-//!   here.
+//! `web/fixtures/from-rust/*.cbor` are encoded here. The wasm client
+//! (`crates/termland-web`) must emit the same bytes — `web/tests/fixtures.test.ts`
+//! byte-compares `encodePayload` against these files. There is no second
+//! TypeScript encoder.
 //!
-//! Set `UPDATE_WEB_FIXTURES=1` to rewrite the Rust-originated files after
-//! a deliberate protocol change. The TypeScript files are written by
-//! `web/`'s own test with the same env var.
+//! Set `UPDATE_WEB_FIXTURES=1` to rewrite the files after a deliberate
+//! protocol change.
 
 use std::path::{Path, PathBuf};
 
@@ -220,67 +219,4 @@ fn rust_fixtures_round_trip_and_match_committed() {
              run UPDATE_WEB_FIXTURES=1 cargo test -p termland-protocol --test web_cross_language"
         );
     }
-}
-
-/// TypeScript-encoded bytes must decode as the same message type, with the
-/// fields that matter for the handshake/session/input path intact.
-#[test]
-fn typescript_fixtures_decode() {
-    let dir = fixtures_dir("from-ts");
-    if !dir.is_dir() {
-        panic!(
-            "web/fixtures/from-ts is missing — run the TypeScript test with UPDATE_WEB_FIXTURES=1"
-        );
-    }
-    let mut seen = 0;
-    for (name, expected) in canonical_messages() {
-        let path = dir.join(format!("{name}.cbor"));
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
-            panic!(
-                "{}: {e} — generate with the TypeScript test",
-                path.display()
-            )
-        });
-        let decoded = Message::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(
-            decoded.message_id(),
-            expected.message_id(),
-            "{name} decoded as the wrong type"
-        );
-        match (&decoded, &expected) {
-            (Message::Hello(a), Message::Hello(b)) => {
-                assert_eq!(a.protocol_version, b.protocol_version);
-                assert_eq!(a.client_name, b.client_name);
-            }
-            (Message::HelloAck(a), Message::HelloAck(b)) => {
-                assert_eq!(a.protocol_version, b.protocol_version);
-                assert_eq!(a.server_name, b.server_name);
-                assert_eq!(a.session_id, b.session_id);
-                assert_eq!(a.auth_required, b.auth_required);
-            }
-            (Message::SessionCreate(a), Message::SessionCreate(b)) => {
-                assert_eq!(a.width, b.width);
-                assert_eq!(a.height, b.height);
-                assert_eq!(a.supported_codecs, b.supported_codecs);
-            }
-            (Message::KeyEvent(a), Message::KeyEvent(b)) => {
-                assert_eq!(a.scancode, b.scancode);
-                assert_eq!(a.state, b.state);
-            }
-            (Message::TextInput(a), Message::TextInput(b)) => {
-                assert_eq!(a.text, b.text);
-            }
-            (Message::MouseMove(a), Message::MouseMove(b)) => {
-                assert!((a.x - b.x).abs() < 1e-6);
-                assert!((a.y - b.y).abs() < 1e-6);
-                assert_eq!(a.absolute, b.absolute);
-            }
-            _ => {}
-        }
-        seen += 1;
-    }
-    assert!(
-        seen >= 15,
-        "expected the full control-plane fixture set, saw {seen}"
-    );
 }

@@ -235,7 +235,9 @@ sessions.
 
 A Chromium or recent Firefox tab can attach over HTTP/3 WebTransport. This is
 a second UDP listener, not a change to `--quic`. Origin allowlisting is
-closed by default.
+closed by default. The control protocol in the browser is the same Rust
+`termland-protocol` crate compiled to wasm; TypeScript handles WebTransport,
+WebCodecs, and the sample UI.
 
 ```bash
 ./web/build.sh

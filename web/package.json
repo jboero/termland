@@ -12,8 +12,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run",
-    "fixtures": "UPDATE_WEB_FIXTURES=1 vitest run tests/fixtures.test.ts"
+    "test": "vitest run"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

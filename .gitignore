@@ -1,6 +1,9 @@
 # Cargo build output (workspace root and per-crate, e.g. crates/termland-web)
 target/
 
+# wasm-bindgen output of crates/termland-web (web/build.sh)
+/web/pkg/
+
 # Editor / tooling
 .claude/
 *.swp

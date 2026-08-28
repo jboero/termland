@@ -33,7 +33,10 @@ const DEV_CERT_VALIDITY_DAYS: u32 = 13;
 
 /// Fail closed for browsers: an empty allowlist rejects every request that
 /// carries an `Origin`. A missing origin is not a browser (native clients and
-/// tests omit it; a page cannot suppress it) and is allowed.
+/// tests omit it; a page cannot suppress it) and is allowed. Without that
+/// default, any page a user happens to visit could open a session to a
+/// Termland server on their LAN and — on a server running without `--auth`
+/// — create and drive a desktop session.
 fn origin_allowed(origin: Option<&str>, allowed: &HashSet<String>) -> bool {
     match origin {
         None => true,
@@ -41,9 +44,14 @@ fn origin_allowed(origin: Option<&str>, allowed: &HashSet<String>) -> bool {
     }
 }
 
-/// `SessionRequest::origin()` looks up the exact key `"origin"`. HTTP/3 names
-/// are lowercase, but a check that depends on the peer's spelling is not much
-/// of a check.
+/// Read the `Origin` header without depending on its casing.
+///
+/// `SessionRequest::origin()` looks up the exact key `"origin"` in a map that
+/// does no case folding, so a request spelling it `Origin` reads back as
+/// absent — and absent means "not a browser", which this module allows. A
+/// browser cannot exploit that (HTTP/3 header names are lowercase, and the
+/// browser, not the page, writes them), but a check whose correctness rests
+/// on the peer's good manners is not much of a check.
 fn header_origin(headers: &HashMap<String, String>) -> Option<&str> {
     headers
         .iter()
@@ -156,6 +164,8 @@ async fn handle_incoming(
             "Rejecting WebTransport session from {remote}: origin {:?} is not allowed",
             origin.as_deref().unwrap_or("<none>"),
         );
+        // 403 rather than dropping the connection, so the browser surfaces a
+        // real error to the page instead of a generic network failure.
         request.forbidden().await;
         return Ok(());
     }
@@ -167,6 +177,9 @@ async fn handle_incoming(
     );
 
     let connection = request.accept().await.context("accepting the session")?;
+
+    // Same contract as raw QUIC: the client opens exactly one bidirectional
+    // stream and it carries the control plane for the whole session.
     let (send, recv) = connection
         .accept_bi()
         .await

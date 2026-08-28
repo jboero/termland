@@ -1,6 +1,7 @@
 // Sample Termland page: sidebar chrome, connecting overlay, size fields.
 // Edit this file (and index.html) by hand — it is not compiled.
-// The reusable protocol client is web/src/ (built to ./dist/).
+// Protocol encode/decode is crates/termland-web (wasm in ./pkg/).
+// web/src (built to ./dist/) is WebTransport, WebCodecs, input, reconnect.
 
 import { TermlandClient, VideoPipeline, InputCapture } from './dist/index.js';
 

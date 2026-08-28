@@ -1,9 +1,12 @@
 //! WebTransport Termland client: handshake, session control, Q2 video, reconnect.
 
-import { FrameDecoder } from './frame.js';
 import {
   decodeMessage,
   encodeWire,
+  FrameDecoder,
+  initProtocol,
+} from './protocol.js';
+import {
   PROTOCOL_VERSION,
   type Message,
   type SessionInfo,
@@ -71,6 +74,7 @@ export class TermlandClient {
   }
 
   async start(): Promise<void> {
+    await initProtocol();
     this.codecs = await probeSupportedCodecs();
     if (this.codecs.length === 0) {
       this.emit({ type: 'error', error: 'this browser cannot decode any Termland video codec' });
@@ -179,9 +183,25 @@ export class TermlandClient {
       client_name: 'termland-web',
     });
 
-    await Promise.race([controlTask, videoTask, transport.closed]);
-    this.stopPing();
-    this.writer = null;
+    try {
+      await Promise.race([controlTask, videoTask, transport.closed]);
+    } finally {
+      this.stopPing();
+      this.writer = null;
+      try {
+        transport.close();
+      } catch {
+        // already closed
+      }
+      // The losing `Promise.race` task must not become an unhandled
+      // rejection (a late `readVideo` error after control already settled).
+      const results = await Promise.allSettled([controlTask, videoTask]);
+      for (const r of results) {
+        if (r.status === 'rejected' && !this.closed) {
+          this.emit({ type: 'error', error: String(r.reason) });
+        }
+      }
+    }
   }
 
   private async readControl(readable: ReadableStream<Uint8Array>): Promise<void> {
@@ -193,8 +213,8 @@ export class TermlandClient {
         if (!this.closed) this.emit({ type: 'status', message: 'control stream closed' });
         return;
       }
-      for (const frame of decoder.push(value)) {
-        const msg = decodeMessage(frame.payload);
+      for (const payload of decoder.push(value)) {
+        const msg = decodeMessage(payload);
         await this.onControl(msg);
       }
     }

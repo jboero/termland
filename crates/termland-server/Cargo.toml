@@ -29,9 +29,15 @@ bytes = { workspace = true }
 # aws-lc-rs to match the explicit provider tls.rs/quic.rs select (workspace's
 # `rustls` default features already bring aws-lc-rs in for this crate).
 quinn = { workspace = true, features = ["rustls-aws-lc-rs"] }
-# HTTP/3 WebTransport for browser clients. Same quinn 0.11 / rustls 0.23 stack.
+# HTTP/3 WebTransport for browser clients — see webtransport.rs.
+# Resolves against the same quinn 0.11 / rustls 0.23 the rest of the crate
+# already uses, so this adds a protocol, not a second QUIC stack.
 wtransport = "0.7"
 
 [dev-dependencies]
-# Skip validation of the short-lived self-signed dev cert. Not in the shipped binary.
+# The WebTransport test drives the listener as a real client.
+# dangerous-configuration is dev-only: it enables skipping validation of the
+# server's short-lived self-signed development certificate, which a browser
+# would instead pin via serverCertificateHashes. It is deliberately not in the
+# main dependency so it cannot reach a shipped binary.
 wtransport = { version = "0.7", features = ["dangerous-configuration"] }
