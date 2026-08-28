@@ -9,3 +9,7 @@
 
 # Stray deploy artifacts (rsync mishaps etc.)
 /john@*
+
+# Generated wasm bundle for the browser client (web/build.sh output).
+/web/pkg/
+/crates/termland-web/target/

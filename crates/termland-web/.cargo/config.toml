@@ -1,0 +1,7 @@
+# WebTransport and WebCodecs are still marked unstable in web-sys, so their
+# bindings are behind this cfg. Setting it here rather than expecting every
+# caller to remember an environment variable: without it the crate does not
+# compile at all, with an error that points at missing imports rather than at
+# the real cause.
+[build]
+rustflags = ["--cfg=web_sys_unstable_apis"]
