@@ -252,18 +252,181 @@ pub fn list_alive() -> Vec<SessionRecord> {
     out
 }
 
-/// Terminate a session: signal the whole compositor process group (the
-/// compositor was `setsid`'d, so it leads its own group — this reaps its apps
-/// too), then drop the record + logfile.
+/// How long the process group gets to honour `SIGTERM` before `SIGKILL`.
+///
+/// Generous on purpose: a desktop shell saving state on the way out is doing
+/// something useful, and this only delays a teardown the user already asked
+/// for. It is not generous enough to matter if nothing exits — the escalation
+/// still happens.
+const TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Poll interval while waiting for the group to go away.
+const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What happened when a session's process group was terminated.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reaped {
+    /// Nothing was running under that group to begin with.
+    AlreadyGone,
+    /// Everything exited on `SIGTERM`.
+    Terminated,
+    /// `SIGTERM` was ignored; `SIGKILL` finished the job.
+    Killed,
+    /// Processes survived even `SIGKILL`. PIDs are the survivors.
+    Survivors(Vec<i32>),
+}
+
+/// Live (non-zombie) members of process group `pgid`, read from `/proc`.
+///
+/// `kill(-pid, 0)` is not usable as the liveness check here: it succeeds for a
+/// group whose only remaining member is an unreaped zombie, which would make
+/// teardown escalate to `SIGKILL` and then report survivors forever. Zombies
+/// hold no resources and own no Wayland connection, so they are not what this
+/// is looking for.
+pub fn group_members(pgid: i32) -> Vec<i32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(pid) = name.parse::<i32>() else { continue };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if let Some((state, pgrp)) = parse_stat_state_and_pgrp(&stat) {
+            if pgrp == pgid && state != 'Z' {
+                found.push(pid);
+            }
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// Pull the state and process-group fields out of a `/proc/<pid>/stat` line.
+///
+/// The comm field (2nd) is wrapped in parentheses and may itself contain
+/// spaces and parentheses, so the fields after it are found by splitting at the
+/// *last* `)` rather than by counting spaces from the start.
+fn parse_stat_state_and_pgrp(stat: &str) -> Option<(char, i32)> {
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    let mut fields = after_comm.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let _ppid = fields.next()?;
+    let pgrp = fields.next()?.parse().ok()?;
+    Some((state, pgrp))
+}
+
+/// Terminate a process group and *confirm* it is gone.
+///
+/// The compositor is `setsid`'d, so it leads its own group and its apps inherit
+/// that group id — including after the compositor itself dies, since orphans
+/// keep their pgid when they are reparented. Signalling the group is therefore
+/// the way to reach a desktop shell whose compositor has already exited.
+///
+/// The confirmation is the point. The previous implementation sent `SIGTERM`,
+/// logged success and deleted the session record without checking anything, and
+/// on this project's own workstation the group did *not* die: orphaned
+/// `plasmashell` processes were left blocked in `drm_syncobj_array_wait_timeout`
+/// waiting on GPU fences from a compositor that no longer existed. They ignored
+/// `SIGTERM` entirely and needed `SIGKILL`. Because the record was already
+/// gone, `--list-sessions` showed nothing and nothing would ever reap them.
+pub fn terminate_group(pgid: i32, grace: std::time::Duration) -> Reaped {
+    if group_members(pgid).is_empty() {
+        return Reaped::AlreadyGone;
+    }
+
+    // Stage 1: the leader alone. For a desktop session the leader is the
+    // compositor, and its startup command shuts the session down in order —
+    // the Plasma wrapper kills plasmashell and waits for it before
+    // `dbus-run-session` tears the private bus down.
+    //
+    // Signalling the whole group up front defeats that: `dbus-daemon` is in
+    // the group too, so it takes SIGTERM at the same moment as plasmashell,
+    // the bus vanishes mid-shutdown, and plasmashell aborts inside libdbus
+    // (`_dbus_warn_check_failed` -> `abort`) leaving a coredump on every
+    // teardown. Giving the leader a head start turns that into a clean exit.
+    unsafe {
+        libc::kill(pgid, libc::SIGTERM);
+    }
+    if wait_for_group_exit(pgid, grace) {
+        return Reaped::Terminated;
+    }
+
+    // Stage 2: anything the leader did not take with it. This is where an
+    // orphaned group with no leader left is reached, since orphans keep the
+    // process-group id when they are reparented.
+    unsafe {
+        libc::kill(-pgid, libc::SIGTERM);
+        libc::kill(pgid, libc::SIGTERM);
+    }
+    if wait_for_group_exit(pgid, grace) {
+        return Reaped::Terminated;
+    }
+
+    tracing::warn!(
+        "process group {pgid} ignored SIGTERM after {:?}; escalating to SIGKILL",
+        grace * 2
+    );
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+        libc::kill(pgid, libc::SIGKILL);
+    }
+
+    // SIGKILL cannot be caught, so this is short — it only covers the kernel
+    // tearing the processes down, not any handler.
+    if wait_for_group_exit(pgid, std::time::Duration::from_secs(2)) {
+        return Reaped::Killed;
+    }
+
+    // Uninterruptible sleep (D state) survives SIGKILL until the syscall
+    // returns; this is exactly where the stranded compositors were found.
+    Reaped::Survivors(group_members(pgid))
+}
+
+/// Poll until the group has no live members, or the deadline passes.
+fn wait_for_group_exit(pgid: i32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if group_members(pgid).is_empty() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(REAP_POLL);
+    }
+}
+
+/// Terminate a session and drop its record + logfile.
+///
+/// The record is removed whatever happens, because leaving it behind would
+/// advertise a session that can no longer be attached to. Survivors are logged
+/// at error level with their PIDs so there is something to act on, rather than
+/// disappearing silently as they used to.
 pub fn close(id: &str) {
     if let Some(rec) = read(id) {
         let pid = rec.compositor_pid as libc::pid_t;
-        unsafe {
-            // Negative pid → the whole process group.
-            libc::kill(-pid, libc::SIGTERM);
-            libc::kill(pid, libc::SIGTERM);
+        match terminate_group(pid, TERM_GRACE) {
+            Reaped::AlreadyGone => {
+                tracing::info!("Closed session {id} (compositor pid {pid} was already gone)");
+            }
+            Reaped::Terminated => {
+                tracing::info!("Closed session {id} (compositor pid {pid})");
+            }
+            Reaped::Killed => {
+                tracing::info!("Closed session {id} (compositor pid {pid}, needed SIGKILL)");
+            }
+            Reaped::Survivors(pids) => {
+                tracing::error!(
+                    "Session {id}: process group {pid} survived SIGKILL; still running: {pids:?}. \
+                     These are usually blocked in an uninterruptible GPU wait and will need \
+                     manual attention."
+                );
+            }
         }
-        tracing::info!("Closed session {id} (compositor pid {})", rec.compositor_pid);
     }
     remove(id);
 }
@@ -273,5 +436,150 @@ pub fn describe_mode(mode: &termland_protocol::SessionMode) -> String {
     match mode {
         termland_protocol::SessionMode::Desktop => "desktop".to_string(),
         termland_protocol::SessionMode::App { command, .. } => format!("app: {command}"),
+    }
+}
+
+#[cfg(test)]
+mod reap_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    /// Spawns a shell in its own session (so it leads a process group, exactly
+    /// as the detached compositor does) and guarantees the group is gone when
+    /// the test ends, however it ends.
+    struct GroupGuard(Child);
+
+    impl GroupGuard {
+        fn spawn(script: &str) -> Self {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script).stdout(Stdio::null()).stderr(Stdio::null());
+            unsafe {
+                cmd.pre_exec(|| {
+                    // setsid: new session, and this process leads a new group.
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            GroupGuard(cmd.spawn().expect("spawn test group"))
+        }
+
+        fn pgid(&self) -> i32 {
+            self.0.id() as i32
+        }
+
+        /// Give the shell time to start its children before signalling.
+        fn settle(&self) {
+            std::thread::sleep(Duration::from_millis(400));
+        }
+    }
+
+    impl Drop for GroupGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn stat_parsing_survives_a_comm_with_spaces_and_parens() {
+        // The comm field is arbitrary and unescaped; splitting on whitespace
+        // from the left puts every later field in the wrong place.
+        let line = "1234 (weird (name) here) S 1 4321 4321 0 -1 4194304";
+        assert_eq!(parse_stat_state_and_pgrp(line), Some(('S', 4321)));
+    }
+
+    #[test]
+    fn stat_parsing_reads_state_and_pgrp_of_a_normal_line() {
+        let line = "42 (plasmashell) D 1 99 99 0 -1 4194560 1234";
+        assert_eq!(parse_stat_state_and_pgrp(line), Some(('D', 99)));
+    }
+
+    #[test]
+    fn group_members_finds_this_test_process() {
+        let pgid = unsafe { libc::getpgid(0) };
+        let members = group_members(pgid);
+        let me = std::process::id() as i32;
+        assert!(members.contains(&me), "own pid {me} missing from group {pgid}: {members:?}");
+    }
+
+    #[test]
+    fn an_empty_group_is_already_gone() {
+        // A pgid nothing can be using: kernel pids do not reach this.
+        assert_eq!(terminate_group(0x7fff_fffe, Duration::from_millis(200)), Reaped::AlreadyGone);
+    }
+
+    #[test]
+    fn a_cooperative_group_exits_on_sigterm() {
+        let g = GroupGuard::spawn("sleep 60 & sleep 60");
+        g.settle();
+        assert_eq!(terminate_group(g.pgid(), Duration::from_secs(3)), Reaped::Terminated);
+        assert!(group_members(g.pgid()).is_empty());
+    }
+
+    /// The behaviour that was missing: the old code sent SIGTERM, logged
+    /// success and deleted the record. A group that ignores SIGTERM — which is
+    /// what the stranded plasmashell processes did — simply stayed alive.
+    #[test]
+    fn a_group_ignoring_sigterm_is_escalated_to_sigkill() {
+        let g = GroupGuard::spawn("trap '' TERM; sleep 60 & trap '' TERM; wait");
+        g.settle();
+        let result = terminate_group(g.pgid(), Duration::from_millis(400));
+        assert_eq!(result, Reaped::Killed, "SIGTERM-ignoring group was not escalated");
+        assert!(group_members(g.pgid()).is_empty(), "survivors after SIGKILL");
+    }
+
+    /// The actual failure on the workstation: the session leader was already
+    /// gone and its children had been reparented to init. Orphans keep their
+    /// process-group id, so the group is still the handle that reaches them —
+    /// and nothing was using it.
+    #[test]
+    fn orphans_of_a_dead_leader_are_still_reaped() {
+        let mut g = GroupGuard::spawn("sleep 60 & sleep 60 & exit 0");
+        g.settle();
+        let pgid = g.pgid();
+        // The leader has exited; reap it so it is not a zombie holding the id.
+        let _ = g.0.wait();
+
+        let before = group_members(pgid);
+        assert!(
+            !before.is_empty(),
+            "test is not exercising anything: no orphans survived the leader"
+        );
+
+        assert_eq!(terminate_group(pgid, Duration::from_secs(3)), Reaped::Terminated);
+        assert!(group_members(pgid).is_empty(), "orphans survived teardown");
+    }
+
+    /// A zombie leader must not read as a live group: it would make teardown
+    /// escalate to SIGKILL and then report survivors that are not really there.
+    #[test]
+    fn a_zombie_does_not_count_as_a_live_group_member() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exit 0").stdout(Stdio::null()).stderr(Stdio::null());
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().expect("spawn");
+        let pid = child.id() as i32;
+        // Deliberately not waited on, so it stays a zombie.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            group_members(pid).is_empty(),
+            "zombie counted as a live group member"
+        );
+        let mut child = child;
+        let _ = child.wait();
     }
 }

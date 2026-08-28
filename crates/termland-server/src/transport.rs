@@ -1055,7 +1055,14 @@ where
             tracing::info!("Session {session_id} closed");
         }
         SessionOutcome::Gone => {
-            crate::registry::remove(&session_id);
+            // "Gone" is inferred from the compositor PID alone, and its
+            // children outliving it is precisely the case that stranded
+            // `plasmashell` on a developer workstation: orphans keep the
+            // compositor's process group id when they are reparented, so the
+            // group is still reachable and still has to be reaped. Dropping
+            // the record alone left them running with nothing recording that
+            // they existed.
+            crate::registry::close(&session_id);
             crate::registry::clipboard_files_cleanup(&session_id);
             tracing::info!("Session {session_id} ended (compositor gone)");
         }
