@@ -1,30 +1,38 @@
 #!/usr/bin/env bash
 #
-# Build the browser client: compile termland-web to wasm and generate the JS
-# bindings next to index.html.
+# Build the wasm protocol codec, run tests, then compile the TypeScript
+# client into web/dist/. The sample page (index.html + app.js) is plain JS
+# and is not compiled.
 #
-# Requires:
-#   rustup target add wasm32-unknown-unknown   (or the distro's
-#                                               rust-std-static-wasm32-unknown-unknown)
-#   cargo install wasm-bindgen-cli --version <matching the crate's wasm-bindgen>
+# Requires: rustc with wasm32-unknown-unknown, wasm-bindgen-cli 0.2.114,
+# Node.js 20+.
 #
 set -euo pipefail
 cd "$(dirname "$0")"
-CRATE=../crates/termland-web
-PROFILE=${1:-release}
 
-# WebTransport and WebCodecs bindings are still gated in web-sys. The crate's
-# own .cargo/config.toml sets this too; it is repeated here because a build run
-# from another directory does not pick that up.
-export RUSTFLAGS="--cfg=web_sys_unstable_apis"
-
-if [ "$PROFILE" = "release" ]; then
-  cargo build --manifest-path "$CRATE/Cargo.toml" --target wasm32-unknown-unknown --release
-  WASM="$CRATE/target/wasm32-unknown-unknown/release/termland_web.wasm"
-else
-  cargo build --manifest-path "$CRATE/Cargo.toml" --target wasm32-unknown-unknown
-  WASM="$CRATE/target/wasm32-unknown-unknown/debug/termland_web.wasm"
+WASM_BINDGEN_VERSION=0.2.114
+if ! command -v wasm-bindgen >/dev/null; then
+  echo "wasm-bindgen not found. Install with:" >&2
+  echo "  cargo install wasm-bindgen-cli --version ${WASM_BINDGEN_VERSION}" >&2
+  exit 1
 fi
 
-wasm-bindgen --target web --out-dir ./pkg --no-typescript "$WASM"
-echo "Built web/pkg/ — serve this directory over HTTPS and open index.html"
+echo "Building crates/termland-web for wasm32…"
+cargo build --manifest-path ../crates/termland-web/Cargo.toml \
+  --target wasm32-unknown-unknown --release
+wasm-bindgen --target web --out-dir ./pkg \
+  ../crates/termland-web/target/wasm32-unknown-unknown/release/termland_web.wasm
+
+if [ ! -d node_modules ]; then
+  if [ -f package-lock.json ]; then
+    npm ci
+  else
+    npm install
+  fi
+fi
+npm test
+npm run build
+
+echo "Built web/pkg/ (wasm protocol) and web/dist/ (TS client)."
+echo "Sample page is index.html + app.js. Serve this directory over HTTP."
+echo "The page's origin must appear in --webtransport-origin."

@@ -288,4 +288,35 @@ mod tests {
             other => panic!("expected Ping, got {:?}", other),
         }
     }
+
+    #[test]
+    fn three_byte_prefix_is_not_yet_a_frame() {
+        let mut codec = TermlandCodec;
+        let mut buf = BytesMut::from(&b"TL\x01"[..]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert_eq!(&buf[..], b"TL\x01", "partial header must not be consumed");
+    }
+
+    #[test]
+    fn invalid_magic_is_rejected() {
+        let mut codec = TermlandCodec;
+        let mut buf = BytesMut::from(&b"XX\x01\x00\x00\x00\x00"[..]);
+        match codec.decode(&mut buf) {
+            Err(CodecError::InvalidMagic) => {}
+            other => panic!("expected InvalidMagic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payload_over_16_mib_is_rejected_from_the_header_alone() {
+        let mut codec = TermlandCodec;
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&FRAME_MAGIC);
+        buf.put_u8(0x01);
+        buf.put_u32_le(MAX_PAYLOAD_SIZE + 1);
+        match codec.decode(&mut buf) {
+            Err(CodecError::PayloadTooLarge(n)) => assert_eq!(n, MAX_PAYLOAD_SIZE + 1),
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+    }
 }

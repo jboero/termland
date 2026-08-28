@@ -60,7 +60,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use termland_protocol::{FrameType, VideoCodec};
 
 /// ALPN identifier for the termland QUIC transport. QUIC requires ALPN — it's
 /// how the handshake picks a protocol and defends against version-downgrade
@@ -159,149 +158,12 @@ async fn handle_quic_connection(incoming: quinn::Incoming, require_auth: bool) -
     // them back into one AsyncRead+AsyncWrite the same way `run_subsystem`
     // already combines stdin/stdout for the SSH-subsystem entry point.
     let io = tokio::io::join(recv, send);
-    crate::transport::handle_session(io, require_auth, Some(connection)).await
-}
-
-/// The Q2 video/audio planes for one QUIC session, assembled by
-/// `run_session` once it actually needs them (see that call site).
-pub(crate) struct QuicPlanes {
-    /// Server-opened uni stream carrying one Q2-framed video frame after
-    /// another (`video_header_bytes` + raw encoded bytes).
-    pub(crate) video: quinn::SendStream,
-    /// Kept for `Connection::send_datagram` (audio) — sending a datagram
-    /// needs only the connection, not a stream object.
-    pub(crate) connection: quinn::Connection,
-}
-
-/// Fixed binary header prefixing every frame on the Q2 video uni stream.
-/// All multi-byte fields little-endian:
-/// `[codec: u8][frame_type: u8][width: u16][height: u16][timestamp_us: u64][data_len: u32]`
-/// = 1+1+2+2+8+4 = 18 bytes. Followed immediately by `data_len` bytes of the
-/// encoded frame — standard length-prefixed framing, nothing fancier.
-pub(crate) const VIDEO_HEADER_LEN: usize = 18;
-
-/// Fixed binary header prefixing the Opus payload in every Q2 audio
-/// datagram: `[sample_rate: u32][channels: u8]`, little-endian = 5 bytes.
-/// No length field: a QUIC datagram is already message-delimited (one
-/// `send_datagram()`/`read_datagram()` call is exactly one complete
-/// datagram, never partial) — everything after these 5 bytes IS the
-/// payload.
-pub(crate) const AUDIO_HEADER_LEN: usize = 5;
-
-/// Encode one video frame's 18-byte Q2 header. Must match
-/// `termland-mobile-core`'s client-side decoder byte-for-byte — see this
-/// module's tests for the exact layout.
-pub(crate) fn video_header_bytes(
-    codec: VideoCodec,
-    frame_type: FrameType,
-    width: u16,
-    height: u16,
-    timestamp_us: u64,
-    data_len: u32,
-) -> [u8; VIDEO_HEADER_LEN] {
-    let mut buf = [0u8; VIDEO_HEADER_LEN];
-    buf[0] = codec_tag(codec);
-    buf[1] = frame_type_tag(frame_type);
-    buf[2..4].copy_from_slice(&width.to_le_bytes());
-    buf[4..6].copy_from_slice(&height.to_le_bytes());
-    buf[6..14].copy_from_slice(&timestamp_us.to_le_bytes());
-    buf[14..18].copy_from_slice(&data_len.to_le_bytes());
-    buf
-}
-
-/// Encode one audio datagram's 5-byte Q2 header.
-pub(crate) fn audio_header_bytes(sample_rate: u32, channels: u8) -> [u8; AUDIO_HEADER_LEN] {
-    let mut buf = [0u8; AUDIO_HEADER_LEN];
-    buf[0..4].copy_from_slice(&sample_rate.to_le_bytes());
-    buf[4] = channels;
-    buf
-}
-
-/// Matches `termland_protocol::VideoCodec::all_preferred()`'s declared
-/// preference order exactly (Av1 best/most-open first) — this is a fixed
-/// wire tag, not derived from the enum's declaration order, so it can't
-/// silently drift if `VideoCodec`'s variants are ever reordered.
-fn codec_tag(codec: VideoCodec) -> u8 {
-    match codec {
-        VideoCodec::Av1 => 0,
-        VideoCodec::Vp9 => 1,
-        VideoCodec::Vp8 => 2,
-        VideoCodec::H265 => 3,
-        VideoCodec::H264 => 4,
-    }
-}
-
-fn frame_type_tag(frame_type: FrameType) -> u8 {
-    match frame_type {
-        FrameType::Inter => 0,
-        FrameType::Keyframe => 1,
-    }
-}
-
-#[cfg(test)]
-mod header_tests {
-    use super::*;
-
-    /// Mirrors the client-side decoder this header must match: unpack the 18
-    /// bytes back into fields the same way `termland-mobile-core`'s
-    /// `quic_video_reader` does, and check they round-trip. Kept local to
-    /// this test (not exposed as production code) since the server itself
-    /// never needs to decode a header it always originates.
-    fn decode_video_header(buf: &[u8; VIDEO_HEADER_LEN]) -> (u8, u8, u16, u16, u64, u32) {
-        let codec = buf[0];
-        let frame_type = buf[1];
-        let width = u16::from_le_bytes([buf[2], buf[3]]);
-        let height = u16::from_le_bytes([buf[4], buf[5]]);
-        let timestamp_us = u64::from_le_bytes(buf[6..14].try_into().unwrap());
-        let data_len = u32::from_le_bytes(buf[14..18].try_into().unwrap());
-        (codec, frame_type, width, height, timestamp_us, data_len)
-    }
-
-    #[test]
-    fn video_header_round_trips_all_codecs_and_frame_types() {
-        for (codec, tag) in [
-            (VideoCodec::Av1, 0u8),
-            (VideoCodec::Vp9, 1),
-            (VideoCodec::Vp8, 2),
-            (VideoCodec::H265, 3),
-            (VideoCodec::H264, 4),
-        ] {
-            for (frame_type, ft_tag) in [(FrameType::Inter, 0u8), (FrameType::Keyframe, 1u8)] {
-                let header = video_header_bytes(codec, frame_type, 1920, 1080, 123_456_789_012, 65536);
-                assert_eq!(header.len(), VIDEO_HEADER_LEN);
-                let (c, ft, w, h, ts, len) = decode_video_header(&header);
-                assert_eq!(c, tag, "codec tag for {codec:?}");
-                assert_eq!(ft, ft_tag, "frame_type tag for {frame_type:?}");
-                assert_eq!(w, 1920);
-                assert_eq!(h, 1080);
-                assert_eq!(ts, 123_456_789_012);
-                assert_eq!(len, 65536);
-            }
-        }
-    }
-
-    #[test]
-    fn video_header_byte_offsets_are_exact() {
-        // Pin the exact byte layout, not just round-trip-through-our-own-decoder:
-        // a future refactor of `video_header_bytes` that still round-trips
-        // through a matching decode function could still silently break wire
-        // compatibility with the client if both sides drifted together.
-        let header = video_header_bytes(VideoCodec::H264, FrameType::Keyframe, 0x0102, 0x0304, 0x0102030405060708, 0xAABBCCDD);
-        assert_eq!(header[0], 4); // H264 tag
-        assert_eq!(header[1], 1); // Keyframe tag
-        assert_eq!(&header[2..4], &0x0102u16.to_le_bytes());
-        assert_eq!(&header[4..6], &0x0304u16.to_le_bytes());
-        assert_eq!(&header[6..14], &0x0102030405060708u64.to_le_bytes());
-        assert_eq!(&header[14..18], &0xAABBCCDDu32.to_le_bytes());
-    }
-
-    #[test]
-    fn audio_header_layout_is_exact() {
-        let header = audio_header_bytes(48000, 2);
-        assert_eq!(header.len(), AUDIO_HEADER_LEN);
-        assert_eq!(&header[0..4], &48000u32.to_le_bytes());
-        assert_eq!(header[4], 2);
-    }
+    crate::transport::handle_session(
+        io,
+        require_auth,
+        crate::media::MediaConnection::Quic(connection),
+    )
+    .await
 }
 
 /// Build quinn's `ServerConfig` around an rustls `ServerConfig` sharing cert

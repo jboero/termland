@@ -32,6 +32,7 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False \
             git \
             rust cargo \
+            rust-std-static-wasm32-unknown-unknown \
             clang-devel \
             cmake gcc gcc-c++ \
             perl \
@@ -40,8 +41,7 @@ jobs:
             pulseaudio-libs-devel \
             alsa-lib-devel \
             pam-devel \
-            wayland-devel wayland-protocols-devel \
-            rust-std-static-wasm32-unknown-unknown
+            wayland-devel wayland-protocols-devel
 
       - uses: actions/checkout@v4
 
@@ -73,12 +73,27 @@ jobs:
         run: cargo test --workspace --locked --test wire_compatibility
 
       # A browser client runs termland-protocol as wasm rather than
-      # reimplementing the framing in another language (see #20). Nothing else
-      # here would notice a dependency creeping back in that breaks that —
-      # tokio's default features pull in mio, which does not build for wasm at
-      # all, and that is exactly how this crate started out.
+      # reimplementing the framing in another language (see #20). This is a
+      # one-line `cargo build` that keeps the crate free of host-only deps
+      # (tokio's default features pull in mio, which is how it started out).
       - name: Check termland-protocol still builds for wasm32
         run: cargo build -p termland-protocol --locked --target wasm32-unknown-unknown
+
+      # Canonical CBOR fixtures. The wasm codec must emit these same bytes
+      # (web/tests/fixtures.test.ts). No compositor.
+      - name: Canonical protocol fixtures
+        run: cargo test --workspace --locked --test web_cross_language
+
+      # TypeScript client + wasm protocol: framing, Q2 headers, and the
+      # fixture byte-compare. Node and wasm-bindgen-cli are not otherwise
+      # build dependencies of this repo.
+      - name: TypeScript client and wasm protocol tests
+        run: |
+          dnf install -y --setopt=install_weak_deps=False nodejs npm
+          cargo install wasm-bindgen-cli --version 0.2.114
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path crates/termland-web/Cargo.toml --lib
+          ./web/build.sh
 
       - name: Check the RPM specs still parse
         run: |

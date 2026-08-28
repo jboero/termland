@@ -428,6 +428,17 @@ impl InputInjector {
         let _ = self.flush();
     }
 
+    /// Inject relative pointer motion, as used by pointer-lock / trackpad
+    /// clients. `dx`/`dy` are compositor pixels, not a fraction of the
+    /// output — the protocol field `MouseMove.absolute = false` is what
+    /// selects this path.
+    pub fn pointer_motion_relative(&mut self, dx: f64, dy: f64) {
+        let time = self.timestamp_ms();
+        self.virtual_pointer.motion(time, dx, dy);
+        self.virtual_pointer.frame();
+        let _ = self.flush();
+    }
+
     /// Inject a mouse button event. button is Linux input event code (e.g., 0x110 = BTN_LEFT).
     pub fn pointer_button(&mut self, button: u32, pressed: bool) {
         let time = self.timestamp_ms();

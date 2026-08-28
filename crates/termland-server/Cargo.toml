@@ -29,7 +29,7 @@ bytes = { workspace = true }
 # aws-lc-rs to match the explicit provider tls.rs/quic.rs select (workspace's
 # `rustls` default features already bring aws-lc-rs in for this crate).
 quinn = { workspace = true, features = ["rustls-aws-lc-rs"] }
-# WebTransport (HTTP/3) listener for browser clients — see webtransport.rs.
+# HTTP/3 WebTransport for browser clients — see webtransport.rs.
 # Resolves against the same quinn 0.11 / rustls 0.23 the rest of the crate
 # already uses, so this adds a protocol, not a second QUIC stack.
 wtransport = "0.7"

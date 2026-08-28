@@ -875,4 +875,61 @@ mod tests {
             );
         }
     }
+
+    /// FFmpeg packets are an elementary stream (AV1 OBUs / Annex-B), which is
+    /// what WebCodecs `EncodedVideoChunk` expects — not IVF/MP4.
+    ///
+    /// `force_keyframe` is left false: SVT-AV1 rejects "Force key frame"
+    /// unless opened in RA CRF/CQP mode. `keyframe_interval: 1` still
+    /// produces a GOP-start keyframe.
+    #[test]
+    fn encoded_packet_is_an_elementary_stream_not_a_container() {
+        let config = EncoderConfig {
+            width: 320,
+            height: 240,
+            fps: 30,
+            bitrate_kbps: 200,
+            keyframe_interval: 1,
+            ..Default::default()
+        };
+        let Ok(mut encoder) = probe_best_encoder(&config, &VideoCodec::all_preferred()) else {
+            eprintln!("skipping: no video encoder in this environment");
+            return;
+        };
+        let codec = encoder.backend().codec();
+        let rgba = vec![80u8; 320 * 240 * 4];
+        let mut packet = None;
+        let mut last_err = None;
+        for i in 0..12 {
+            match encoder.encode_frame(&rgba, i * 33_000, false) {
+                Ok(frames) => {
+                    if let Some(f) = frames.into_iter().find(|f| !f.data.is_empty()) {
+                        packet = Some(f.data);
+                        break;
+                    }
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if packet.is_none() {
+            match encoder.flush() {
+                Ok(frames) => {
+                    packet = frames.into_iter().find(|f| !f.data.is_empty()).map(|f| f.data);
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let data = packet.unwrap_or_else(|| {
+            panic!("{codec:?} encoder produced no packet: {last_err:?}");
+        });
+        assert!(data.len() > 2, "packet too small to inspect");
+        let fourcc = data.get(0..4);
+        assert_ne!(fourcc, Some(&b"DKIF"[..]), "packet is IVF, not an elementary stream");
+        assert_ne!(fourcc, Some(&b"ftyp"[..]), "packet is MP4, not an elementary stream");
+        assert!(
+            termland_protocol::bitstream_matches_codec(codec, &data),
+            "{codec:?} packet prefix {:02x?} is not the elementary stream WebCodecs expects",
+            &data[..data.len().min(8)],
+        );
+    }
 }

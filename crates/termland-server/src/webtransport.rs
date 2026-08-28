@@ -1,32 +1,9 @@
-//! WebTransport (HTTP/3) listener, for browser clients.
+//! WebTransport (HTTP/3) listener for browser clients.
 //!
-//! # Why this is not just `--quic`
-//!
-//! A browser cannot speak to the raw QUIC listener in `quic.rs`. That endpoint
-//! negotiates ALPN `termland/1` and starts exchanging Termland's own framing
-//! immediately. Browser WebTransport is a *session* layered on HTTP/3: ALPN
-//! `h3`, an extended-CONNECT request carrying `:authority`/`:path`/`Origin`,
-//! and only then a bidirectional stream. There is no browser API that opens a
-//! bare QUIC connection, so this is a second listener rather than a change to
-//! the first — `--quic` and its Android client keep working untouched.
-//!
-//! # What is reused
-//!
-//! Everything above the transport. Once the session is established and the
-//! client opens its control stream, the two halves are joined into one
-//! `AsyncRead + AsyncWrite` and handed to the same `handle_session` that TCP,
-//! TLS, the SSH subsystem and raw QUIC all use. Hello, PAM auth, the session
-//! list/create/attach/close lifecycle, input, clipboard and codec negotiation
-//! are the existing implementations, not parallel ones.
-//!
-//! # Scope of this first pass
-//!
-//! `handle_session` is called with `None` for the QUIC connection, so video
-//! and audio travel as CBOR messages on the control stream — the pre-Q2
-//! arrangement that TCP still uses. Splitting them onto a WebTransport uni
-//! stream and datagrams needs the `Option<quinn::Connection>` coupling in
-//! `run_session` generalised first, which is a larger change and deliberately
-//! not attempted here.
+//! A second listener: browsers cannot speak `--quic` (ALPN `termland/1`).
+//! After extended-CONNECT, the control bidi stream is joined into
+//! `AsyncRead + AsyncWrite` and handed to the same `handle_session`. Video
+//! is Q2 on a server-opened uni stream (`MediaConnection::WebTransport`).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -39,25 +16,20 @@ use wtransport::endpoint::IncomingSession;
 use wtransport::tls::{Certificate, Sha256DigestFmt};
 use wtransport::{Endpoint, Identity, ServerConfig};
 
-/// How long a generated development certificate is valid.
-///
+use crate::media::MediaConnection;
+
+const SESSION_PATH: &str = "/termland";
+
 /// Browsers accept `serverCertificateHashes` only for certificates valid no
-/// longer than two weeks, so this is a protocol limit rather than a
-/// preference. It is also why the server's ordinary long-lived self-signed
-/// certificate cannot be reused for the browser path.
+/// longer than two weeks, so the server's ordinary long-lived self-signed
+/// certificate cannot be reused here.
 const DEV_CERT_VALIDITY_DAYS: u32 = 13;
 
-/// Decide whether a session request's `Origin` may proceed.
-///
-/// Fails closed for browsers. An empty allowlist rejects every request that
-/// carries an `Origin` header, which is every browser request — without this,
-/// any web page the user happens to visit could open a WebTransport session
-/// to a Termland server on their LAN and, when the server runs without PAM
-/// auth, create and drive a desktop session on it.
-///
-/// A request with *no* `Origin` is not a browser: native clients and tests do
-/// not send one, and a hostile page cannot suppress it. Those are allowed, so
-/// this check adds nothing for non-browser callers.
+/// Fail closed for browsers: an empty allowlist rejects every request that
+/// carries an `Origin`. A missing origin is not a browser (native clients and
+/// tests omit it; a page cannot suppress it) and is allowed. Without that
+/// default, any page on the LAN could open a session — and without `--auth`,
+/// create and drive a desktop.
 fn origin_allowed(origin: Option<&str>, allowed: &HashSet<String>) -> bool {
     match origin {
         None => true,
@@ -67,12 +39,9 @@ fn origin_allowed(origin: Option<&str>, allowed: &HashSet<String>) -> bool {
 
 /// Read the `Origin` header without depending on its casing.
 ///
-/// `SessionRequest::origin()` looks up the exact key `"origin"` in a map that
-/// does no case folding, so a request spelling it `Origin` reads back as
-/// absent — and absent means "not a browser", which this module allows. A
-/// browser cannot exploit that (HTTP/3 header names are lowercase, and the
-/// browser, not the page, writes them), but a check whose correctness rests on
-/// the peer's good manners is not much of a check.
+/// `SessionRequest::origin()` looks up the exact key `"origin"` with no case
+/// folding, so `Origin` would look absent — and absent is allowed. HTTP/3
+/// names are lowercase in practice, but the check must not depend on that.
 fn header_origin(headers: &HashMap<String, String>) -> Option<&str> {
     headers
         .iter()
@@ -80,12 +49,12 @@ fn header_origin(headers: &HashMap<String, String>) -> Option<&str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// Load the configured certificate, or generate a short-lived development one
-/// and print the hash a browser needs to trust it.
-async fn resolve_identity(
-    cert_path: Option<&Path>,
-    key_path: Option<&Path>,
-) -> Result<Identity> {
+fn path_allowed(path: &str) -> bool {
+    let without_query = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    without_query.trim_end_matches('/') == SESSION_PATH
+}
+
+async fn resolve_identity(cert_path: Option<&Path>, key_path: Option<&Path>) -> Result<Identity> {
     if let (Some(cert), Some(key)) = (cert_path, key_path) {
         let identity = Identity::load_pemfiles(cert, key)
             .await
@@ -94,10 +63,6 @@ async fn resolve_identity(
         return Ok(identity);
     }
 
-    // No certificate given: generate one scoped to this run. Deliberately not
-    // the server's usual keypair from tls.rs — that one is long-lived and
-    // therefore unusable with serverCertificateHashes, and reusing it here
-    // would silently produce a certificate no browser will accept.
     let identity = Identity::self_signed_builder()
         .subject_alt_names(["localhost", "127.0.0.1", "::1"])
         .from_now_utc()
@@ -109,7 +74,6 @@ async fn resolve_identity(
     Ok(identity)
 }
 
-/// Print the SHA-256 digest a browser passes as `serverCertificateHashes`.
 fn print_cert_hash(chain: &[Certificate]) {
     let Some(leaf) = chain.first() else { return };
     let hex = leaf.hash().fmt(Sha256DigestFmt::DottedHex);
@@ -119,7 +83,6 @@ fn print_cert_hash(chain: &[Certificate]) {
     );
 }
 
-/// Serve WebTransport sessions until cancelled.
 pub async fn run_webtransport_listener(
     bind: &str,
     port: u16,
@@ -168,7 +131,6 @@ pub async fn run_webtransport_listener(
     }
 }
 
-/// Take one session from HTTP/3 request through to `handle_session`.
 async fn handle_incoming(
     incoming: IncomingSession,
     allowed: Arc<HashSet<String>>,
@@ -177,6 +139,15 @@ async fn handle_incoming(
     let request = incoming.await.context("WebTransport handshake failed")?;
     let remote = request.remote_address();
     let origin = header_origin(request.headers()).map(str::to_string);
+
+    if !path_allowed(request.path()) {
+        tracing::warn!(
+            "Rejecting WebTransport session from {remote}: path {:?} is not {SESSION_PATH}",
+            request.path(),
+        );
+        request.not_found().await;
+        return Ok(());
+    }
 
     if !origin_allowed(origin.as_deref(), &allowed) {
         tracing::warn!(
@@ -205,7 +176,8 @@ async fn handle_incoming(
         .context("client did not open a control stream")?;
 
     let io = tokio::io::join(recv, send);
-    crate::transport::handle_session(io, require_auth, None).await
+    crate::transport::handle_session(io, require_auth, MediaConnection::WebTransport(connection))
+        .await
 }
 
 #[cfg(test)]
@@ -216,9 +188,13 @@ mod tests {
         items.iter().map(|s| (*s).to_string()).collect()
     }
 
-    /// The property that matters: with nothing configured, no browser gets in.
-    /// A default-open allowlist would let any page a user visits reach a
-    /// Termland server on their network.
+    fn headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
     fn empty_allowlist_rejects_every_browser_origin() {
         let empty = allowlist(&[]);
@@ -227,8 +203,6 @@ mod tests {
         assert!(!origin_allowed(Some("null"), &empty));
     }
 
-    /// Native clients and tests send no Origin, and a hostile page cannot
-    /// suppress one, so absence is not a way past the check.
     #[test]
     fn requests_without_an_origin_are_allowed() {
         assert!(origin_allowed(None, &allowlist(&[])));
@@ -236,60 +210,53 @@ mod tests {
     }
 
     #[test]
-    fn configured_origins_are_allowed_and_others_are_not() {
+    fn origin_matching_is_exact() {
         let allowed = allowlist(&["https://app.example", "https://localhost:8443"]);
         assert!(origin_allowed(Some("https://app.example"), &allowed));
         assert!(origin_allowed(Some("https://localhost:8443"), &allowed));
-        assert!(!origin_allowed(Some("https://app.example.evil"), &allowed));
-        assert!(!origin_allowed(Some("http://app.example"), &allowed));
-    }
-
-    /// Origins are compared exactly. A prefix or suffix match would let
-    /// `https://app.example.evil.com` through on an allowlist containing
-    /// `https://app.example`.
-    #[test]
-    fn origin_matching_is_exact_not_substring() {
-        let allowed = allowlist(&["https://app.example"]);
         for hostile in [
             "https://app.example.evil.com",
             "https://notapp.example",
             "https://app.example:8443",
             "https://app.example/",
+            "http://app.example",
         ] {
-            assert!(!origin_allowed(Some(hostile), &allowed), "{hostile} was allowed");
-        }
-    }
-
-    fn headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-    }
-
-    /// The header map does no case folding, so this must. Reading `Origin` as
-    /// absent would classify a browser request as a native one and let it
-    /// straight past the allowlist.
-    #[test]
-    fn origin_header_is_found_whatever_its_casing() {
-        for spelling in ["origin", "Origin", "ORIGIN", "OrIgIn"] {
-            let h = headers(&[(spelling, "https://app.example")]);
-            assert_eq!(
-                header_origin(&h),
-                Some("https://app.example"),
-                "{spelling} was not recognised as the Origin header",
+            assert!(
+                !origin_allowed(Some(hostile), &allowed),
+                "{hostile} was allowed"
             );
         }
     }
 
     #[test]
-    fn absent_origin_header_reads_as_none() {
+    fn origin_header_is_found_whatever_its_casing() {
+        for spelling in ["origin", "Origin", "ORIGIN", "OrIgIn"] {
+            let h = headers(&[(spelling, "https://app.example")]);
+            assert_eq!(header_origin(&h), Some("https://app.example"), "{spelling}");
+        }
         assert_eq!(header_origin(&headers(&[("user-agent", "curl")])), None);
         assert_eq!(header_origin(&headers(&[])), None);
     }
 
-    /// A sandboxed iframe or a `file://` page sends the literal string "null".
-    /// It must not be treated as "no origin".
     #[test]
-    fn literal_null_origin_is_treated_as_an_origin() {
+    fn literal_null_origin_is_an_origin() {
         assert!(!origin_allowed(Some("null"), &allowlist(&[])));
         assert!(origin_allowed(Some("null"), &allowlist(&["null"])));
+    }
+
+    #[test]
+    fn control_path_accepts_slash_and_query() {
+        assert!(path_allowed("/termland"));
+        assert!(path_allowed("/termland/"));
+        assert!(path_allowed("/termland?x=1"));
+        for hostile in [
+            "/",
+            "/echo",
+            "/termland.evil",
+            "/Termland",
+            "/termland/extra",
+        ] {
+            assert!(!path_allowed(hostile), "{hostile} was allowed");
+        }
     }
 }

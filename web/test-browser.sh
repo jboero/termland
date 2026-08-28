@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 #
 # End-to-end browser check: start a server with the WebTransport listener,
-# serve the client, drive a real Chrome at it, and confirm the handshake
-# completed.
+# serve the web client, drive a real Chrome at it, and confirm the
+# handshake completed.
 #
 # This is the only test that proves a *browser* interoperates. The Rust
-# integration tests in crates/termland-server/tests/webtransport_handshake.rs
-# cover the listener and the origin checks, but a Rust WebTransport client is
-# not a browser and cannot show that Chrome accepts the certificate, the
-# origin, or the wasm module.
-#
-# Not run by CI: it needs Chrome and a working UDP path.
+# integration tests cover the listener and origin checks, but a Rust
+# WebTransport client is not a browser.
 #
 #   ./web/build.sh && ./web/test-browser.sh
 #
@@ -19,7 +15,7 @@ cd "$(dirname "$0")/.."
 
 CHROME=${CHROME:-$(command -v google-chrome || command -v chromium || true)}
 [ -n "$CHROME" ] || { echo "no chrome/chromium found; set CHROME=..." >&2; exit 1; }
-[ -f web/pkg/termland_web.js ] || { echo "run ./web/build.sh first" >&2; exit 1; }
+[ -f web/dist/index.js ] || { echo "run ./web/build.sh first" >&2; exit 1; }
 
 WORK=$(mktemp -d)
 SERVER_PORT=28810 WT_PORT=28811 HTTP_PORT=8099
@@ -37,26 +33,24 @@ trap cleanup EXIT
 SRV=$!
 sleep 3
 
-# The browser needs the certificate's SHA-256 because the server mints a
-# short-lived self-signed one; a trusted certificate needs none of this.
 HASH=$(grep -oE '([0-9a-f]{2}:){31}[0-9a-f]{2}' "$WORK/server.log" | head -1)
 [ -n "$HASH" ] || { echo "server printed no certificate hash:" >&2; cat "$WORK/server.log" >&2; exit 1; }
 
-# The page reports its outcome by fetching a URL, so the result is visible in
-# the static server's log. Reading the DOM instead would mean guessing when
-# the asynchronous handshake had finished.
 cat > web/headless.html <<HTML
 <!doctype html><meta charset="utf-8"><div id="r">pending</div>
 <script type="module">
   const beacon = (s) => { document.getElementById('r').textContent = s;
                           fetch('/RESULT/' + encodeURIComponent(s.slice(0,200))).catch(()=>{}); };
   window.addEventListener('unhandledrejection', e => beacon('REJECTION ' + e.reason));
-  import init, { connect } from './pkg/termland_web.js';
-  try {
-    await init();
-    const g = await connect('https://127.0.0.1:$WT_PORT/termland', '$HASH');
-    beacon('OK server=' + g.server_name + ' v=' + g.protocol_version);
-  } catch (e) { beacon('FAIL ' + e); }
+  import { TermlandClient } from './dist/index.js';
+  const client = new TermlandClient(
+    { url: 'https://127.0.0.1:$WT_PORT/termland', certHashHex: '$HASH' },
+    (ev) => {
+      if (ev.type === 'hello') beacon('OK server=' + ev.server_name + ' auth=' + ev.auth_required);
+      if (ev.type === 'error') beacon('FAIL ' + ev.error);
+    },
+  );
+  client.start().catch(e => beacon('FAIL ' + e));
 </script>
 HTML
 trap 'rm -f web/headless.html; cleanup' EXIT

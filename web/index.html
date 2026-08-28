@@ -1,60 +1,392 @@
 <!doctype html>
+<html lang="en">
 <meta charset="utf-8">
-<title>Termland — WebTransport spike</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Termland</title>
 <style>
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 46rem;
-         background: #181825; color: #cdd6f4; }
-  h1 { font-size: 1.2rem; color: #89b4fa; }
-  label { display: block; margin: .75rem 0 .2rem; color: #a6adc8; }
-  input { width: 100%; padding: .4rem; background: #11111b; color: #cdd6f4;
-          border: 1px solid #313244; border-radius: 4px; font-family: monospace; }
-  button { margin-top: 1rem; padding: .5rem 1rem; background: #89b4fa; color: #11111b;
-           border: 0; border-radius: 4px; font-weight: 600; cursor: pointer; }
-  pre { background: #11111b; border: 1px solid #313244; border-radius: 4px;
-        padding: .75rem; white-space: pre-wrap; margin-top: 1rem; }
-  .note { color: #a6adc8; font-size: 13px; }
+  :root {
+    color-scheme: dark;
+    --crust: #11111b;
+    --mantle: #181825;
+    --base: #1e1e2e;
+    --surface0: #313244;
+    --surface1: #45475a;
+    --overlay: #6c7086;
+    --subtext: #a6adc8;
+    --text: #cdd6f4;
+    --blue: #89b4fa;
+    --yellow: #f9e2af;
+    --tab: 36px;
+    --panel: 320px;
+  }
+  html, body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: #000;
+    color: var(--text);
+    font: 14px/1.45 system-ui, sans-serif;
+  }
+
+  #stage {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    background: #000;
+  }
+  canvas {
+    display: block;
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    background: #000;
+    outline: none;
+  }
+  #banner {
+    position: absolute;
+    top: 1rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 15;
+    background: var(--yellow);
+    color: var(--crust);
+    padding: .4rem .8rem;
+    border-radius: 4px;
+    font-weight: 600;
+    pointer-events: none;
+  }
+  #connecting {
+    position: absolute;
+    inset: 0;
+    z-index: 12;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    background: rgba(17, 17, 27, .55);
+    color: var(--text);
+    pointer-events: none;
+  }
+  #connecting.visible { display: flex; }
+  .connecting-spinner {
+    width: 40px;
+    height: 40px;
+    border: 3px solid var(--surface1);
+    border-top-color: var(--blue);
+    border-radius: 50%;
+    animation: termland-spin .8s linear infinite;
+  }
+  .connecting-mark {
+    color: var(--blue);
+    opacity: .95;
+    animation: termland-pulse 1.4s ease-in-out infinite;
+  }
+  #connecting-text {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: .02em;
+    color: var(--subtext);
+  }
+  @keyframes termland-spin {
+    to { transform: rotate(360deg); }
+  }
+  @keyframes termland-pulse {
+    0%, 100% { opacity: .55; transform: scale(.96); }
+    50% { opacity: 1; transform: scale(1); }
+  }
+
+  /* noVNC-like control chrome: thin tab on an edge, panel slides out from it. */
+  #chrome {
+    position: fixed;
+    z-index: 20;
+    top: var(--offset, 16px);
+    display: flex;
+    align-items: flex-start;
+    max-height: calc(100vh - var(--offset, 16px) - 8px);
+    user-select: none;
+  }
+  #chrome.side-left { left: 0; }
+  #chrome.side-right { right: 0; flex-direction: row-reverse; }
+  #chrome.dragging { cursor: grabbing; }
+
+  #tab {
+    box-sizing: border-box;
+    width: var(--tab);
+    min-height: 88px;
+    margin: 0;
+    padding: 8px 0 10px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    color: var(--blue);
+    background: var(--mantle);
+    border: 1px solid var(--surface1);
+    cursor: grab;
+    touch-action: none;
+    box-shadow: 0 4px 18px rgba(0, 0, 0, .45);
+  }
+  #tab:hover { background: var(--base); }
+  #chrome.dragging #tab { cursor: grabbing; }
+  #chrome.side-left #tab {
+    border-left: 0;
+    border-radius: 0 8px 8px 0;
+  }
+  #chrome.side-right #tab {
+    border-right: 0;
+    border-radius: 8px 0 0 8px;
+  }
+  .grip {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 4px 0;
+  }
+  .grip i {
+    display: block;
+    width: 14px;
+    height: 2px;
+    border-radius: 1px;
+    background: var(--overlay);
+  }
+  #tab svg { display: block; }
+
+  #panel {
+    box-sizing: border-box;
+    width: var(--panel);
+    max-height: inherit;
+    display: none;
+    flex-direction: column;
+    background: var(--mantle);
+    border: 1px solid var(--surface1);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, .5);
+    overflow: hidden;
+  }
+  #chrome.open #panel { display: flex; }
+  #chrome.side-left #panel { border-left: 0; }
+  #chrome.side-right #panel { border-right: 0; }
+
+  .panel-head, .panel-foot {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    padding: .65rem .85rem;
+    background: var(--base);
+    border-bottom: 1px solid var(--surface0);
+  }
+  .panel-foot {
+    border-bottom: 0;
+    border-top: 1px solid var(--surface0);
+    display: block;
+  }
+  .panel-head h1 {
+    flex: 1;
+    margin: 0;
+    font-size: 13px;
+    font-weight: 650;
+    letter-spacing: .02em;
+    color: var(--blue);
+  }
+  .panel-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: .75rem .85rem 1rem;
+  }
+  .panel-body h2 {
+    margin: .85rem 0 .4rem;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--overlay);
+  }
+  .panel-body h2:first-child { margin-top: 0; }
+
+  label {
+    display: flex;
+    flex-direction: column;
+    gap: .2rem;
+    margin: 0 0 .55rem;
+    font-size: 12px;
+    color: var(--subtext);
+  }
+  input {
+    width: 100%;
+    min-width: 0;
+    height: 2rem;
+    box-sizing: border-box;
+    padding: .35rem .5rem;
+    background: var(--crust);
+    color: var(--text);
+    border: 1px solid var(--surface0);
+    border-radius: 4px;
+    font: 12px/1.3 ui-monospace, monospace;
+  }
+  input:focus {
+    outline: 1px solid var(--blue);
+    border-color: var(--blue);
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .4rem;
+    margin: .15rem 0 .25rem;
+  }
+  .size-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: .5rem;
+    margin: 0 0 .55rem;
+  }
+  .size-row label { margin: 0; }
+  .size-row input { font-variant-numeric: tabular-nums; }
+  #remote-size {
+    margin: .35rem 0 0;
+    font-size: 11px;
+    color: var(--subtext);
+  }
+  #remote-size strong { color: var(--text); font-weight: 600; }
+  button {
+    background: var(--blue);
+    color: var(--crust);
+    border: 0;
+    border-radius: 4px;
+    padding: .4rem .75rem;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost {
+    background: var(--surface0);
+    color: var(--text);
+  }
+  button.ghost:hover { background: var(--surface1); }
+  .actions button { flex: 1; }
+  #connect { width: 100%; margin-bottom: .15rem; }
+
+  .icon-btn {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    display: grid;
+    place-items: center;
+    background: var(--surface0);
+    color: var(--text);
+    border-radius: 4px;
+  }
+  .icon-btn:hover { background: var(--surface1); }
+  .icon-btn::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    border-left: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    transform: rotate(45deg);
+  }
+  #chrome.side-right .icon-btn::before { transform: rotate(-135deg); }
+
+  #out, #sessions { font-size: 12px; }
+  #out {
+    margin: 0;
+    padding: .5rem .55rem;
+    background: var(--crust);
+    border: 1px solid var(--surface0);
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 8rem;
+    overflow-y: auto;
+    user-select: text;
+  }
+  .session {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: .35rem;
+    margin: .35rem 0;
+  }
+  .session code {
+    font-size: 11px;
+    color: var(--subtext);
+  }
+  .session button { padding: .25rem .5rem; font-size: 12px; }
+  .note {
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--subtext);
+    user-select: text;
+  }
+  .note code {
+    font-size: 10px;
+    color: var(--text);
+  }
 </style>
-
-<h1>Termland — WebTransport transport spike</h1>
-
-<p class="note">
-  Completes a real <code>Hello</code>/<code>HelloAck</code> against
-  <code>termland-server --webtransport</code>. The framing and CBOR are the
-  server's own implementation compiled to WebAssembly, not a JavaScript port.
-</p>
-
-<label for="url">Server URL</label>
-<input id="url" value="https://localhost:7868/termland">
-
-<label for="hash">Certificate SHA-256 (from the server log; leave empty if the certificate is trusted)</label>
-<input id="hash" placeholder="e.g. a1:b2:c3:...">
-
-<button id="go">Connect</button>
-<pre id="out">Not connected.</pre>
-
-<script type="module">
-  import init, { connect } from './pkg/termland_web.js';
-
-  const out = document.getElementById('out');
-  await init();
-
-  document.getElementById('go').addEventListener('click', async () => {
-    const url = document.getElementById('url').value.trim();
-    const hash = document.getElementById('hash').value.trim();
-    out.textContent = `Connecting to ${url} …`;
-    try {
-      const greeting = await connect(url, hash === '' ? undefined : hash);
-      out.textContent =
-        `Connected.\n\n` +
-        `  server:           ${greeting.server_name}\n` +
-        `  protocol version: ${greeting.protocol_version}\n` +
-        `  session id:       ${greeting.session_id}\n` +
-        `  auth required:    ${greeting.auth_required}\n`;
-    } catch (e) {
-      out.textContent = `Failed: ${e}\n\n` +
-        `If the browser reports a certificate error, the server's development\n` +
-        `certificate is not trusted — paste its SHA-256 from the server log above.\n` +
-        `If it reports 403, this page's origin is not in --webtransport-origin.`;
-    }
-  });
-</script>
+<div id="stage">
+  <div id="banner" hidden></div>
+  <div id="connecting" hidden aria-live="polite" aria-busy="false" aria-hidden="true">
+    <div class="connecting-spinner" aria-hidden="true"></div>
+    <svg class="connecting-mark" viewBox="0 0 24 24" width="28" height="28" aria-hidden="true">
+      <rect x="2" y="4" width="20" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>
+      <path d="M8 20h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <p id="connecting-text">Connecting…</p>
+  </div>
+  <canvas id="screen" tabindex="0" width="1280" height="720"></canvas>
+</div>
+<aside id="chrome" class="side-left" aria-label="Termland controls">
+  <button type="button" id="tab" aria-expanded="false" aria-controls="panel" title="Termland controls">
+    <span class="grip" aria-hidden="true"><i></i><i></i><i></i></span>
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+      <rect x="2" y="4" width="20" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>
+      <path d="M8 20h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+  </button>
+  <div id="panel" hidden>
+    <div class="panel-head">
+      <h1>Termland</h1>
+      <button type="button" id="hide" class="icon-btn" title="Hide controls" aria-label="Hide controls"></button>
+    </div>
+    <div class="panel-body">
+      <h2>Connection</h2>
+      <form id="connect-form">
+        <label>Server URL<input id="url" value="https://127.0.0.1:7868/termland"></label>
+        <label>Certificate SHA-256<input id="hash" placeholder="from the server log, or empty if trusted" spellcheck="false"></label>
+        <label>Username<input id="user" autocomplete="username"></label>
+        <label>Password<input id="pass" type="password" autocomplete="current-password"></label>
+        <button type="submit" id="connect">Connect</button>
+      </form>
+      <h2>Session</h2>
+      <div class="actions">
+        <button type="button" id="new-session" class="ghost" disabled>New session</button>
+      </div>
+      <div id="sessions"></div>
+      <h2>Display</h2>
+      <div class="size-row">
+        <label>Width<input id="width" type="number" inputmode="numeric" min="320" max="7680" step="1" value=""></label>
+        <label>Height<input id="height" type="number" inputmode="numeric" min="240" max="4320" step="1" value=""></label>
+      </div>
+      <div class="actions">
+        <button type="button" id="apply-size" class="ghost" disabled>Apply size</button>
+        <button type="button" id="pointer-lock" class="ghost">Pointer lock</button>
+      </div>
+      <p id="remote-size" class="note">Remote size: <strong>—</strong></p>
+      <h2>Status</h2>
+      <pre id="out">Not connected.</pre>
+    </div>
+    <div class="panel-foot">
+      <p class="note">Experimental. Origin must be listed in <code>--webtransport-origin</code>.
+        Click the canvas for keyboard; pointer lock for relative mouse.</p>
+    </div>
+  </div>
+</aside>
+<script type="module" src="./app.js"></script>
