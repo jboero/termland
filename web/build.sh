@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Build the browser client: TypeScript into web/dist/.
+# Build the embeddable TypeScript client into web/dist/.
+# The sample page (index.html + app.js) is plain JS and is not compiled.
 #
 # Requires Node.js 20+.
 #
@@ -13,5 +14,5 @@ fi
 npm test
 npm run build
 
-echo "Built web/dist/ — serve this directory over HTTP and open index.html"
-echo "The page's origin must appear in --webtransport-origin."
+echo "Built web/dist/ — library entry is dist/index.js; sample page is index.html + app.js"
+echo "Serve this directory over HTTP. The page's origin must appear in --webtransport-origin."

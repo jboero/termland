@@ -20,17 +20,29 @@ So `--webtransport` is additive. `--quic` and its Android client are untouched.
 ## Architecture
 
 ```
-Browser (TypeScript in web/)
+Browser (web/src TypeScript library + web/app.js demo)
   │  HTTP/3 WebTransport  (`--webtransport`, default port = --port + 1)
   ├─ bidi stream  →  existing handle_session (Hello / auth / Session*)
   └─ uni stream   ←  Q2 video (same 18-byte header as native QUIC)
 ```
 
-Rust stays on the server. The browser client is TypeScript because
+Rust stays on the server. The protocol client is TypeScript because
 WebTransport and WebCodecs are JavaScript APIs; compiling the protocol crate
-to wasm would not remove that work. `web/src/` encodes the 7-byte `TL` frame
-and serde's externally-tagged CBOR, pinned by fixtures in `web/fixtures/`
-that Rust encodes and TypeScript decodes, and the other way around.
+to wasm would not remove that work. `web/src/` is the embeddable client:
+WebTransport, the 7-byte `TL` frame, serde's externally-tagged CBOR, codec
+probe, Q2/WebCodecs, input, and reconnect. `web/index.html` plus `web/app.js`
+is the sample UI (sidebar, connecting overlay, size fields) — plain JavaScript,
+not compiled, so the page can be edited by hand. It imports the built library
+from `./dist/index.js`. Fixtures in `web/fixtures/` pin the wire format: Rust
+encodes and TypeScript decodes, and the other way around.
+
+```ts
+import { TermlandClient, VideoPipeline, InputCapture } from 'termland-web-client';
+```
+
+or, after `./web/build.sh`, relative `from './dist/index.js'`.
+`TermlandClient` emits `status`, `hello`, `session-ready`, `reconnecting`,
+`error`, and `video` so a host UI can drive its own spinner.
 
 `crates/termland-web` is the earlier Hello-only wasm spike. It is still
 buildable; the page in `web/` no longer loads it.
@@ -42,7 +54,7 @@ can open a video uni stream on either UDP listener.
 ## Running
 
 ```
-# TypeScript client
+# TypeScript library → web/dist/; demo page is index.html + app.js
 ./web/build.sh
 python3 -m http.server 8080 --directory web
 

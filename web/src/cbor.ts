@@ -229,9 +229,6 @@ export function uint(n: number | bigint): CborValue {
 export function text(s: string): CborValue {
   return { t: 'text', v: s };
 }
-export function bytes(v: Uint8Array): CborValue {
-  return { t: 'bytes', v };
-}
 export function bool(v: boolean): CborValue {
   return { t: 'bool', v };
 }
@@ -283,12 +280,6 @@ export function asFloat(v: CborValue): number {
   if (v.t === 'uint') return Number(v.v);
   if (v.t === 'nint') return -1 - Number(v.v);
   throw new CborError(`expected float, got ${v.t}`);
-}
-
-export function asBytes(v: CborValue): Uint8Array {
-  if (v.t === 'bytes') return v.v;
-  if (v.t === 'array') return Uint8Array.from(v.v.map(asUint));
-  throw new CborError(`expected bytes, got ${v.t}`);
 }
 
 export function asArray(v: CborValue): CborValue[] {

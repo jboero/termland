@@ -120,10 +120,8 @@ export class TermlandClient {
     });
   }
 
-  attachSession(id: string, width: number, height: number): void {
+  attachSession(id: string): void {
     this.sessionId = id;
-    void width;
-    void height;
     this.send({
       type: 'SessionAttach',
       session_id: id,
@@ -213,7 +211,7 @@ export class TermlandClient {
         });
         if (!msg.auth_required) {
           if (this.attachNext && this.sessionId) {
-            this.attachSession(this.sessionId, 0, 0);
+            this.attachSession(this.sessionId);
             this.attachNext = false;
           } else {
             this.listSessions();
@@ -235,7 +233,7 @@ export class TermlandClient {
           return;
         }
         if (this.attachNext && this.sessionId) {
-          this.attachSession(this.sessionId, 0, 0);
+          this.attachSession(this.sessionId);
           this.attachNext = false;
         } else {
           this.listSessions();
@@ -310,5 +308,3 @@ function openTransport(url: string, certHashHex?: string): WebTransport {
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
-
-export { decodeHex };

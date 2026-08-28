@@ -71,7 +71,7 @@ export class FrameDecoder {
   }
 }
 
-export function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
+function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
   const out = new Uint8Array(a.byteLength + b.byteLength);
   out.set(a, 0);
   out.set(b, a.byteLength);

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # End-to-end browser check: start a server with the WebTransport listener,
-# serve the TypeScript client, drive a real Chrome at it, and confirm the
+# serve the web client, drive a real Chrome at it, and confirm the
 # handshake completed.
 #
 # This is the only test that proves a *browser* interoperates. The Rust
@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 
 CHROME=${CHROME:-$(command -v google-chrome || command -v chromium || true)}
 [ -n "$CHROME" ] || { echo "no chrome/chromium found; set CHROME=..." >&2; exit 1; }
-[ -f web/dist/client.js ] || { echo "run ./web/build.sh first" >&2; exit 1; }
+[ -f web/dist/index.js ] || { echo "run ./web/build.sh first" >&2; exit 1; }
 
 WORK=$(mktemp -d)
 SERVER_PORT=28810 WT_PORT=28811 HTTP_PORT=8099
@@ -42,7 +42,7 @@ cat > web/headless.html <<HTML
   const beacon = (s) => { document.getElementById('r').textContent = s;
                           fetch('/RESULT/' + encodeURIComponent(s.slice(0,200))).catch(()=>{}); };
   window.addEventListener('unhandledrejection', e => beacon('REJECTION ' + e.reason));
-  import { TermlandClient } from './dist/client.js';
+  import { TermlandClient } from './dist/index.js';
   const client = new TermlandClient(
     { url: 'https://127.0.0.1:$WT_PORT/termland', certHashHex: '$HASH' },
     (ev) => {
