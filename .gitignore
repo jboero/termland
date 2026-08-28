@@ -17,3 +17,8 @@ target/
 # COSMIC clipboard applet lock dropped in the repo cwd
 io.github.cosmic_utils.cosmic-ext-applet-clipboard-manager-db.lock
 
+
+# Rust browser client build output (web/build-wasm.sh) and its test scratch
+/web/wasm/pkg/
+/web/wasm/headless.html
+/crates/termland-web-client/target/
