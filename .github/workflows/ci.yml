@@ -40,8 +40,7 @@ jobs:
             pulseaudio-libs-devel \
             alsa-lib-devel \
             pam-devel \
-            wayland-devel wayland-protocols-devel \
-            rust-std-static-wasm32-unknown-unknown
+            wayland-devel wayland-protocols-devel
 
       - uses: actions/checkout@v4
 
@@ -76,13 +75,6 @@ jobs:
       # web/src/messages.ts should fail here, not only after npm test.
       - name: Cross-language TypeScript fixtures
         run: cargo test --workspace --locked --test web_cross_language
-
-      # The TypeScript client in web/ reimplements framing; crates/termland-web
-      # is the leftover wasm spike and still depends on this crate targeting
-      # wasm32. Tokio's default features pull in mio, which does not build for
-      # wasm at all, and that is exactly how this crate started out.
-      - name: Check termland-protocol still builds for wasm32
-        run: cargo build -p termland-protocol --locked --target wasm32-unknown-unknown
 
       # TypeScript client: framing, CBOR, Q2 headers, and the cross-language
       # fixtures. Node is not otherwise a build dependency of this repo.

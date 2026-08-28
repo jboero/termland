@@ -1,10 +1,7 @@
 //! Live check that WebTransport sessions get Q2 video, not CBOR-on-control.
 //!
 //! Mirrors `quic_q2_planes.rs` for the HTTP/3 listener: a real compositor,
-//! a real encoder, one real keyframe on a server-opened uni stream, parsed
-//! with the same 18-byte header the Android client already reads. Without
-//! this, a regression that passed `None` into `handle_session` would still
-//! complete Hello/HelloAck and look fine.
+//! a real encoder, one real keyframe on a server-opened uni stream.
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -15,8 +12,8 @@ use tokio_util::codec::Framed;
 use wtransport::{ClientConfig, Endpoint};
 
 use termland_protocol::{
-    FrameType, Hello, Message, SessionCreate, SessionMode, TermlandCodec, VideoCodec,
-    PROTOCOL_VERSION,
+    FrameType, Hello, Message, PROTOCOL_VERSION, SessionCreate, SessionMode, TermlandCodec,
+    VideoCodec,
 };
 
 struct ChildGuard(Child);

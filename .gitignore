@@ -10,10 +10,8 @@
 # Stray deploy artifacts (rsync mishaps etc.)
 /john@*
 
-# Generated wasm bundle for the browser client (web/build.sh output).
-/web/pkg/
+# TypeScript client build output
 /web/node_modules/
 /web/dist/
 /web/headless.html
 /web/bun.lock
-/crates/termland-web/target/

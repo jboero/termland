@@ -876,11 +876,8 @@ mod tests {
         }
     }
 
-    /// FFmpeg packets are an elementary stream (AV1 OBUs, VP9 frames,
-    /// Annex-B H.264/H.265), which is what WebCodecs `EncodedVideoChunk`
-    /// expects. An IVF/MP4 container would start with a fourcc ('DKIF' /
-    /// 'ftyp') and would fail `VideoDecoder.decode` if we fed it unchanged.
-    /// This pins the actual packet prefix rather than assuming the format.
+    /// FFmpeg packets are an elementary stream (AV1 OBUs / Annex-B), which is
+    /// what WebCodecs `EncodedVideoChunk` expects — not IVF/MP4.
     ///
     /// `force_keyframe` is left false: SVT-AV1 rejects "Force key frame"
     /// unless opened in RA CRF/CQP mode. `keyframe_interval: 1` still

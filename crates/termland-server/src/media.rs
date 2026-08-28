@@ -1,11 +1,8 @@
 //! Native-QUIC / WebTransport media planes.
 //!
-//! `run_session` used to take `Option<quinn::Connection>`, which could not
-//! represent a `wtransport::Connection`. Both transports open the same Q2
-//! video uni stream. Audio datagrams stay native-QUIC-only: Q2's 5-byte
-//! audio header omits `AudioChunk.timestamp_us`, which WebCodecs
-//! `EncodedAudioChunk` requires, and inventing a clock here would be a
-//! protocol lie.
+//! Both transports open the same Q2 video uni stream. Audio datagrams stay
+//! native-QUIC-only: Q2's 5-byte audio header omits `AudioChunk.timestamp_us`,
+//! which WebCodecs `EncodedAudioChunk` requires.
 
 use anyhow::{Context, Result};
 use termland_protocol::{audio_header_bytes, video_header_bytes, AudioChunk, FrameType, VideoCodec};
@@ -20,10 +17,7 @@ pub(crate) enum MediaConnection {
 
 impl MediaConnection {
     /// Open the video uni stream once the encoder has a first frame.
-    ///
-    /// `None` means "keep using the control stream" (TCP/TLS/SSH). `Some`
-    /// is a live split-plane session; the inner connection is held so
-    /// dropping this value does not close the transport.
+    /// `None` keeps video on the control stream (TCP/TLS/SSH).
     pub(crate) async fn open_planes(self) -> Result<Option<MediaPlanes>> {
         match self {
             Self::None => Ok(None),
@@ -160,30 +154,6 @@ fn send_audio_datagram_quic(connection: &quinn::Connection, chunk: &AudioChunk) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use termland_protocol::{parse_video_header, VIDEO_HEADER_LEN};
-
-    #[test]
-    fn q2_frame_bytes_are_header_then_payload() {
-        let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let header = video_header_bytes(
-            VideoCodec::Av1,
-            FrameType::Keyframe,
-            320,
-            240,
-            42,
-            data.len() as u32,
-        );
-        let mut wire = Vec::new();
-        wire.extend_from_slice(&header);
-        wire.extend_from_slice(&data);
-        assert_eq!(wire.len(), VIDEO_HEADER_LEN + 4);
-        let hdr: [u8; VIDEO_HEADER_LEN] = wire[..VIDEO_HEADER_LEN].try_into().unwrap();
-        let parsed = parse_video_header(&hdr).unwrap();
-        assert!(parsed.keyframe);
-        assert_eq!(parsed.width, 320);
-        assert_eq!(parsed.data_len, 4);
-        assert_eq!(&wire[VIDEO_HEADER_LEN..], &[0xDE, 0xAD, 0xBE, 0xEF]);
-    }
 
     #[tokio::test]
     async fn none_opens_no_planes() {

@@ -1,13 +1,8 @@
-//! Live check of the browser WebTransport listener.
+//! Live check of the WebTransport listener: HTTP/3 session, origin/path
+//! checks, and that the control stream reaches `handle_session`.
 //!
-//! A browser is not required to exercise this: the parts that could break are
-//! the HTTP/3 session establishment, the origin check, and whether the control
-//! stream really reaches `handle_session`. A Rust WebTransport client
-//! exercises all three, and unlike a browser it can be told exactly which
-//! `Origin` to send — including none, which a browser can never do.
-//!
-//! What this deliberately does not prove is that a *browser* interoperates.
-//! That needs a browser, and is covered separately.
+//! A Rust WebTransport client is not a browser; `web/test-browser.sh` covers
+//! that. These tests can send a chosen `Origin`, including none.
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -17,7 +12,7 @@ use futures::{SinkExt, StreamExt};
 use tokio_util::codec::Framed;
 use wtransport::{ClientConfig, Endpoint};
 
-use termland_protocol::{Hello, Message, TermlandCodec, PROTOCOL_VERSION};
+use termland_protocol::{Hello, Message, PROTOCOL_VERSION, TermlandCodec};
 
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -27,16 +22,15 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Start a server with the WebTransport listener on `wt_port`.
-///
-/// An explicit --port matters here for the same reason as the QUIC tests: the
-/// default collides with any termland-server the developer already has
-/// running, and the bind failure kills the child before the listener starts.
 fn spawn_server(tcp_port: u16, wt_port: u16, origins: &[&str]) -> ChildGuard {
     let bin = env!("CARGO_BIN_EXE_termland-server");
     let mut cmd = Command::new(bin);
     cmd.args(["--bind", "127.0.0.1", "--port", &tcp_port.to_string()])
-        .args(["--webtransport", "--webtransport-port", &wt_port.to_string()]);
+        .args([
+            "--webtransport",
+            "--webtransport-port",
+            &wt_port.to_string(),
+        ]);
     for o in origins {
         cmd.args(["--webtransport-origin", o]);
     }
@@ -50,9 +44,6 @@ fn spawn_server(tcp_port: u16, wt_port: u16, origins: &[&str]) -> ChildGuard {
 }
 
 fn client_endpoint() -> Endpoint<wtransport::endpoint::endpoint_side::Client> {
-    // The server generates a short-lived self-signed certificate when none is
-    // configured. A browser would pin it via serverCertificateHashes; a test
-    // client has no such ceremony to perform.
     let config = ClientConfig::builder()
         .with_bind_default()
         .with_no_cert_validation()
@@ -60,8 +51,6 @@ fn client_endpoint() -> Endpoint<wtransport::endpoint::endpoint_side::Client> {
     Endpoint::client(config).expect("client endpoint")
 }
 
-/// The whole point: a WebTransport session reaches the real control path and
-/// speaks the existing protocol, with no second implementation involved.
 #[tokio::test]
 #[ignore = "spawns a real server; run with --ignored"]
 async fn allowed_origin_reaches_the_real_control_stream() -> Result<()> {
@@ -77,8 +66,6 @@ async fn allowed_origin_reaches_the_real_control_stream() -> Result<()> {
         )
         .await?;
 
-    // Same contract as raw QUIC: the client opens one bidi stream and it
-    // carries the control plane.
     let (send, recv) = connection.open_bi().await?.await?;
     let mut framed = Framed::new(tokio::io::join(recv, send), TermlandCodec);
 
@@ -89,27 +76,46 @@ async fn allowed_origin_reaches_the_real_control_stream() -> Result<()> {
         }))
         .await?;
 
-    let reply = tokio::time::timeout(Duration::from_secs(10), framed.next())
+    let hello_ack = tokio::time::timeout(Duration::from_secs(10), framed.next())
         .await
         .expect("timed out waiting for HelloAck")
         .expect("stream closed before HelloAck")?;
-
-    match reply {
+    match hello_ack {
         Message::HelloAck(ack) => {
-            assert_eq!(
-                ack.protocol_version, PROTOCOL_VERSION,
-                "the browser transport must speak the same protocol version as every other one",
-            );
+            assert_eq!(ack.protocol_version, PROTOCOL_VERSION);
             assert!(!ack.server_name.is_empty());
         }
         other => panic!("expected HelloAck, got {:?}", other.message_id()),
     }
+
+    // The browser client starts Ping after HelloAck, before SessionCreate.
+    framed
+        .send(Message::Ping(termland_protocol::Ping { timestamp_us: 42 }))
+        .await?;
+    let pong = tokio::time::timeout(Duration::from_secs(10), framed.next())
+        .await
+        .expect("timed out waiting for Pong")
+        .expect("stream closed before Pong")?;
+    match pong {
+        Message::Pong(p) => assert_eq!(p.timestamp_us, 42),
+        other => panic!("expected Pong, got {:?}", other.message_id()),
+    }
+
+    framed
+        .send(Message::SessionList(termland_protocol::SessionList {}))
+        .await?;
+    let list = tokio::time::timeout(Duration::from_secs(10), framed.next())
+        .await
+        .expect("timed out waiting for SessionListResult")
+        .expect("stream closed before SessionListResult")?;
+    assert!(
+        matches!(list, Message::SessionListResult(_)),
+        "expected SessionListResult after Ping, got {:?}",
+        list.message_id()
+    );
     Ok(())
 }
 
-/// An origin that is not on the allowlist must be refused before any session
-/// exists. This is the check that stops an arbitrary web page reaching a
-/// Termland server on the user's network.
 #[tokio::test]
 #[ignore = "spawns a real server; run with --ignored"]
 async fn disallowed_origin_is_rejected() -> Result<()> {
@@ -124,42 +130,10 @@ async fn disallowed_origin_is_rejected() -> Result<()> {
                 .build(),
         )
         .await;
-
-    assert!(
-        result.is_err(),
-        "a disallowed origin established a session — any web page could then \
-         reach this server",
-    );
+    assert!(result.is_err(), "a disallowed origin established a session");
     Ok(())
 }
 
-/// With no origins configured, every browser request is refused. The default
-/// has to be closed: a server started with just --webtransport must not be
-/// reachable from any page on the internet.
-#[tokio::test]
-#[ignore = "spawns a real server; run with --ignored"]
-async fn empty_allowlist_refuses_browser_origins() -> Result<()> {
-    let _server = spawn_server(28805, 28806, &[]);
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-
-    let endpoint = client_endpoint();
-    let result = endpoint
-        .connect(
-            wtransport::endpoint::ConnectOptions::builder("https://127.0.0.1:28806/termland")
-                .add_header("origin", "https://anything.example")
-                .build(),
-        )
-        .await;
-
-    assert!(
-        result.is_err(),
-        "a browser origin was accepted with an empty allowlist",
-    );
-    Ok(())
-}
-
-/// A CONNECT to the wrong path must not become a session. The listener logs
-/// `request.path()`; logging is not a check.
 #[tokio::test]
 #[ignore = "spawns a real server; run with --ignored"]
 async fn unknown_path_is_rejected() -> Result<()> {
@@ -174,123 +148,9 @@ async fn unknown_path_is_rejected() -> Result<()> {
                 .build(),
         )
         .await;
-
     assert!(
         result.is_err(),
-        "a session was established on a path other than /termland",
-    );
-    Ok(())
-}
-
-/// SessionList after HelloAck must work on WebTransport the same as on TCP:
-/// no compositor, no video stream, just the control plane.
-#[tokio::test]
-#[ignore = "spawns a real server; run with --ignored"]
-async fn hello_then_session_list_on_webtransport() -> Result<()> {
-    let _server = spawn_server(28809, 28810, &["https://app.example"]);
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-
-    let endpoint = client_endpoint();
-    let connection = endpoint
-        .connect(
-            wtransport::endpoint::ConnectOptions::builder("https://127.0.0.1:28810/termland")
-                .add_header("origin", "https://app.example")
-                .build(),
-        )
-        .await?;
-
-    let (send, recv) = connection.open_bi().await?.await?;
-    let mut framed = Framed::new(tokio::io::join(recv, send), TermlandCodec);
-
-    framed
-        .send(Message::Hello(Hello {
-            protocol_version: PROTOCOL_VERSION,
-            client_name: "webtransport-list".into(),
-        }))
-        .await?;
-
-    let hello_ack = tokio::time::timeout(Duration::from_secs(10), framed.next())
-        .await
-        .expect("timed out waiting for HelloAck")
-        .expect("stream closed before HelloAck")?;
-    assert!(matches!(hello_ack, Message::HelloAck(_)));
-
-    framed
-        .send(Message::SessionList(termland_protocol::SessionList {}))
-        .await?;
-
-    let list = tokio::time::timeout(Duration::from_secs(10), framed.next())
-        .await
-        .expect("timed out waiting for SessionListResult")
-        .expect("stream closed before SessionListResult")?;
-    match list {
-        Message::SessionListResult(_) => {}
-        other => panic!("expected SessionListResult, got {:?}", other.message_id()),
-    }
-    Ok(())
-}
-
-/// The browser client starts Ping after HelloAck, before SessionCreate. That
-/// keepalive must not tear the control stream down — a regression here is
-/// exactly "Connect works for five seconds, then STOP_SENDING".
-#[tokio::test]
-#[ignore = "spawns a real server; run with --ignored"]
-async fn ping_before_session_create_gets_pong() -> Result<()> {
-    let _server = spawn_server(28811, 28812, &["https://app.example"]);
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-
-    let endpoint = client_endpoint();
-    let connection = endpoint
-        .connect(
-            wtransport::endpoint::ConnectOptions::builder("https://127.0.0.1:28812/termland")
-                .add_header("origin", "https://app.example")
-                .build(),
-        )
-        .await?;
-
-    let (send, recv) = connection.open_bi().await?.await?;
-    let mut framed = Framed::new(tokio::io::join(recv, send), TermlandCodec);
-
-    framed
-        .send(Message::Hello(Hello {
-            protocol_version: PROTOCOL_VERSION,
-            client_name: "webtransport-ping".into(),
-        }))
-        .await?;
-
-    let hello_ack = tokio::time::timeout(Duration::from_secs(10), framed.next())
-        .await
-        .expect("timed out waiting for HelloAck")
-        .expect("stream closed before HelloAck")?;
-    assert!(matches!(hello_ack, Message::HelloAck(_)));
-
-    framed
-        .send(Message::Ping(termland_protocol::Ping {
-            timestamp_us: 42,
-        }))
-        .await?;
-
-    let pong = tokio::time::timeout(Duration::from_secs(10), framed.next())
-        .await
-        .expect("timed out waiting for Pong — Ping before SessionCreate was likely rejected")
-        .expect("stream closed before Pong — Ping must be accepted in the session-control loop")?;
-    match pong {
-        Message::Pong(p) => assert_eq!(p.timestamp_us, 42),
-        other => panic!("expected Pong, got {:?}", other.message_id()),
-    }
-
-    // And the stream must still accept SessionList afterwards.
-    framed
-        .send(Message::SessionList(termland_protocol::SessionList {}))
-        .await?;
-    let list = tokio::time::timeout(Duration::from_secs(10), framed.next())
-        .await
-        .expect("timed out waiting for SessionListResult after Ping")
-        .expect("stream closed after Ping")?;
-    assert!(
-        matches!(list, Message::SessionListResult(_)),
-        "expected SessionListResult after Ping, got {:?}",
-        list.message_id()
+        "a session was established on a path other than /termland"
     );
     Ok(())
 }

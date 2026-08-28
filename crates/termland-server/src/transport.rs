@@ -9,8 +9,7 @@ use termland_protocol::*;
 use libpulse_binding as pulse;
 use libpulse_simple_binding as psimple;
 
-/// Run the server in SSH subsystem mode: protocol over stdin/stdout. Never a
-/// split-plane media connection, so video stays on the control stream.
+/// Run the server in SSH subsystem mode: protocol over stdin/stdout.
 pub async fn run_subsystem() -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -48,8 +47,6 @@ pub async fn run_tcp_listener(
         let acceptor = tls_acceptor.clone();
         let auth = require_auth;
         tokio::spawn(async move {
-            // Never a QUIC/WebTransport connection (those have their own
-            // listeners), so media stays on the control stream.
             let result = if let Some(acceptor) = acceptor {
                 match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
@@ -97,13 +94,8 @@ enum InputCommand {
 }
 
 /// Handle a single client session over any AsyncRead+AsyncWrite transport.
-/// `pub(crate)` so the QUIC and WebTransport listeners (sibling entry points,
-/// not forks of this logic) can reuse it as-is, exactly like
-/// `run_tcp_listener` does for TCP/TLS sockets.
-///
-/// `media` is `None` for TCP/TLS/SSH (video stays on the control stream) and
-/// the matching connection handle for `--quic` / `--webtransport`, which is
-/// where `run_session` opens Q2's video uni stream. See `media.rs`.
+/// `media` is `None` for TCP/TLS/SSH (video on the control stream) and a
+/// connection handle for `--quic` / `--webtransport` (Q2 video uni stream).
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn handle_session<T>(
     io: T,

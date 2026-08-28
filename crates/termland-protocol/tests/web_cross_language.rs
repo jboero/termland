@@ -1,9 +1,5 @@
 //! Cross-language fixtures for the TypeScript browser client.
 //!
-//! The browser speaks Termland's wire format in TypeScript rather than by
-//! compiling this crate to wasm. These files are the contract between the
-//! two implementations:
-//!
 //! - `web/fixtures/from-rust/*.cbor` are encoded here and decoded in
 //!   `web/tests/fixtures.test.ts`.
 //! - `web/fixtures/from-ts/*.cbor` are encoded by TypeScript and decoded
@@ -193,7 +189,9 @@ fn rust_fixtures_round_trip_and_match_committed() {
     }
     let mut missing = 0;
     for (name, msg) in canonical_messages() {
-        let encoded = msg.encode().unwrap_or_else(|e| panic!("{name}: encode {e}"));
+        let encoded = msg
+            .encode()
+            .unwrap_or_else(|e| panic!("{name}: encode {e}"));
         let decoded = Message::decode(&encoded).unwrap_or_else(|e| panic!("{name}: decode {e}"));
         assert_eq!(
             decoded.message_id(),
@@ -237,8 +235,12 @@ fn typescript_fixtures_decode() {
     let mut seen = 0;
     for (name, expected) in canonical_messages() {
         let path = dir.join(format!("{name}.cbor"));
-        let bytes = std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("{}: {e} — generate with the TypeScript test", path.display()));
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e} — generate with the TypeScript test",
+                path.display()
+            )
+        });
         let decoded = Message::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(
             decoded.message_id(),
@@ -277,5 +279,8 @@ fn typescript_fixtures_decode() {
         }
         seen += 1;
     }
-    assert!(seen >= 15, "expected the full control-plane fixture set, saw {seen}");
+    assert!(
+        seen >= 15,
+        "expected the full control-plane fixture set, saw {seen}"
+    );
 }

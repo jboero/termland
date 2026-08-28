@@ -19,7 +19,7 @@ describe('Q2 video header', () => {
   });
 
   it('matches the exact byte layout pinned on the Rust side', () => {
-    // crates/termland-server/src/quic.rs::video_header_byte_offsets_are_exact
+    // crates/termland-protocol/src/q2.rs::video_header_byte_offsets_are_exact
     const header = encodeVideoHeader('H264', 'Keyframe', 0x0102, 0x0304, 0x0102030405060708n, 0xaabbccdd);
     expect(header[0]).toBe(4);
     expect(header[1]).toBe(1);

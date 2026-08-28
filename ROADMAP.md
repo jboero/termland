@@ -139,7 +139,8 @@ Replace TCP with QUIC for the video/audio data stream. Benefits:
 - UDP-based: no head-of-line blocking from lost packets
 - 0-RTT reconnection for session resume
 - Independent streams for video, audio, and control (no priority inversion)
-- WebTransport variant enables a future browser-based client
+- WebTransport variant: experimental browser client — see
+  [docs/webtransport.md](docs/webtransport.md)
 
 Now designed and pulled forward alongside the mobile work — see
 [docs/quic-transport.md](docs/quic-transport.md).

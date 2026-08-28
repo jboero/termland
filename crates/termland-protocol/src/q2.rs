@@ -1,7 +1,7 @@
 //! Q2 media-plane framing: the 18-byte video header and 5-byte audio header.
 //!
-//! Shared by the native QUIC listener, the WebTransport listener, the mobile
-//! client, and the wasm browser client so the layout cannot drift.
+//! Shared by the native QUIC listener, the WebTransport listener, and the
+//! TypeScript client so the layout cannot drift.
 
 use crate::messages::{FrameType, VideoCodec};
 
@@ -77,39 +77,10 @@ pub fn parse_audio_datagram(datagram: &[u8]) -> Option<(u32, u8, &[u8])> {
     Some((sample_rate, channels, &datagram[AUDIO_HEADER_LEN..]))
 }
 
-/// WebCodecs `VideoDecoderConfig.codec` strings to probe for this wire codec.
-///
-/// These are candidates, not a guarantee: the browser must still run
-/// `VideoDecoder.isConfigSupported()` against the actual coded size. FFmpeg
-/// emits in-band parameter sets (AV1 OBUs / Annex-B / length-prefixed VP9),
-/// so the configs are used *without* a `description` box.
-pub fn webcodecs_codec_candidates(codec: VideoCodec) -> &'static [&'static str] {
-    match codec {
-        VideoCodec::Av1 => &["av01.0.04M.08", "av01.0.08M.08", "av01.0.13M.08"],
-        VideoCodec::Vp9 => &["vp09.00.10.08", "vp09.00.40.08", "vp09.00.51.08"],
-        VideoCodec::Vp8 => &["vp8"],
-        VideoCodec::H264 => &["avc1.42E01E", "avc1.4D401F", "avc1.64001F"],
-        VideoCodec::H265 => &["hvc1.1.6.L93.B0", "hev1.1.6.L93.B0"],
-    }
-}
-
-/// Parse `VideoCodec` from the name a JS client sends (`"Av1"`, `"VP9"`, …).
-pub fn video_codec_from_name(name: &str) -> Option<VideoCodec> {
-    match name {
-        "Av1" | "AV1" | "av1" => Some(VideoCodec::Av1),
-        "Vp9" | "VP9" | "vp9" => Some(VideoCodec::Vp9),
-        "Vp8" | "VP8" | "vp8" => Some(VideoCodec::Vp8),
-        "H265" | "H.265" | "hevc" | "HEVC" => Some(VideoCodec::H265),
-        "H264" | "H.264" | "avc" | "AVC" => Some(VideoCodec::H264),
-        _ => None,
-    }
-}
-
 /// Does this encoded payload look like the given codec's elementary stream?
 ///
 /// Used to refuse advertising a WebCodecs string whose bitstream we did not
-/// actually produce. Conservative: unknown prefixes return `false` rather
-/// than guessing.
+/// actually produce. Conservative: unknown prefixes return `false`.
 pub fn bitstream_matches_codec(codec: VideoCodec, data: &[u8]) -> bool {
     if data.is_empty() {
         return false;
@@ -177,14 +148,8 @@ mod tests {
             (VideoCodec::H264, 4),
         ] {
             for (frame_type, keyframe) in [(FrameType::Inter, false), (FrameType::Keyframe, true)] {
-                let header = video_header_bytes(
-                    codec,
-                    frame_type,
-                    1920,
-                    1080,
-                    123_456_789_012,
-                    65536,
-                );
+                let header =
+                    video_header_bytes(codec, frame_type, 1920, 1080, 123_456_789_012, 65536);
                 assert_eq!(header.len(), VIDEO_HEADER_LEN);
                 let parsed = parse_video_header(&header).expect("parse");
                 assert_eq!(header[0], tag);
@@ -242,29 +207,15 @@ mod tests {
     }
 
     #[test]
-    fn webcodecs_candidates_cover_every_wire_codec() {
-        for codec in VideoCodec::all_preferred() {
-            assert!(
-                !webcodecs_codec_candidates(codec).is_empty(),
-                "{codec} has no WebCodecs candidates"
-            );
-        }
-    }
-
-    #[test]
     fn bitstream_probe_accepts_av1_obu_and_h264_annexb() {
         // Sequence header OBU: obu_type = 1 in bits 3-6 → 0b0_0001_000 = 0x08
         assert!(bitstream_matches_codec(VideoCodec::Av1, &[0x08, 0x00]));
-        assert!(bitstream_matches_codec(VideoCodec::H264, &[0, 0, 0, 1, 0x67]));
+        assert!(bitstream_matches_codec(
+            VideoCodec::H264,
+            &[0, 0, 0, 1, 0x67]
+        ));
         assert!(!bitstream_matches_codec(VideoCodec::Av1, &[0xFF]));
         assert!(!bitstream_matches_codec(VideoCodec::H264, &[0x67, 0x42]));
         assert!(!bitstream_matches_codec(VideoCodec::Av1, &[]));
-    }
-
-    #[test]
-    fn video_codec_from_name_accepts_js_labels() {
-        assert_eq!(video_codec_from_name("Av1"), Some(VideoCodec::Av1));
-        assert_eq!(video_codec_from_name("VP9"), Some(VideoCodec::Vp9));
-        assert_eq!(video_codec_from_name("nope"), None);
     }
 }

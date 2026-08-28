@@ -69,25 +69,17 @@ struct Args {
     quic_port: Option<u16>,
 
     /// Also listen for browser WebTransport (HTTP/3) connections.
-    ///
-    /// Separate from --quic on purpose: a browser cannot speak the raw QUIC
-    /// listener's protocol, and the native client cannot speak HTTP/3
-    /// extended CONNECT. See crates/termland-server/src/webtransport.rs.
+    /// Separate from --quic: browsers cannot speak the raw QUIC listener.
     #[arg(long)]
     webtransport: bool,
 
-    /// UDP port for the WebTransport listener. Defaults to --port + 1, since
-    /// HTTP/3 and raw QUIC cannot share a socket (different ALPN).
+    /// UDP port for the WebTransport listener. Defaults to --port + 1.
     #[arg(long)]
     webtransport_port: Option<u16>,
 
     /// Browser origin permitted to open WebTransport sessions, e.g.
-    /// https://desktop.example.com. Repeat for several.
-    ///
-    /// With none given, every browser request is refused. That is deliberate:
-    /// without it, any page a user visits could reach a Termland server on
-    /// their network and — on a server running without --auth — create and
-    /// drive a desktop session.
+    /// https://desktop.example.com. Repeat for several. With none given,
+    /// every browser request is refused.
     #[arg(long = "webtransport-origin", value_name = "ORIGIN")]
     webtransport_origins: Vec<String>,
 
@@ -192,9 +184,6 @@ async fn main() -> Result<()> {
             if args.quic { "enabled" } else { "disabled" },
         );
 
-        // Each listener is an independent future; whichever are enabled run
-        // together and any one failing brings the server down, which is the
-        // existing behaviour for TCP+QUIC.
         let tcp_fut = transport::run_tcp_listener(&args.bind, args.port, acceptor, args.auth);
 
         match (args.quic, args.webtransport) {
@@ -214,7 +203,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// The raw-QUIC listener future for the current arguments.
 fn quic_listener(args: &Args) -> impl std::future::Future<Output = Result<()>> + '_ {
     let port = args.quic_port.unwrap_or(args.port);
     quic::run_quic_listener(
@@ -226,11 +214,6 @@ fn quic_listener(args: &Args) -> impl std::future::Future<Output = Result<()>> +
     )
 }
 
-/// The browser WebTransport listener future for the current arguments.
-///
-/// Defaults to `--port + 1` rather than sharing the QUIC port: both are UDP
-/// but they negotiate different ALPN (`h3` vs `termland/1`), so one socket
-/// cannot serve both.
 fn webtransport_listener(args: &Args) -> impl std::future::Future<Output = Result<()>> + '_ {
     let port = args.webtransport_port.unwrap_or(args.port.saturating_add(1));
     webtransport::run_webtransport_listener(

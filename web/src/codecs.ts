@@ -12,7 +12,8 @@ export interface CodecConfig {
   webcodecs: string;
 }
 
-/** Same candidate list as `termland_protocol::q2::webcodecs_codec_candidates`. */
+/** WebCodecs `VideoDecoderConfig.codec` strings to probe, in the same
+ * preference order as `VideoCodec::all_preferred`. */
 const CANDIDATES: { codec: VideoCodec; strings: string[] }[] = [
   { codec: 'Av1', strings: ['av01.0.04M.08', 'av01.0.08M.08', 'av01.0.13M.08'] },
   { codec: 'Vp9', strings: ['vp09.00.10.08', 'vp09.00.40.08', 'vp09.00.51.08'] },
