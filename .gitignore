@@ -1,4 +1,5 @@
-/target
+# Cargo build output (workspace root and per-crate, e.g. crates/termland-web)
+target/
 
 # Editor / tooling
 .claude/
@@ -10,8 +11,6 @@
 # Stray deploy artifacts (rsync mishaps etc.)
 /john@*
 
-# TypeScript client build output
-/web/node_modules/
-/web/dist/
-/web/headless.html
-/web/bun.lock
+# COSMIC clipboard applet lock dropped in the repo cwd
+io.github.cosmic_utils.cosmic-ext-applet-clipboard-manager-db.lock
+
