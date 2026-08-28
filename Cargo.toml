@@ -7,9 +7,9 @@ members = [
     "crates/termland-client",
     "crates/termland-mobile-core",
 ]
-# Standalone wasm32 crate: including it would break `cargo build --workspace`
-# on a normal host. Build with --manifest-path crates/termland-web/Cargo.toml.
-exclude = ["crates/termland-web"]
+# Standalone wasm32 crates: including them would break `cargo build --workspace`
+# on a normal host. Build with --manifest-path crates/<name>/Cargo.toml.
+exclude = ["crates/termland-web", "crates/termland-web-client"]
 resolver = "2"
 
 [workspace.package]

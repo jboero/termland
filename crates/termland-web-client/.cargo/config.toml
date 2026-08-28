@@ -1,0 +1,6 @@
+# WebTransport and WebCodecs are still behind web-sys's unstable gate: without
+# this the `web_sys::WebTransport` and `web_sys::VideoDecoder` bindings simply
+# do not exist. Crate-local so the flag cannot leak into the workspace build,
+# where it would be meaningless.
+[build]
+rustflags = ["--cfg=web_sys_unstable_apis"]
