@@ -28,6 +28,11 @@ jobs:
         # Kept in sync with BuildRequires in packaging/termland-server.spec and
         # packaging/termland-client.spec — this is the union of the two, plus
         # git, which the checkout action needs inside a container.
+        #
+        # chromium and python3 are test-only, not BuildRequires: web/test-browser.sh
+        # drives a real browser and serves the page with `python3 -m http.server`.
+        # python3 is not implicit — the Fedora base image dropped it when dnf5
+        # replaced the Python-based dnf.
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             git \
@@ -41,16 +46,20 @@ jobs:
             pulseaudio-libs-devel \
             alsa-lib-devel \
             pam-devel \
-            wayland-devel wayland-protocols-devel
+            wayland-devel wayland-protocols-devel \
+            chromium python3
 
       - uses: actions/checkout@v4
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
+        # ~/.cargo/bin holds wasm-bindgen-cli. Without it in the cache,
+        # `cargo install` rebuilds that CLI from source on every single run.
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin
             target
           key: ${{ runner.os }}-fedora43-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-fedora43-cargo-
@@ -90,10 +99,29 @@ jobs:
       - name: TypeScript client and wasm protocol tests
         run: |
           dnf install -y --setopt=install_weak_deps=False nodejs npm
-          cargo install wasm-bindgen-cli --version 0.2.114
+          # The bindgen schema is not stable across releases, so the CLI must
+          # match the generated glue exactly. Read the version from the
+          # lockfile rather than hardcoding it here, so bumping the crate
+          # cannot leave CI installing a stale CLI (or vice versa).
+          WB=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' \
+                 crates/termland-web/Cargo.lock)
+          echo "wasm-bindgen pinned at ${WB}"
+          cargo install wasm-bindgen-cli --version "$WB"
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo test --manifest-path crates/termland-web/Cargo.toml --lib
           ./web/build.sh
+
+      # The only test that proves a *browser* interoperates. Everything else
+      # in the WebTransport suite drives the listener with a `wtransport`
+      # client, which cannot catch a WebCodecs config the browser rejects,
+      # broken wasm-bindgen glue, or a serverCertificateHashes regression.
+      #
+      # It lives in this job rather than `integration` because it only drives
+      # the handshake -- no session is created, so no compositor is needed --
+      # and this job has already built target/debug/termland-server, web/pkg/
+      # and web/dist/ in the step above.
+      - name: Browser interop (real Chromium)
+        run: ./web/test-browser.sh
 
       - name: Check the RPM specs still parse
         run: |
