@@ -1,6 +1,6 @@
 /** Public API of the Termland TypeScript client. */
 
-export { TermlandClient, backoffDelay } from './client.js';
+export { TermlandClient, backoffDelay, shouldReconnectAfterHidden } from './client.js';
 export type { ClientEvent, ConnectOptions } from './client.js';
 
 export {
@@ -13,7 +13,7 @@ export {
 } from './protocol.js';
 export type { Message, SessionInfo, VideoCodec } from './messages.js';
 
-export { VideoPipeline } from './video.js';
+export { VideoPipeline, shouldReconfigureDecoder } from './video.js';
 export { probeSupportedCodecs } from './codecs.js';
 export type { CodecConfig } from './codecs.js';
 

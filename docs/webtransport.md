@@ -98,6 +98,11 @@ byte-compares wasm `encodePayload` against `web/fixtures/from-rust/`.
 Headless Chrome `--virtual-time-budget` fast-forwards timers and hangs the
 QUIC handshake; `test-browser.sh` uses wall-clock time.
 
+A Chromium tab left in the background is frozen after a few minutes (Page
+Lifecycle). The client unlatches a dropped `requestAnimationFrame`, rebuilds
+a dead `VideoDecoder` on the next keyframe, releases stuck mouse buttons, and
+re-attaches the session if the tab was hidden for more than a minute.
+
 ## Not done
 
 - **Audio.** Q2's 5-byte datagram header has no `AudioChunk.timestamp_us`,

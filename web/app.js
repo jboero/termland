@@ -353,5 +353,10 @@ function initChrome() {
   });
 }
 
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !sessionAttached) return;
+  canvas.focus();
+});
+
 initSizeFields();
 initChrome();

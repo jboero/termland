@@ -50,6 +50,17 @@ export function backoffDelay(attempt: number): number {
   return Math.min(1000 * (1 << shift), 30_000);
 }
 
+/** Close a live WebTransport after this long in the background.
+ *
+ * Chromium freezes a hidden page after a few minutes: JS and WebCodecs
+ * stop, while QUIC keep-alives can keep the session looking connected.
+ * Re-attaching is cheaper than a stuck canvas that no longer paints. */
+export const RECONNECT_AFTER_HIDDEN_MS = 60_000;
+
+export function shouldReconnectAfterHidden(hiddenMs: number): boolean {
+  return hiddenMs >= RECONNECT_AFTER_HIDDEN_MS;
+}
+
 export class TermlandClient {
   private transport: WebTransport | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
@@ -57,8 +68,11 @@ export class TermlandClient {
   private sessionId: string | null = null;
   private attachNext = false;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private lastPongAt = 0;
+  private hiddenAt: number | null = null;
   private codecs: CodecConfig[] = [];
   private reconnectEnabled = true;
+  private visibilityBound = false;
 
   constructor(
     private readonly opts: ConnectOptions,
@@ -80,6 +94,7 @@ export class TermlandClient {
       this.emit({ type: 'error', error: 'this browser cannot decode any Termland video codec' });
       return;
     }
+    this.bindVisibility();
     await this.connectLoop();
   }
 
@@ -87,6 +102,7 @@ export class TermlandClient {
     this.closed = true;
     this.reconnectEnabled = false;
     this.stopPing();
+    this.unbindVisibility();
     try {
       this.send({ type: 'SessionEnd', reason: 'client quit' });
     } catch {
@@ -100,6 +116,11 @@ export class TermlandClient {
     if (!writer) return;
     void writer.write(encodeWire(msg)).catch((e) => {
       this.emit({ type: 'error', error: String(e) });
+      try {
+        this.transport?.close();
+      } catch {
+        // already closed
+      }
     });
   }
 
@@ -280,6 +301,7 @@ export class TermlandClient {
         this.transport?.close();
         break;
       case 'Pong':
+        this.lastPongAt = Date.now();
         break;
       case 'Unknown':
         break;
@@ -301,7 +323,18 @@ export class TermlandClient {
 
   private startPing(): void {
     this.stopPing();
+    this.lastPongAt = Date.now();
     this.pingTimer = setInterval(() => {
+      const visible =
+        typeof document === 'undefined' || document.visibilityState === 'visible';
+      if (visible && this.lastPongAt > 0 && Date.now() - this.lastPongAt > 20_000) {
+        try {
+          this.transport?.close();
+        } catch {
+          // already closed
+        }
+        return;
+      }
       this.send({ type: 'Ping', timestamp_us: Date.now() * 1000 });
     }, 5000);
   }
@@ -312,6 +345,37 @@ export class TermlandClient {
       this.pingTimer = null;
     }
   }
+
+  private bindVisibility(): void {
+    if (this.visibilityBound || typeof document === 'undefined') return;
+    document.addEventListener('visibilitychange', this.onVisibility);
+    this.visibilityBound = true;
+  }
+
+  private unbindVisibility(): void {
+    if (!this.visibilityBound || typeof document === 'undefined') return;
+    document.removeEventListener('visibilitychange', this.onVisibility);
+    this.visibilityBound = false;
+  }
+
+  private onVisibility = (): void => {
+    if (typeof document === 'undefined') return;
+    if (document.hidden) {
+      this.hiddenAt = Date.now();
+      return;
+    }
+    const hiddenMs = this.hiddenAt == null ? 0 : Date.now() - this.hiddenAt;
+    this.hiddenAt = null;
+    this.lastPongAt = Date.now();
+    this.send({ type: 'Ping', timestamp_us: Date.now() * 1000 });
+    if (shouldReconnectAfterHidden(hiddenMs) && this.transport) {
+      try {
+        this.transport.close();
+      } catch {
+        // already closed
+      }
+    }
+  };
 }
 
 function openTransport(url: string, certHashHex?: string): WebTransport {

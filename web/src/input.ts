@@ -2,8 +2,9 @@
 //!
 //! Keyboard: `event.code` (layout-independent) maps to evdev scancodes, the
 //! same table the desktop client uses. Printable IME output goes as
-//! `TextInput`. On blur, every currently-pressed key is released so a
-//! lost key-up cannot leave a modifier stuck in the session.
+//! `TextInput`. On blur or when the tab is hidden, every currently-pressed
+//! key *and* mouse button is released so a lost key-up or mouse-up cannot
+//! leave labwc with a stuck modifier or BTN_LEFT (clicks then do nothing).
 //!
 //! Pointer: canvas coordinates are scaled to the remote framebuffer.
 //! Pointer-lock uses `movementX/Y` with `absolute: false`.
@@ -50,6 +51,7 @@ export function mouseButtonToLinux(button: number): number | undefined {
 
 export class InputCapture {
   private pressed = new Set<number>();
+  private buttons = new Set<number>();
   private remoteW = 1;
   private remoteH = 1;
 
@@ -76,6 +78,13 @@ export class InputCapture {
     el.addEventListener('blur', this.releaseAll);
     el.addEventListener('compositionend', this.onComposition);
     window.addEventListener('blur', this.releaseAll);
+    // mouseup on the canvas is lost if the pointer leaves the tab or the
+    // page is hidden mid-click — labwc then keeps BTN_LEFT down and the
+    // desktop stops receiving ordinary clicks.
+    window.addEventListener('mouseup', this.onWindowMouseUp);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.onVisibility);
+    }
   }
 
   detach(): void {
@@ -90,6 +99,10 @@ export class InputCapture {
     el.removeEventListener('blur', this.releaseAll);
     el.removeEventListener('compositionend', this.onComposition);
     window.removeEventListener('blur', this.releaseAll);
+    window.removeEventListener('mouseup', this.onWindowMouseUp);
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.onVisibility);
+    }
     this.releaseAll();
   }
 
@@ -134,6 +147,10 @@ export class InputCapture {
     if (e.data) this.send({ type: 'TextInput', text: e.data });
   };
 
+  private onVisibility = (): void => {
+    if (typeof document !== 'undefined' && document.hidden) this.releaseAll();
+  };
+
   private releaseAll = (): void => {
     for (const scancode of this.pressed) {
       this.send({
@@ -145,6 +162,10 @@ export class InputCapture {
       });
     }
     this.pressed.clear();
+    for (const button of this.buttons) {
+      this.send({ type: 'MouseButton', button, state: 'Released' });
+    }
+    this.buttons.clear();
   };
 
   private scale(e: MouseEvent): { x: number; y: number } {
@@ -173,13 +194,23 @@ export class InputCapture {
     this.canvas.focus();
     const button = mouseButtonToLinux(e.button);
     if (button === undefined) return;
+    this.buttons.add(button);
     this.send({ type: 'MouseButton', button, state: 'Pressed' });
   };
 
   private onMouseUp = (e: MouseEvent): void => {
     e.preventDefault();
-    const button = mouseButtonToLinux(e.button);
-    if (button === undefined) return;
+    this.releaseButton(e.button);
+  };
+
+  private onWindowMouseUp = (e: MouseEvent): void => {
+    this.releaseButton(e.button);
+  };
+
+  private releaseButton(domButton: number): void {
+    const button = mouseButtonToLinux(domButton);
+    if (button === undefined || !this.buttons.has(button)) return;
+    this.buttons.delete(button);
     this.send({ type: 'MouseButton', button, state: 'Released' });
   };
 
