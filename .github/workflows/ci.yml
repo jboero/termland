@@ -106,8 +106,17 @@ jobs:
           WB=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' \
                  crates/termland-web/Cargo.lock)
           echo "wasm-bindgen pinned at ${WB}"
-          cargo install wasm-bindgen-cli --version "$WB"
           export PATH="$HOME/.cargo/bin:$PATH"
+          # Skip the install when the cache already restored the right CLI.
+          # `cargo install` refuses to overwrite an existing binary without
+          # --force, so caching ~/.cargo/bin turns an unconditional install
+          # into a hard failure on every run after the first.
+          HAVE=$(wasm-bindgen --version 2>/dev/null | awk '{print $2}' || true)
+          if [ "$HAVE" = "$WB" ]; then
+            echo "wasm-bindgen-cli ${WB} restored from cache"
+          else
+            cargo install wasm-bindgen-cli --version "$WB" --force
+          fi
           cargo test --manifest-path crates/termland-web/Cargo.toml --lib
           ./web/build.sh
 
