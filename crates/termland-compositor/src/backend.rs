@@ -508,10 +508,45 @@ pub fn detect_desktop_shell() -> String {
     let terminal = detect_terminal();
 
     if has_program("plasmashell") && has_program("dbus-run-session") {
-        // Start plasmashell (panels/plasmoids) in the background, plus a terminal
-        // in the foreground so something is visible and labwc has a session process
-        // to tie its lifetime to. When the terminal exits, labwc exits.
-        return format!("dbus-run-session sh -c 'plasmashell & exec {terminal}'");
+        // Start plasmashell (panels/plasmoids) in the background, plus a
+        // terminal in the foreground so something is visible and labwc has a
+        // session process to tie its lifetime to. When the terminal exits,
+        // labwc exits.
+        //
+        // Two details here are load-bearing, both learned from stranding
+        // `plasmashell` processes on a developer workstation for hours:
+        //
+        //   --no-respawn   Bare plasmashell restarts itself when it dies, so a
+        //                  stranded instance resurrects indefinitely and no
+        //                  amount of killing settles it. A real Plasma session
+        //                  passes this flag for the same reason.
+        //
+        //   no `exec`      `exec` replaced this shell with the terminal,
+        //                  destroying the only process that could clean up
+        //                  after plasmashell. Keeping the shell costs one
+        //                  process and buys a trap that stops the shell when
+        //                  the terminal exits, instead of orphaning it.
+        //
+        // The `wait` after the `kill` is not decoration. Without it the shell
+        // exits as soon as the signal is sent, `dbus-run-session` tears down
+        // the private session bus, and plasmashell — still shutting down —
+        // aborts inside libdbus:
+        //
+        //     abort <- _dbus_warn_check_failed
+        //           <- QDBusConnectionPrivate::getNameOwnerNoCache
+        //           <- QDBusConnectionPrivate::addSignalHookImpl
+        //
+        // which is a coredump and a KCrash handler on every single teardown.
+        // Waiting keeps the bus alive until plasmashell has finished with it.
+        //
+        // The trap does not run on SIGKILL, so this does not replace reaping
+        // the process group in `registry::close` — it just means the common
+        // case never gets that far.
+        return format!(
+            "dbus-run-session sh -c 'plasmashell --no-respawn & shell=$!; \
+             trap \"kill $shell 2>/dev/null; wait $shell 2>/dev/null\" EXIT INT TERM; \
+             {terminal}'"
+        );
     }
 
     terminal
@@ -519,6 +554,65 @@ pub fn detect_desktop_shell() -> String {
 
 pub mod cage;
 pub mod labwc;
+
+#[cfg(test)]
+mod desktop_shell_tests {
+    use super::*;
+
+    /// Only meaningful where plasmashell is actually detected; elsewhere the
+    /// function returns a bare terminal and there is nothing to assert.
+    fn plasma_command() -> Option<String> {
+        let cmd = detect_desktop_shell();
+        cmd.contains("plasmashell").then_some(cmd)
+    }
+
+    /// Bare plasmashell restarts itself when it dies, so a stranded instance
+    /// resurrects forever and killing it never settles anything.
+    #[test]
+    fn plasmashell_is_launched_with_no_respawn() {
+        let Some(cmd) = plasma_command() else { return };
+        assert!(
+            cmd.contains("plasmashell --no-respawn"),
+            "plasmashell must not be allowed to respawn: {cmd}"
+        );
+    }
+
+    /// `exec` replaced the shell with the terminal, destroying the only
+    /// process that could clean up the backgrounded plasmashell. The shell has
+    /// to survive for the trap to exist at all.
+    #[test]
+    fn the_wrapper_shell_survives_to_run_its_trap() {
+        let Some(cmd) = plasma_command() else { return };
+        assert!(
+            !cmd.contains("exec "),
+            "exec destroys the shell that owns plasmashell: {cmd}"
+        );
+        assert!(cmd.contains("trap "), "no trap to clean up plasmashell: {cmd}");
+        assert!(
+            cmd.contains("EXIT") && cmd.contains("TERM"),
+            "trap must cover normal exit and termination: {cmd}"
+        );
+    }
+
+    /// The command is handed to `sh -c`; if it is not valid shell the session
+    /// dies at startup with a message about syntax rather than about Termland.
+    #[test]
+    fn the_command_is_valid_shell() {
+        let Some(cmd) = plasma_command() else { return };
+        // `sh -n` parses without executing.
+        let inner = cmd
+            .split_once("sh -c '")
+            .and_then(|(_, rest)| rest.strip_suffix('\''))
+            .expect("expected a `sh -c '...'` wrapper");
+        let status = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(inner)
+            .status()
+            .expect("run sh -n");
+        assert!(status.success(), "not valid shell: {inner}");
+    }
+}
 
 #[cfg(test)]
 mod program_lookup_tests {
