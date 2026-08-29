@@ -1,0 +1,77 @@
+# Standalone, not a member of the parent workspace: this crate only builds for
+# wasm32, so including it would break `cargo build --workspace` on any normal
+# host. The empty [workspace] table below makes it its own root despite living
+# inside the repo tree.
+[workspace]
+
+[package]
+name = "termland-web-client"
+version = "0.7.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Rust/wasm browser client for Termland: WebTransport, WebCodecs and input, without a TypeScript layer"
+
+# Deliberately outside the workspace: this only ever builds for
+# wasm32-unknown-unknown, and its dependency tree (web-sys, wasm-bindgen)
+# is meaningless on the host.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+termland-protocol = { path = "../termland-protocol" }
+
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+bytes = "1"
+tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
+# Turns a Rust panic into a readable console error rather than a bare wasm
+# trap, which otherwise leaves the page hung with no message.
+console_error_panic_hook = "0.1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "console",
+  "Window",
+  "Document",
+  "Element",
+  "HtmlElement",
+  "HtmlCanvasElement",
+  "CanvasRenderingContext2d",
+  "DomRect",
+  # WebTransport (all behind web_sys_unstable_apis; see .cargo/config.toml)
+  "WebTransport",
+  "WebTransportOptions",
+  "WebTransportHash",
+  "WebTransportBidirectionalStream",
+  "WebTransportReceiveStream",
+  "WebTransportSendStream",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "WritableStream",
+  "WritableStreamDefaultWriter",
+  # WebCodecs
+  "VideoDecoder",
+  "VideoDecoderConfig",
+  "VideoDecoderInit",
+  "VideoDecoderSupport",
+  "EncodedVideoChunk",
+  "EncodedVideoChunkInit",
+  "EncodedVideoChunkType",
+  "CodecState",
+  "VideoFrame",
+  # Input
+  "EventTarget",
+  "Event",
+  "KeyboardEvent",
+  "MouseEvent",
+  "WheelEvent",
+  "FocusEvent",
+]
+
+[profile.release]
+opt-level = "s"
+lto = true

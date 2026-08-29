@@ -246,9 +246,18 @@ termland-server --webtransport --webtransport-origin http://localhost:8080
 ```
 
 Open `http://localhost:8080/` and paste the certificate SHA-256 the server
-logs if you are not using a normally trusted certificate. Details, browser
-support, and what is deliberately not implemented yet:
-[docs/webtransport.md](docs/webtransport.md).
+logs if you are not using a normally trusted certificate.
+
+There are two browser clients against the same listener: a TypeScript one
+(above) and a Rust/wasm one that keeps the session logic, input handling and
+video pump in Rust, sharing `termland-protocol` with the server.
+
+```bash
+./web/build-wasm.sh          # then open /wasm/ instead of /
+```
+
+Details, browser support, the trade-offs between the two, and what is
+deliberately not implemented yet: [docs/webtransport.md](docs/webtransport.md).
 
 ## Building from Source
 

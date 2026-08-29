@@ -103,11 +103,31 @@ jobs:
           # match the generated glue exactly. Read the version from the
           # lockfile rather than hardcoding it here, so bumping the crate
           # cannot leave CI installing a stale CLI (or vice versa).
-          WB=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' \
-                 crates/termland-web/Cargo.lock)
+          wb_version() {
+            awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' "$1"
+          }
+          WB=$(wb_version crates/termland-web/Cargo.lock)
+          # Both wasm crates are built by the one CLI installed here, so their
+          # lockfiles have to agree. If they drift, one of the two builds fails
+          # on a bindgen schema mismatch that says nothing about lockfiles.
+          WB_CLIENT=$(wb_version crates/termland-web-client/Cargo.lock)
+          if [ "$WB" != "$WB_CLIENT" ]; then
+            echo "wasm-bindgen pins disagree: termland-web ${WB}, termland-web-client ${WB_CLIENT}" >&2
+            echo "Bring them together with 'cargo update -p wasm-bindgen --precise <version>'." >&2
+            exit 1
+          fi
           echo "wasm-bindgen pinned at ${WB}"
-          cargo install wasm-bindgen-cli --version "$WB"
           export PATH="$HOME/.cargo/bin:$PATH"
+          # Skip the install when the cache already restored the right CLI.
+          # `cargo install` refuses to overwrite an existing binary without
+          # --force, so caching ~/.cargo/bin turns an unconditional install
+          # into a hard failure on every run after the first.
+          HAVE=$(wasm-bindgen --version 2>/dev/null | awk '{print $2}' || true)
+          if [ "$HAVE" = "$WB" ]; then
+            echo "wasm-bindgen-cli ${WB} restored from cache"
+          else
+            cargo install wasm-bindgen-cli --version "$WB" --force
+          fi
           cargo test --manifest-path crates/termland-web/Cargo.toml --lib
           ./web/build.sh
 
@@ -122,6 +142,28 @@ jobs:
       # and web/dist/ in the step above.
       - name: Browser interop (real Chromium)
         run: ./web/test-browser.sh
+
+      # The Rust/wasm client (crates/termland-web-client), a parallel
+      # implementation to web/src. Its unit tests run on the host; the crate
+      # itself only builds for wasm32.
+      #
+      # --cfg=web_sys_unstable_apis is added to RUSTFLAGS explicitly rather
+      # than left to the crate's .cargo/config.toml: the workflow-level
+      # RUSTFLAGS (`-D warnings`) REPLACES build.rustflags rather than merging,
+      # so the config alone would be silently dropped here and every web-sys
+      # WebTransport/WebCodecs binding would go missing.
+      - name: Rust browser client tests
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          export RUSTFLAGS="$RUSTFLAGS --cfg=web_sys_unstable_apis"
+          (cd crates/termland-web-client && cargo test --lib)
+          ./web/build-wasm.sh
+
+      # Same argument as the TypeScript browser check above: a wtransport
+      # client cannot exercise wasm-bindgen glue or WebCodecs. Handshake only —
+      # `--with-video` needs a compositor and is left for the developer.
+      - name: Rust client browser interop (real Chromium)
+        run: ./web/test-browser-wasm.sh
 
       - name: Check the RPM specs still parse
         run: |

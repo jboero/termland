@@ -1,0 +1,54 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Termland — Rust/wasm client</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #14161a; color: #e6e8eb; }
+  header { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center;
+           padding: .6rem .8rem; background: #1c1f25; border-bottom: 1px solid #2a2e36; }
+  input { background: #0f1114; color: inherit; border: 1px solid #333842;
+          border-radius: 4px; padding: .3rem .45rem; font: inherit; }
+  input#url { min-width: 22rem; }
+  input#hash { min-width: 14rem; }
+  button { background: #2d6cdf; color: #fff; border: 0; border-radius: 4px;
+           padding: .35rem .7rem; font: inherit; cursor: pointer; }
+  button.ghost { background: #333842; }
+  #status { padding: .4rem .8rem; color: #9aa3ad; border-bottom: 1px solid #2a2e36; }
+  #sessions { display: flex; flex-direction: column; align-items: flex-start;
+              gap: .3rem; padding: .5rem .8rem; }
+  #sessions button { background: #333842; font-family: ui-monospace, monospace; }
+  #screen { display: block; max-width: 100%; background: #000; margin: 0 auto; }
+  #screen:focus { outline: 2px solid #2d6cdf; }
+</style>
+
+<header>
+  <input id="url" value="https://127.0.0.1:7868/termland" spellcheck="false">
+  <input id="hash" placeholder="cert SHA-256 (dev cert)" spellcheck="false">
+  <input id="user" placeholder="user" size="8">
+  <input id="pass" placeholder="password" type="password" size="10">
+  <button id="connect">Connect</button>
+  <button id="new" class="ghost">New 1280×720</button>
+  <button id="quit" class="ghost">Disconnect</button>
+</header>
+
+<div id="status">idle</div>
+<div id="sessions"></div>
+<canvas id="screen" width="1280" height="720"></canvas>
+
+<!--
+  The whole page script. Everything else -- framing, CBOR, the session state
+  machine, the keymap, WebCodecs and the canvas -- is Rust in
+  crates/termland-web-client, sharing termland-protocol with the server.
+-->
+<script type="module">
+  import init, { WebClient } from './pkg/termland_web_client.js';
+  await init();
+
+  const client = new WebClient('screen', 'status', 'sessions');
+  const val = (id) => document.getElementById(id).value.trim() || undefined;
+
+  document.getElementById('connect').onclick = () =>
+    client.connect(val('url'), val('hash'), val('user'), val('pass'));
+  document.getElementById('new').onclick = () => client.create_session(1280, 720);
+  document.getElementById('quit').onclick = () => client.disconnect();
+</script>
