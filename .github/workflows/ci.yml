@@ -283,7 +283,8 @@ jobs:
         # 1.87, while the Fedora jobs use their distro's current toolchain.
         # Keep this platform check on stable instead of pinning it below the
         # versions Cargo resolves for the workspace.
-        uses: dtolnay/rust-toolchain@stable
+        # stable at 6bed0761d98439e5a578e2877258200ad565ba87
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
