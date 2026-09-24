@@ -1,0 +1,94 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* TermlandApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* TermlandApp.swift */; };
+		A10000000000000000000002 /* HostProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* HostProfile.swift */; };
+		A10000000000000000000003 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* KeychainStore.swift */; };
+		A10000000000000000000004 /* HomeModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* HomeModel.swift */; };
+		A10000000000000000000005 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* HomeView.swift */; };
+		A10000000000000000000006 /* TermlandCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* TermlandCore.swift */; };
+		A10000000000000000000007 /* TermlandCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* TermlandCore.xcframework */; };
+		A10000000000000000000008 /* TermlandCore.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* TermlandCore.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		A10000000000000000000009 /* TermlandTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* TermlandTests.swift */; };
+		A10000000000000000000010 /* TermlandCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* TermlandCore.xcframework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A30000000000000000000001 /* PBXContainerItemProxy */ = {isa = PBXContainerItemProxy; containerPortal = A40000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = Termland; };
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A60000000000000000000001 /* Embed Frameworks */ = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 10; files = (A10000000000000000000008 /* TermlandCore.xcframework in Embed Frameworks */, ); name = "Embed Frameworks"; runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		A20000000000000000000001 /* TermlandApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TermlandApp.swift; sourceTree = "<group>"; };
+		A20000000000000000000002 /* HostProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostProfile.swift; sourceTree = "<group>"; };
+		A20000000000000000000003 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		A20000000000000000000004 /* HomeModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeModel.swift; sourceTree = "<group>"; };
+		A20000000000000000000005 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		A20000000000000000000006 /* TermlandCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TermlandCore.swift; sourceTree = "<group>"; };
+		A20000000000000000000007 /* TermlandCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = build/TermlandCore.xcframework; sourceTree = "<group>"; };
+		A20000000000000000000008 /* Termland.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Termland.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A20000000000000000000009 /* TermlandTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TermlandTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000010 /* TermlandTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TermlandTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A20000000000000000000011 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A70000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000007 /* TermlandCore.xcframework in Frameworks */, ); runOnlyForDeploymentPostprocessing = 0; };
+		A70000000000000000000002 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000010 /* TermlandCore.xcframework in Frameworks */, ); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A80000000000000000000001 = {isa = PBXGroup; children = (A80000000000000000000002 /* Termland */, A80000000000000000000003 /* TermlandTests */, A20000000000000000000007 /* TermlandCore.xcframework */, A80000000000000000000004 /* Products */, ); sourceTree = "<group>"; };
+		A80000000000000000000002 /* Termland */ = {isa = PBXGroup; children = (A20000000000000000000001 /* TermlandApp.swift */, A20000000000000000000002 /* HostProfile.swift */, A20000000000000000000003 /* KeychainStore.swift */, A20000000000000000000004 /* HomeModel.swift */, A20000000000000000000005 /* HomeView.swift */, A80000000000000000000005 /* Generated */, A20000000000000000000011 /* Info.plist */, ); path = Termland; sourceTree = "<group>"; };
+		A80000000000000000000003 /* TermlandTests */ = {isa = PBXGroup; children = (A20000000000000000000009 /* TermlandTests.swift */, ); path = TermlandTests; sourceTree = "<group>"; };
+		A80000000000000000000004 /* Products */ = {isa = PBXGroup; children = (A20000000000000000000008 /* Termland.app */, A20000000000000000000010 /* TermlandTests.xctest */, ); name = Products; sourceTree = "<group>"; };
+		A80000000000000000000005 /* Generated */ = {isa = PBXGroup; children = (A20000000000000000000006 /* TermlandCore.swift */, ); path = Generated; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A50000000000000000000001 /* Termland */ = {isa = PBXNativeTarget; buildConfigurationList = A90000000000000000000001 /* Build configuration list for PBXNativeTarget "Termland" */; buildPhases = (AA0000000000000000000001 /* Build TermlandCore */, AB0000000000000000000001 /* Sources */, A70000000000000000000001 /* Frameworks */, A60000000000000000000001 /* Embed Frameworks */, ); buildRules = (); dependencies = (); name = Termland; productName = Termland; productReference = A20000000000000000000008 /* Termland.app */; productType = "com.apple.product-type.application"; };
+		A50000000000000000000002 /* TermlandTests */ = {isa = PBXNativeTarget; buildConfigurationList = A90000000000000000000002 /* Build configuration list for PBXNativeTarget "TermlandTests" */; buildPhases = (AB0000000000000000000002 /* Sources */, A70000000000000000000002 /* Frameworks */, ); buildRules = (); dependencies = (AC0000000000000000000001 /* PBXTargetDependency */, ); name = TermlandTests; productName = TermlandTests; productReference = A20000000000000000000010 /* TermlandTests.xctest */; productType = "com.apple.product-type.bundle.unit-test"; };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A40000000000000000000001 /* Project object */ = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = YES; LastSwiftUpdateCheck = 2700; LastUpgradeCheck = 2700; TargetAttributes = { A50000000000000000000001 = {CreatedOnToolsVersion = 27.0;}; A50000000000000000000002 = {CreatedOnToolsVersion = 27.0; TestTargetID = A50000000000000000000001;}; }; }; buildConfigurationList = A90000000000000000000003 /* Build configuration list for PBXProject "Termland" */; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base, ); mainGroup = A80000000000000000000001; productRefGroup = A80000000000000000000004 /* Products */; projectDirPath = ""; projectRoot = ""; targets = (A50000000000000000000001 /* Termland */, A50000000000000000000002 /* TermlandTests */, ); };
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		AA0000000000000000000001 /* Build TermlandCore */ = {isa = PBXShellScriptBuildPhase; buildActionMask = 2147483647; files = (); name = "Build TermlandCore"; runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/bash; shellScript = "\"${SRCROOT}/build-rust.sh\"\n"; };
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		AB0000000000000000000001 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001 /* TermlandApp.swift in Sources */, A10000000000000000000002 /* HostProfile.swift in Sources */, A10000000000000000000003 /* KeychainStore.swift in Sources */, A10000000000000000000004 /* HomeModel.swift in Sources */, A10000000000000000000005 /* HomeView.swift in Sources */, A10000000000000000000006 /* TermlandCore.swift in Sources */, ); runOnlyForDeploymentPostprocessing = 0; };
+		AB0000000000000000000002 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000009 /* TermlandTests.swift in Sources */, ); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		AC0000000000000000000001 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = A50000000000000000000001 /* Termland */; targetProxy = A30000000000000000000001 /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		AD0000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; SWIFT_VERSION = 5.0; }; name = Debug; };
+		AD0000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; SWIFT_VERSION = 5.0; }; name = Release; };
+		AD0000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = ""; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_TEAM = ""; ENABLE_TESTABILITY = YES; FRAMEWORK_SEARCH_PATHS = "$(SRCROOT)/build"; GENERATE_INFOPLIST_FILE = NO; HEADER_SEARCH_PATHS = "$(SRCROOT)/Termland/Generated"; INFOPLIST_FILE = Termland/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks"; MARKETING_VERSION = 0.7.0; PRODUCT_BUNDLE_IDENTIFIER = dev.termland.ios; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Termland/Generated"; SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Termland/Termland-Bridging-Header.h"; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		AD0000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = ""; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_TEAM = ""; FRAMEWORK_SEARCH_PATHS = "$(SRCROOT)/build"; GENERATE_INFOPLIST_FILE = NO; HEADER_SEARCH_PATHS = "$(SRCROOT)/Termland/Generated"; INFOPLIST_FILE = Termland/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks"; MARKETING_VERSION = 0.7.0; PRODUCT_BUNDLE_IDENTIFIER = dev.termland.ios; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Termland/Generated"; SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Termland/Termland-Bridging-Header.h"; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		AD0000000000000000000005 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; FRAMEWORK_SEARCH_PATHS = "$(SRCROOT)/build"; GENERATE_INFOPLIST_FILE = YES; HEADER_SEARCH_PATHS = "$(SRCROOT)/Termland/Generated"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = dev.termland.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Termland.app/Termland"; }; name = Debug; };
+		AD0000000000000000000006 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; FRAMEWORK_SEARCH_PATHS = "$(SRCROOT)/build"; GENERATE_INFOPLIST_FILE = YES; HEADER_SEARCH_PATHS = "$(SRCROOT)/Termland/Generated"; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = dev.termland.ios.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Termland.app/Termland"; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A90000000000000000000001 /* Build configuration list for PBXNativeTarget "Termland" */ = {isa = XCConfigurationList; buildConfigurations = (AD0000000000000000000003 /* Debug */, AD0000000000000000000004 /* Release */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A90000000000000000000002 /* Build configuration list for PBXNativeTarget "TermlandTests" */ = {isa = XCConfigurationList; buildConfigurations = (AD0000000000000000000005 /* Debug */, AD0000000000000000000006 /* Release */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A90000000000000000000003 /* Build configuration list for PBXProject "Termland" */ = {isa = XCConfigurationList; buildConfigurations = (AD0000000000000000000001 /* Debug */, AD0000000000000000000002 /* Release */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+	};
+	rootObject = A40000000000000000000001 /* Project object */;
+}
