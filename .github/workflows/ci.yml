@@ -171,6 +171,33 @@ jobs:
           rpmspec -P packaging/termland-server.spec > /dev/null
           rpmspec -P packaging/termland-client.spec > /dev/null
 
+      - name: Check the service unit word-splits its flag variables
+        # Regression guard for #31. Per systemd.service(5), "${VAR}" expands to
+        # exactly one argument (whitespace included) while "$VAR" splits at
+        # whitespace into zero or more. The multi-option TLS/auth settings the
+        # environment file documents therefore only work unbraced. Both forms
+        # are valid unit syntax, so systemd-analyze cannot catch this, and a
+        # container has no PID 1 systemd to actually run the unit against.
+        run: |
+          dnf install -y --setopt=install_weak_deps=False systemd
+          # verify resolves ExecStart= on disk and fails if the binary is
+          # absent, which it is in this container; stub it so the check covers
+          # the directives we actually care about here.
+          install -Dm755 /dev/null /usr/bin/termland-server
+          systemd-analyze verify packaging/termland-server.service
+          # -F throughout: as a regex, a leading "$" is an anchor to GNU grep
+          # and "{...}" an interval, so neither pattern matches literally.
+          for var in TERMLAND_TLS_FLAGS TERMLAND_AUTH_FLAGS; do
+            if grep -qF -- "\${$var}" packaging/termland-server.service; then
+              echo "ERROR: \${$var} is braced in ExecStart, so a multi-word value" >&2
+              echo "reaches termland-server as one argument and an empty value as an" >&2
+              echo "empty one. Both are rejected by the parser. Use \$$var." >&2
+              exit 1
+            fi
+            grep -qF -- "\$$var" packaging/termland-server.service || {
+              echo "ERROR: \$$var is no longer referenced in the unit." >&2; exit 1; }
+          done
+
   integration:
     name: Integration tests (real compositor)
     runs-on: ubuntu-latest

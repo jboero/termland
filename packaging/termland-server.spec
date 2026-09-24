@@ -207,7 +207,16 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
-* Fri Aug 14 2026 John Boero - 0.7.0-1
+* Thu Sep 24 2026 John Boero - 0.7.0-1
+- Fix the service passing multi-word TERMLAND_TLS_FLAGS/TERMLAND_AUTH_FLAGS as
+  a single argument, which made every documented non-default setting in
+  /etc/sysconfig/termland-server fail to start. systemd's "${VAR}" always
+  expands to exactly one argument and an empty value to one empty argument;
+  both are rejected by the argument parser. The unit now uses "$VAR", which
+  splits at whitespace and contributes nothing when empty, so explicit
+  --tls-cert/--tls-key paths and the documented "disable" settings both work.
+  TERMLAND_BIND/TERMLAND_PORT also gained Environment= defaults so a missing
+  or partially-commented environment file no longer yields an empty --bind.
 - Fix service sandboxing that blocked session startup and cert generation.
   ProtectHome=read-only covers /home, /root AND /run/user, all three of which
   the server must write. This was the single cause of three user reports:
