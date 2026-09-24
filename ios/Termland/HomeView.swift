@@ -93,7 +93,7 @@ private struct SessionListView: View {
         }
         .navigationTitle(profile.displayName)
         .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .primaryAction) {
                 Button { model.refreshSessions(for: profile) } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                 Button { editing = profile } label: { Label("Edit", systemImage: "slider.horizontal.3") }
             }
@@ -132,8 +132,8 @@ private struct ProfileEditor: View {
             Form {
                 Section("Server") {
                     TextField("Label", text: $profile.label)
-                    TextField("Host", text: $profile.host).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    TextField("Port", value: $profile.port, format: .number).keyboardType(.numberPad)
+                    hostField
+                    portField
                 }
                 Section("Connection") {
                     Toggle("Use TLS", isOn: $profile.useTLS)
@@ -146,7 +146,7 @@ private struct ProfileEditor: View {
                     }
                 }
                 Section("Credentials") {
-                    TextField("Username (optional)", text: $profile.username).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    usernameField
                     SecureField("Password", text: $password)
                     Text("The password is stored in this device’s Keychain, never in the profile file.")
                         .font(.footnote).foregroundStyle(.secondary)
@@ -164,5 +164,33 @@ private struct ProfileEditor: View {
                 }
             }
         }
+    }
+
+    private var hostField: some View {
+        #if os(iOS)
+        TextField("Host", text: $profile.host)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+        #else
+        TextField("Host", text: $profile.host)
+        #endif
+    }
+
+    private var portField: some View {
+        #if os(iOS)
+        TextField("Port", value: $profile.port, format: .number).keyboardType(.numberPad)
+        #else
+        TextField("Port", value: $profile.port, format: .number)
+        #endif
+    }
+
+    private var usernameField: some View {
+        #if os(iOS)
+        TextField("Username (optional)", text: $profile.username)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+        #else
+        TextField("Username (optional)", text: $profile.username)
+        #endif
     }
 }

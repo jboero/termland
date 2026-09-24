@@ -4,3 +4,10 @@
 /Termland/Generated/TermlandCore.swift
 /Termland/Generated/TermlandCoreFFI.h
 /Termland/Generated/TermlandCoreFFI.modulemap
+
+# Per-user Xcode state (window layout, breakpoints, scheme choices).
+xcuserdata/
+*.xcuserstate
+/Termland.xcodeproj/project.xcworkspace/
+# xcodebuild's plugin/spec cache, dropped in the cwd when TMPDIR is unset.
+/com.apple.DeveloperTools/

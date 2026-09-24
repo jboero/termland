@@ -1,11 +1,23 @@
 #!/usr/bin/env bash
-# Build Termland's UniFFI core for an iPhone/iPad and an Apple-Silicon
-# simulator, then make the dynamic XCFramework consumed by Termland.xcodeproj.
+# Build Termland's UniFFI core for an iPhone/iPad, an Apple-Silicon simulator,
+# and Apple-Silicon macOS, then make the dynamic XCFramework consumed by
+# Termland.xcodeproj.
 #
 # All output stays below ios/build/.  In particular this does not share the
 # workspace target/ directory: an iOS build must never invalidate a desktop
 # Rust build (or vice versa).
 set -euo pipefail
+
+# Xcode run-script phases do not source the user's shell profile, so a
+# rustup-managed toolchain in ~/.cargo/bin is not on PATH when building from
+# the Xcode GUI (it is from a terminal, which hides the problem).
+export PATH="${CARGO_HOME:-${HOME}/.cargo}/bin:${PATH}"
+for tool in rustup cargo; do
+  command -v "${tool}" >/dev/null || {
+    echo "error: ${tool} not found on PATH (${PATH}). Install Rust via rustup or set CARGO_HOME." >&2
+    exit 1
+  }
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_PACKAGE="termland-mobile-core"
@@ -20,10 +32,10 @@ case "${CONFIGURATION}" in
   *) PROFILE_DIR=debug ;;
 esac
 
-for target in aarch64-apple-ios aarch64-apple-ios-sim; do
+for target in aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin; do
   if ! rustup target list --installed | grep -qx "${target}"; then
     echo "Missing Rust target ${target}. Install it with:" >&2
-    echo "  rustup target add aarch64-apple-ios aarch64-apple-ios-sim" >&2
+    echo "  rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin" >&2
     exit 1
   fi
 done
@@ -31,7 +43,7 @@ done
 export CARGO_TARGET_DIR="${TARGET_DIR}"
 mkdir -p "${OUTPUT_DIR}" "${SWIFT_DIR}"
 
-for target in aarch64-apple-ios aarch64-apple-ios-sim; do
+for target in aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin; do
   if [[ "${CONFIGURATION}" == "Release" ]]; then
     cargo build --locked -p "${CORE_PACKAGE}" --target "${target}" --release
   else
@@ -41,7 +53,8 @@ done
 
 DEVICE_LIB="${TARGET_DIR}/aarch64-apple-ios/${PROFILE_DIR}/${LIB_NAME}"
 SIMULATOR_LIB="${TARGET_DIR}/aarch64-apple-ios-sim/${PROFILE_DIR}/${LIB_NAME}"
-for library in "${DEVICE_LIB}" "${SIMULATOR_LIB}"; do
+MACOS_LIB="${TARGET_DIR}/aarch64-apple-darwin/${PROFILE_DIR}/${LIB_NAME}"
+for library in "${DEVICE_LIB}" "${SIMULATOR_LIB}" "${MACOS_LIB}"; do
   test -f "${library}" || { echo "Expected library was not built: ${library}" >&2; exit 1; }
 done
 
@@ -57,12 +70,26 @@ make_framework() {
   local name="$1"
   local library="$2"
   local parent="$3"
+  local layout="${4:-shallow}"
   local framework="${parent}/${name}.framework"
+  # iOS frameworks are shallow (everything at the top level); macOS frameworks
+  # must be versioned, with top-level symlinks into Versions/Current, or Xcode
+  # rejects the embedded bundle.
+  local root="${framework}" resources="${framework}" install_name="@rpath/${name}.framework/${name}"
+  if [[ "${layout}" == "deep" ]]; then
+    root="${framework}/Versions/A"
+    resources="${root}/Resources"
+    install_name="@rpath/${name}.framework/Versions/A/${name}"
+  fi
   rm -rf "${framework}"
-  mkdir -p "${framework}/Headers" "${framework}/Modules"
-  cp "${library}" "${framework}/${name}"
-  cp "${SWIFT_DIR}/TermlandCoreFFI.h" "${framework}/Headers/TermlandCoreFFI.h"
-  cat > "${framework}/Modules/module.modulemap" <<EOF
+  mkdir -p "${root}/Headers" "${root}/Modules" "${resources}"
+  cp "${library}" "${root}/${name}"
+  # cargo records the absolute target/deps path as the install name; the app
+  # would then try to load the dylib from this build machine at launch
+  # instead of from the embedded framework.
+  install_name_tool -id "${install_name}" "${root}/${name}"
+  cp "${SWIFT_DIR}/TermlandCoreFFI.h" "${root}/Headers/TermlandCoreFFI.h"
+  cat > "${root}/Modules/module.modulemap" <<EOF
 // UniFFI's generated Swift source imports this module name. The binary stays
 // TermlandCore so the dynamically embedded framework has a stable product
 // name, while this module exposes its C ABI to the generated source.
@@ -72,7 +99,13 @@ framework module TermlandCoreFFI {
   link "${name}"
 }
 EOF
-  cat > "${framework}/Info.plist" <<EOF
+  # installd rejects an embedded iOS framework without MinimumOSVersion; it
+  # must match the app's IPHONEOS_DEPLOYMENT_TARGET.
+  local min_os=""
+  if [[ "${layout}" == "shallow" ]]; then
+    min_os="<key>MinimumOSVersion</key><string>17.0</string>"
+  fi
+  cat > "${resources}/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -84,18 +117,27 @@ EOF
   <key>CFBundlePackageType</key><string>FMWK</string>
   <key>CFBundleShortVersionString</key><string>0.7.0</string>
   <key>CFBundleVersion</key><string>1</string>
+  ${min_os}
 </dict></plist>
 EOF
+  if [[ "${layout}" == "deep" ]]; then
+    ln -s A "${framework}/Versions/Current"
+    for entry in "${name}" Headers Modules Resources; do
+      ln -s "Versions/Current/${entry}" "${framework}/${entry}"
+    done
+  fi
 }
 
 INPUT_DIR="${OUTPUT_DIR}/xcframework-input"
 rm -rf "${INPUT_DIR}"
 make_framework TermlandCore "${DEVICE_LIB}" "${INPUT_DIR}/ios"
 make_framework TermlandCore "${SIMULATOR_LIB}" "${INPUT_DIR}/simulator"
+make_framework TermlandCore "${MACOS_LIB}" "${INPUT_DIR}/macos" deep
 rm -rf "${OUTPUT_DIR}/TermlandCore.xcframework"
 xcodebuild -create-xcframework \
   -framework "${INPUT_DIR}/ios/TermlandCore.framework" \
   -framework "${INPUT_DIR}/simulator/TermlandCore.framework" \
+  -framework "${INPUT_DIR}/macos/TermlandCore.framework" \
   -output "${OUTPUT_DIR}/TermlandCore.xcframework"
 rm -rf "${INPUT_DIR}"
 
