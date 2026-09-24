@@ -64,9 +64,9 @@ final class HomeModel: ObservableObject {
         Task.detached {
             do {
                 let result = try client.listSessions(profile: coreProfile)
-                await MainActor.run { self.sessions = .loaded(result) }
+                await self.publish(.loaded(result), for: profile.id)
             } catch {
-                await MainActor.run { self.sessions = .failed(error.localizedDescription) }
+                await self.publish(.failed(TermlandErrorText.describe(error, profile: profile)), for: profile.id)
             }
         }
     }
@@ -79,11 +79,20 @@ final class HomeModel: ObservableObject {
             do {
                 try client.closeSession(profile: coreProfile, sessionId: session.sessionId)
                 let result = try client.listSessions(profile: coreProfile)
-                await MainActor.run { self.sessions = .loaded(result) }
+                await self.publish(.loaded(result), for: profile.id)
             } catch {
-                await MainActor.run { self.sessions = .failed(error.localizedDescription) }
+                await self.publish(.failed(TermlandErrorText.describe(error, profile: profile)), for: profile.id)
             }
         }
+    }
+
+    /// Requests are not cancelled when the selection changes, and a slow or
+    /// unreachable server can answer after a faster one. Drop results for a
+    /// profile that is no longer selected, or server A's sessions would be
+    /// shown (and closable) under server B.
+    private func publish(_ state: SessionsState, for profileID: UUID) {
+        guard selectedProfileID == profileID else { return }
+        sessions = state
     }
 
     private func persistProfiles() {

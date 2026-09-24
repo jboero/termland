@@ -4,8 +4,32 @@ struct HomeView: View {
     @ObservedObject var model: HomeModel
     @State private var editing: HostProfile?
     @State private var profileToDelete: HostProfile?
+    #if os(iOS)
+    @State private var launch: SessionLaunch?
+    #else
+    @Environment(\.openWindow) private var openWindow
+    #endif
 
     var body: some View {
+        content
+        #if os(iOS)
+            .fullScreenCover(item: $launch) { launch in
+                SessionContainer(home: model, launch: launch) { self.launch = nil }
+            }
+        #endif
+    }
+
+    /// iOS covers the screen with the session; macOS gives each session its
+    /// own window, so several can be open side by side.
+    private func open(_ launch: SessionLaunch) {
+        #if os(iOS)
+        self.launch = launch
+        #else
+        openWindow(value: launch)
+        #endif
+    }
+
+    private var content: some View {
         NavigationSplitView {
             List(selection: $model.selectedProfileID) {
                 ForEach(model.profiles) { profile in
@@ -26,7 +50,7 @@ struct HomeView: View {
             }
         } detail: {
             if let profile = model.selectedProfile {
-                SessionListView(model: model, profile: profile, editing: $editing, deleting: $profileToDelete)
+                SessionListView(model: model, profile: profile, editing: $editing, deleting: $profileToDelete, open: open)
             } else {
                 ContentUnavailableView("Add a server", systemImage: "desktopcomputer", description: Text("Save a Termland server profile to list its resumable sessions."))
             }
@@ -52,6 +76,7 @@ private struct SessionListView: View {
     let profile: HostProfile
     @Binding var editing: HostProfile?
     @Binding var deleting: HostProfile?
+    let open: (SessionLaunch) -> Void
     @State private var closeCandidate: SessionSummary?
 
     var body: some View {
@@ -61,6 +86,11 @@ private struct SessionListView: View {
                 if profile.useTLS && profile.acceptInvalidCertificates {
                     Label("Certificate verification is disabled for this profile.", systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
+                }
+                Button {
+                    open(SessionLaunch(profileID: profile.id, sessionID: nil))
+                } label: {
+                    Label("New Session", systemImage: "plus.rectangle.on.rectangle")
                 }
             }
             Section("Resumable sessions") {
@@ -74,20 +104,35 @@ private struct SessionListView: View {
                 case .loaded(let sessions):
                     if sessions.isEmpty { Text("No resumable sessions.").foregroundStyle(.secondary) }
                     ForEach(sessions, id: \.sessionId) { session in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(session.mode.capitalized)
-                            Text("\(session.width) × \(session.height) · \(ageText(session.ageSecs))\(session.attached ? " · attached" : "")")
-                                .font(.caption).foregroundStyle(.secondary)
-                            Text(session.sessionId).font(.caption2).foregroundStyle(.tertiary)
+                        Button {
+                            open(SessionLaunch(profileID: profile.id, sessionID: session.sessionId))
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(session.mode.capitalized)
+                                    Text("\(session.width) × \(session.height) · \(ageText(session.ageSecs))\(session.attached ? " · attached elsewhere" : "")")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                    Text(session.sessionId).font(.caption2).foregroundStyle(.tertiary)
+                                }
+                                Spacer()
+                                Image(systemName: "play.circle").foregroundStyle(.tint)
+                            }
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
+                        .help("Resume this session")
                         .swipeActions {
                             Button("Close", role: .destructive) { closeCandidate = session }
+                        }
+                        .contextMenu {
+                            Button("Resume") { open(SessionLaunch(profileID: profile.id, sessionID: session.sessionId)) }
+                            Button("Close Session", role: .destructive) { closeCandidate = session }
                         }
                     }
                 }
             }
             Section {
-                Text("Streaming and resume open in the next VideoToolbox milestone. This screen only manages persistent sessions.")
+                Text("Sessions are persistent: disconnecting detaches and leaves the remote desktop running. Close a session to end it.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
         }
