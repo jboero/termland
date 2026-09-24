@@ -237,7 +237,7 @@ not with cxx-qt.
 2. Control-plane messages (B) — small, unblocks the UI.
 3. Tray + manager (C) — build on the working attach/resume flow.
 
-## Mobile clients — Android SHIPPED (M1 + M2), iOS not started
+## Mobile clients — Android SHIPPED (M1 + M2), iOS M3a/M3b in progress
 
 Native touch clients for phones/tablets. Full design in
 [docs/mobile-clients.md](docs/mobile-clients.md); this section tracks what's
@@ -283,7 +283,8 @@ actually built.
   expects Ogg/WebM-Opus container CSD, but the stream is headerless raw Opus,
   so the mandatory 19-byte OpusHead (RFC 7845 §5.1) is synthesized by hand from
   the two fixed, never-negotiated stream parameters (48kHz stereo).
-  iOS (M3) has not been started.
+  iOS M3a/M3b now has the dynamic XCFramework build and SwiftUI control plane;
+  VideoToolbox streaming (M3c) has not been started.
 - Not runtime-verified: no device or emulator was available while building
   this. Everything above is confirmed at the build/compile/unit-test level
   (including two independent live QUIC handshake proofs — see below — and a

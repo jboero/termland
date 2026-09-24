@@ -573,6 +573,7 @@ fn spawn_client_for_profile(profile: &Profile, extra: &[String]) {
 /// Spawn `termland-client --manager` as a detached subprocess. Used by the
 /// tray's "Manage profiles…" menu item, which — unlike `tray::spawn_client`
 /// — must not append a server address.
+#[cfg(target_os = "linux")]
 pub fn spawn_manager_window() {
     let exe = std::env::current_exe().unwrap_or_else(|_| "termland-client".into());
     if let Err(e) = Command::new(exe).arg("--manager").spawn() {

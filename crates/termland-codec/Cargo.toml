@@ -10,7 +10,10 @@ termland-protocol = { path = "../termland-protocol" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-ffmpeg-next = { version = "8", default-features = false, features = ["codec", "format", "software-scaling"] }
+# v9 tracks FFmpeg 9 (Homebrew's current release on macOS). Keep the codec
+# layer on the matching binding generation so native clients do not rely on a
+# Linux-only system FFmpeg version.
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
 libc = "0.2"
 opus = { workspace = true }
 

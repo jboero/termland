@@ -1,6 +1,7 @@
 # Termland mobile clients (Android + iOS) — design
 
-Status: **M1 (core) + M2 (Android app) shipped.** iOS (M3) not started.
+Status: **M1 (core) + M2 (Android app) shipped.** iOS M3a/M3b's SwiftUI
+control plane is in progress; VideoToolbox streaming is M3c.
 This doc is kept as the design reference; see [ROADMAP.md](../ROADMAP.md)'s
 "Mobile clients" section for what's actually built and verified. Known
 deviations from the original plan below:
@@ -188,8 +189,10 @@ So the server grows a small "text injector" with two backends
   test harness on desktop.
 - **M2 — Android:** Compose UI, MediaCodec→Surface, touch + soft keyboard,
   session list/resume. MVP codecs: H.265/H.264 (+VP9 where present).
-- **M3 — iOS:** SwiftUI, VideoToolbox→Metal (AVSampleBufferDisplayLayer),
-  same feature set (HEVC/H.264).
+- **M3 — iOS:** M3a/M3b provides an XCFramework build, generated UniFFI Swift
+  bindings, profile/session control UI, and Keychain credentials. M3c adds
+  VideoToolbox→Metal (`AVSampleBufferDisplayLayer`) and streaming input, with
+  HEVC/H.264.
 - **M4 — parity+:** embedded `russh` subsystem transport; audio; trackpad mode;
   AV1 where HW-supported; QUIC.
 
