@@ -593,19 +593,7 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                     }
                     Some(Ok(Message::ClipboardData(cp))) => {
                         tracing::debug!("Clipboard received ({} bytes)", cp.data.len());
-                        use std::io::Write;
-                        if let Ok(mut child) = std::process::Command::new("wl-copy")
-                            .args(["--type", if cp.mime_type.is_empty() { "text/plain" } else { &cp.mime_type }])
-                            .stdin(std::process::Stdio::piped())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn()
-                        {
-                            if let Some(mut stdin) = child.stdin.take() {
-                                let _ = stdin.write_all(&cp.data);
-                            }
-                            let _ = child.wait();
-                        }
+                        write_local_clipboard(&cp.mime_type, &cp.data);
                     }
                     Some(Ok(Message::FileTransferData(payload))) => {
                         // Server sent us files copied on its (remote) clipboard -
@@ -763,6 +751,79 @@ fn decode_thread(
     tracing::info!("Decode thread exiting ({count} frames decoded)");
 }
 
+/// Read the local text clipboard. On Linux this is `wl-paste`; on macOS,
+/// `pbpaste`. Returns `None` if the helper is missing or the clipboard is empty.
+pub fn read_local_clipboard_text() -> Option<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("pbpaste");
+    #[cfg(not(target_os = "macos"))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("wl-paste");
+        c.arg("--no-newline");
+        c
+    };
+    let output = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if output.status.success() && !output.stdout.is_empty() {
+        Some(output.stdout)
+    } else {
+        None
+    }
+}
+
+/// Write bytes onto the local clipboard. Linux uses `wl-copy` (honours MIME).
+/// macOS `pbcopy` only accepts text; non-text payloads are skipped.
+fn write_local_clipboard(mime_type: &str, data: &[u8]) {
+    use std::io::Write;
+
+    let mime = if mime_type.is_empty() { "text/plain" } else { mime_type };
+
+    #[cfg(target_os = "macos")]
+    {
+        if !mime.starts_with("text/") {
+            tracing::debug!("skipping non-text clipboard write on macOS ({mime})");
+            return;
+        }
+        let mut child = match std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("pbcopy failed: {e}");
+                return;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(data);
+        }
+        let _ = child.wait();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut child = match std::process::Command::new("wl-copy")
+            .args(["--type", mime])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(data);
+        }
+        let _ = child.wait();
+    }
+}
+
 /// Check the local clipboard for a `text/uri-list` (files copied via a
 /// desktop file manager's "Copy" action) and, if present and within the size
 /// cap, send the files to the server as `ClientCommand::FileTransferSend`.
@@ -774,6 +835,15 @@ fn decode_thread(
 /// `read_files_from_uri_list`/`clipboard_watch_thread`) instead of split
 /// across crates.
 pub fn send_clipboard_file_transfer(tx: &mpsc::UnboundedSender<ClientCommand>) {
+    // File-manager uri-list paste is a Wayland clipboard convention.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = tx;
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
     let has_uri_list = std::process::Command::new("wl-paste")
         .arg("--list-types")
         .stdout(std::process::Stdio::piped())
@@ -834,6 +904,7 @@ pub fn send_clipboard_file_transfer(tx: &mpsc::UnboundedSender<ClientCommand>) {
         tracing::debug!("Clipboard file list changed ({} file(s)), sending to server", files.len());
         let _ = tx.send(ClientCommand::FileTransferSend(FileTransferPayload { files }));
     }
+    }
 }
 
 /// `$XDG_CACHE_HOME/termland/clipboard-files` (falling back to
@@ -849,6 +920,7 @@ pub fn send_clipboard_file_transfer(tx: &mpsc::UnboundedSender<ClientCommand>) {
 /// lookups - see `profile.rs`'s local `mod dirs` for the existing precedent
 /// (a ~10-line lookup doesn't justify the dependency); this mirrors that
 /// convention for `XDG_CACHE_HOME` instead of `XDG_CONFIG_HOME`.
+#[cfg(target_os = "linux")]
 fn client_clipboard_files_dir() -> std::path::PathBuf {
     let cache_dir = std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
@@ -865,6 +937,7 @@ fn client_clipboard_files_dir() -> std::path::PathBuf {
 /// `transport::transfer_subdir_name` (same reasoning: a fresh subdir per
 /// transfer avoids a later paste's filenames overwriting an earlier paste's
 /// files while the local clipboard might still reference the earlier ones).
+#[cfg(target_os = "linux")]
 fn transfer_subdir_name() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -872,10 +945,22 @@ fn transfer_subdir_name() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
+/// Reject an inbound file transfer where the native clipboard has no file URL
+/// publisher. Do this before writing the payload so a transfer is never
+/// reported as usable when the user cannot paste it.
+#[cfg(not(target_os = "linux"))]
+fn receive_file_transfer(payload: FileTransferPayload) {
+    tracing::warn!(
+        files = payload.files.len(),
+        "incoming file clipboard transfers are not yet supported on this platform"
+    );
+}
+
 /// Handle an inbound `Message::FileTransferData` from the server: write the
 /// files into a fresh subdirectory under `client_clipboard_files_dir()` and
 /// point the local clipboard at them via `wl-copy --type text/uri-list`, so a
-/// `Ctrl+V` in a local app pastes the real files the server sent.
+/// local file manager can paste them.
+#[cfg(target_os = "linux")]
 fn receive_file_transfer(payload: FileTransferPayload) {
     if payload.files.is_empty() {
         return;
@@ -922,30 +1007,34 @@ fn receive_file_transfer(payload: FileTransferPayload) {
         return;
     }
 
-    let uri_list = termland_protocol::build_uri_list(&written_paths);
-    use std::io::Write;
-    let mut child = match std::process::Command::new("wl-copy")
-        .args(["--type", "text/uri-list"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+    #[cfg(target_os = "linux")]
     {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("clipboard file transfer: wl-copy failed: {e}");
-            return;
+        let uri_list = termland_protocol::build_uri_list(&written_paths);
+        use std::io::Write;
+        let mut child = match std::process::Command::new("wl-copy")
+            .args(["--type", "text/uri-list"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("clipboard file transfer: wl-copy failed: {e}");
+                return;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(uri_list.as_bytes());
         }
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(uri_list.as_bytes());
+        let _ = child.wait();
     }
-    let _ = child.wait();
 
     tracing::info!(
-        "Clipboard file transfer: wrote {} file(s) to {} and set local clipboard",
+        "Clipboard file transfer: wrote {} file(s) to {}{}",
         written_paths.len(),
-        dir.display()
+        dir.display(),
+        if cfg!(target_os = "linux") { " and set local clipboard" } else { "" },
     );
 }
 

@@ -3,6 +3,7 @@ mod display;
 mod manager;
 mod overlay;
 mod profile;
+#[cfg(target_os = "linux")]
 mod tray;
 
 use anyhow::Result;
@@ -231,8 +232,17 @@ fn main() -> Result<()> {
         };
 
         if args.tray {
-            // Blocks until quit; runs its own refresh loop + runtime.
-            return tray::run(server, args.ssh, params);
+            #[cfg(target_os = "linux")]
+            {
+                // Blocks until quit; runs its own refresh loop + runtime.
+                return tray::run(server, args.ssh, params);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                anyhow::bail!(
+                    "--tray uses StatusNotifierItem and is Linux-only; use --manager instead"
+                );
+            }
         }
 
         let op = match args.close.clone() {

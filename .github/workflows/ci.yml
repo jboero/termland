@@ -276,7 +276,12 @@ jobs:
       - name: Install native build dependencies
         # ffmpeg-sys-next discovers libav* through pkg-config; the macOS
         # runner has Homebrew but not its multimedia development packages.
-        run: brew install ffmpeg opus pkgconf
+        run: |
+          brew install ffmpeg opus pkgconf
+          # Prefer Homebrew's pkgconf and its FFmpeg metadata. This avoids a
+          # separately installed pkg-config resolving a different prefix.
+          echo "$(brew --prefix pkgconf)/bin" >> "$GITHUB_PATH"
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg)/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Set up Rust
         # The lockfile's GUI/transitive dependencies currently require Rust

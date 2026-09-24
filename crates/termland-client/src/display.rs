@@ -7,8 +7,6 @@ use winit::event::{ElementState, MouseButton as WinitMouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-
 use crate::Args;
 use crate::connection::{ClientCommand, ConnectParams, ServerEvent, connect};
 use crate::overlay::{self, BarItem, BarLayout, MenuState, RemoteCursor, MENUBAR_HEIGHT};
@@ -18,7 +16,9 @@ use winit::window::Fullscreen;
 /// Inhibit compositor keyboard shortcuts on the given window so ALL keys
 /// (including Ctrl, Alt, Super, Alt-F4, etc.) are forwarded to us.
 /// Uses the zwp_keyboard_shortcuts_inhibit_manager_v1 Wayland protocol.
+#[cfg(target_os = "linux")]
 fn inhibit_shortcuts(window: &Window) -> Result<()> {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
     use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
     use wayland_client::protocol::{wl_registry, wl_seat, wl_surface};
     use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
@@ -661,7 +661,9 @@ impl ApplicationHandler for App {
                 let window = Arc::new(window);
                 window.set_cursor_visible(false);
 
-                // Inhibit compositor keyboard shortcuts so we get ALL keys
+                // Inhibit compositor keyboard shortcuts so we get ALL keys.
+                // Wayland-only; on macOS the window server still owns Cmd-Tab etc.
+                #[cfg(target_os = "linux")]
                 if let Err(e) = inhibit_shortcuts(&window) {
                     tracing::warn!("Could not inhibit keyboard shortcuts: {e}");
                     tracing::warn!("Modifier keys (Ctrl, Alt, Super) may be intercepted by your compositor");
@@ -689,18 +691,11 @@ impl ApplicationHandler for App {
                     if let Some(ref tx) = self.client_tx {
                         let tx = tx.clone();
                         std::thread::spawn(move || {
-                            if let Ok(output) = std::process::Command::new("wl-paste")
-                                .arg("--no-newline")
-                                .stdout(std::process::Stdio::piped())
-                                .stderr(std::process::Stdio::null())
-                                .output()
-                            {
-                                if output.status.success() && !output.stdout.is_empty() {
-                                    let _ = tx.send(ClientCommand::ClipboardSend {
-                                        mime_type: "text/plain".into(),
-                                        data: output.stdout,
-                                    });
-                                }
+                            if let Some(data) = crate::connection::read_local_clipboard_text() {
+                                let _ = tx.send(ClientCommand::ClipboardSend {
+                                    mime_type: "text/plain".into(),
+                                    data,
+                                });
                             }
                             crate::connection::send_clipboard_file_transfer(&tx);
                         });
