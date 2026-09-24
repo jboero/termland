@@ -30,15 +30,33 @@ Type=simple
 User=root
 Group=root
 
+# Defaults, so a missing or partially-commented environment file still yields a
+# complete command line. EnvironmentFile= is applied after these and overrides
+# them, so /etc/sysconfig/termland-server stays the place to configure this.
+# --bind mirrors the packaged default (0.0.0.0), not the binary's 127.0.0.1.
+Environment=TERMLAND_BIND=0.0.0.0
+Environment=TERMLAND_PORT=7867
+
 # Load configuration from environment file
 EnvironmentFile=-/etc/sysconfig/termland-server
 
-# Main command - flags are controlled via the environment file
+# Main command - flags are controlled via the environment file.
+#
+# The flag variables are expanded UNBRACED, and that is load-bearing. Per
+# systemd.service(5), "${VAR}" always produces exactly one argument including
+# any whitespace, whereas "$VAR" is split at whitespace into zero or more
+# arguments (honouring quotes, so a path containing spaces still survives).
+# Braced, TERMLAND_TLS_FLAGS="--tls --tls-cert c.pem --tls-key k.pem" reaches
+# the server as a single unparseable argument, and an empty value becomes an
+# empty argument the parser also rejects. Unbraced, both work.
+#
+# --bind/--port stay braced: each is one value that must remain one argument,
+# and the Environment= lines above guarantee they are never empty.
 ExecStart=/usr/bin/termland-server \
     --bind ${TERMLAND_BIND} \
     --port ${TERMLAND_PORT} \
-    ${TERMLAND_TLS_FLAGS} \
-    ${TERMLAND_AUTH_FLAGS}
+    $TERMLAND_TLS_FLAGS \
+    $TERMLAND_AUTH_FLAGS
 
 # Restart on crash, but not on clean exit (e.g. SIGTERM)
 Restart=on-failure
