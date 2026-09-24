@@ -134,50 +134,90 @@ private struct SessionScreen: View {
     #if os(iOS)
     /// Compact, collapsible bar: the keys a touch keyboard lacks, plus
     /// keyboard toggle and detach.
-    private var controlBar: some View {
-        HStack(spacing: 6) {
-            if controlsExpanded {
+    ///
+    /// One fixed-height row. Disconnect and collapse are pinned at the ends;
+    /// the keys between them sit in a compact capsule when they fit (iPad,
+    /// landscape) and scroll horizontally when they do not (iPhone portrait),
+    /// rather than being squeezed until the labels wrap.
+    @ViewBuilder private var controlBar: some View {
+        if controlsExpanded {
+            HStack(spacing: 0) {
                 barButton("chevron.left", "Disconnect") {
                     model.detach()
                     onClose()
                 }
                 if model.isLive {
-                    barButton(keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard", "Keyboard") {
-                        keyboardVisible.toggle()
+                    Divider().frame(height: 22).padding(.horizontal, 2)
+                    ViewThatFits(in: .horizontal) {
+                        keyRow
+                        ScrollView(.horizontal, showsIndicators: false) { keyRow }
                     }
-                    keyButton("Esc", KeyMap.keyEsc)
-                    keyButton("Tab", KeyMap.keyTab)
-                    StickyKeyButton(title: "Ctrl", scancode: KeyMap.keyLeftCtrl, router: model.router)
-                    StickyKeyButton(title: "Alt", scancode: KeyMap.keyLeftAlt, router: model.router)
-                    StickyKeyButton(title: "Super", scancode: KeyMap.keyLeftMeta, router: model.router)
-                    keyButton("←", KeyMap.keyLeft)
-                    keyButton("↑", KeyMap.keyUp)
-                    keyButton("↓", KeyMap.keyDown)
-                    keyButton("→", KeyMap.keyRight)
-                    Text(rateText).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Divider().frame(height: 22).padding(.horizontal, 2)
+                }
+                barButton("chevron.up", "Hide controls") {
+                    withAnimation(.snappy) { controlsExpanded = false }
                 }
             }
-            barButton(controlsExpanded ? "chevron.up" : "chevron.down", controlsExpanded ? "Hide controls" : "Show controls") {
-                withAnimation(.snappy) { controlsExpanded.toggle() }
+            .frame(height: 40)
+            .padding(.horizontal, 4)
+            .background(.ultraThinMaterial, in: Capsule())
+            .padding(.horizontal, 8)
+        } else {
+            barButton("chevron.down", "Show controls") {
+                withAnimation(.snappy) { controlsExpanded = true }
             }
+            .background(.ultraThinMaterial, in: Circle())
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(.horizontal, 12)
         }
-        .padding(6)
-        .background(.ultraThinMaterial, in: Capsule())
+    }
+
+    private var keyRow: some View {
+        HStack(spacing: 2) {
+            barButton(keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard", "Keyboard") {
+                keyboardVisible.toggle()
+            }
+            keyButton("Esc", KeyMap.keyEsc)
+            keyButton("Tab", KeyMap.keyTab)
+            StickyKeyButton(title: "Ctrl", scancode: KeyMap.keyLeftCtrl, router: model.router)
+            StickyKeyButton(title: "Alt", scancode: KeyMap.keyLeftAlt, router: model.router)
+            StickyKeyButton(title: "Super", scancode: KeyMap.keyLeftMeta, router: model.router)
+            keyButton("←", KeyMap.keyLeft)
+            keyButton("↑", KeyMap.keyUp)
+            keyButton("↓", KeyMap.keyDown)
+            keyButton("→", KeyMap.keyRight)
+            Text(rateText)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, 6)
+        }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private func barButton(_ systemImage: String, _ label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: systemImage).frame(width: 30, height: 30)
+            Image(systemName: systemImage)
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: 36, height: 36)
+                .contentShape(Rectangle())
         }
         .accessibilityLabel(label)
         .buttonStyle(.plain)
     }
 
     private func keyButton(_ title: String, _ scancode: UInt32) -> some View {
-        Button(title) { model.router.tap(scancode) }
-            .font(.callout.monospaced())
-            .frame(minWidth: 30, minHeight: 30)
-            .buttonStyle(.plain)
+        Button { model.router.tap(scancode) } label: {
+            Text(title)
+                .font(.footnote.monospaced().weight(.medium))
+                .lineLimit(1)
+                .fixedSize()
+                .frame(minWidth: 32, minHeight: 36)
+                .padding(.horizontal, 2)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
     #endif
 }
@@ -191,11 +231,19 @@ private struct StickyKeyButton: View {
 
     var body: some View {
         let latched = router.stickyModifiers & KeyMap.modifierBit(forScancode: scancode) != 0
-        Button(title) { router.setSticky(scancode, latched: !latched) }
-            .font(.callout.monospaced())
-            .frame(minWidth: 36, minHeight: 30)
-            .background(latched ? Color.accentColor.opacity(0.35) : .clear, in: RoundedRectangle(cornerRadius: 6))
-            .buttonStyle(.plain)
+        Button { router.setSticky(scancode, latched: !latched) } label: {
+            Text(title)
+                .font(.footnote.monospaced().weight(.medium))
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, 6)
+                .frame(minWidth: 36, minHeight: 28)
+                .background(latched ? Color.accentColor.opacity(0.45) : .clear, in: RoundedRectangle(cornerRadius: 7))
+                .frame(minHeight: 36)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(latched ? .isSelected : [])
     }
 }
 #endif

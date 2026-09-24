@@ -44,7 +44,6 @@ final class SessionModel: ObservableObject {
     /// `onDisconnected` from the loop we just detached) are ignored.
     private var generation = 0
     private var viewSize: CGSize = .zero
-    private var requestedSize: (width: Int, height: Int)?
     private var resizeTask: Task<Void, Never>?
 
     init(profile: HostProfile, password: String, sessionID: String?) {
@@ -96,7 +95,6 @@ final class SessionModel: ObservableObject {
         decoder.reset()
 
         let size = Self.remoteSize(for: viewSize)
-        requestedSize = size
         let params = profile.sessionParams(width: size.width, height: size.height)
         let coreProfile = profile.coreProfile(password: password)
         let observer = Observer(model: self, decoder: decoder, generation: generation)
@@ -189,8 +187,12 @@ final class SessionModel: ObservableObject {
             try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled, let self, self.isLive else { return }
             let size = Self.remoteSize(for: self.viewSize)
-            if let requested = self.requestedSize, requested == size { return }
-            self.requestedSize = size
+            // Compare against the session's actual size too, not just our last
+            // request: an attached session keeps whatever size its previous
+            // client gave it (a Mac window, say), so resuming it on a phone
+            // must resize even though the view itself never changed.
+            let remote = (width: Int(self.router.remoteSize.width), height: Int(self.router.remoteSize.height))
+            if remote == size { return }
             self.client.resize(width: UInt32(size.width), height: UInt32(size.height))
         }
     }
