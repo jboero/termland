@@ -261,3 +261,35 @@ jobs:
           left=$(ls /tmp/xdg/termland/sessions/*.session 2>/dev/null | wc -l)
           echo "sessions left behind: $left"
           test "$left" -eq 0
+
+  macos-client:
+    # The Linux jobs above build and exercise the compositor/server stack.
+    # This job is deliberately narrower: it keeps the native desktop client
+    # compiling against AppKit, CoreAudio, and the macOS FFmpeg packages
+    # without pretending that Linux-only compositor integration tests apply.
+    name: Build desktop client (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        # ffmpeg-sys-next discovers libav* through pkg-config; the macOS
+        # runner has Homebrew but not its multimedia development packages.
+        run: brew install ffmpeg opus pkgconf
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-client-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-client-
+
+      - name: Build desktop client
+        run: cargo build -p termland-client --locked
