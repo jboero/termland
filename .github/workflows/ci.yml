@@ -279,7 +279,11 @@ jobs:
         run: brew install ffmpeg opus pkgconf
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.85
+        # The lockfile's GUI/transitive dependencies currently require Rust
+        # 1.87, while the Fedora jobs use their distro's current toolchain.
+        # Keep this platform check on stable instead of pinning it below the
+        # versions Cargo resolves for the workspace.
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
