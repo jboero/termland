@@ -400,11 +400,25 @@ async fn quic_q2_video_stream_carries_real_frames() {
     let mut noise_guard = None;
     if sink_ready {
         eprintln!("[test] found session's PulseAudio null sink '{sink_name}', feeding it real (non-silent) noise via pacat");
-        match Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "head -c 4000000 /dev/urandom | pacat --playback --device={sink_name} --format=s16le --rate=48000 --channels=2"
-            ))
+        // pacat is the direct child, reading /dev/urandom as its stdin, so
+        // ChildGuard kills pacat itself. This used to be `sh -c "head ... |
+        // pacat ..."`, where the guard only killed `sh`: pacat outlived the
+        // test, the session's null sink was unloaded under it at teardown,
+        // and WirePlumber moved the orphaned stream to the default sink —
+        // up to 20s of full-scale noise on a developer's speakers.
+        // node.dont-reconnect is the second line of defence: if this stream
+        // ever loses its sink it is left unrouted rather than moved.
+        let urandom = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
+        match Command::new("pacat")
+            .args([
+                "--playback",
+                &format!("--device={sink_name}"),
+                "--property=node.dont-reconnect=true",
+                "--format=s16le",
+                "--rate=48000",
+                "--channels=2",
+            ])
+            .stdin(urandom)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

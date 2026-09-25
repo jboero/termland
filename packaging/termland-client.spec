@@ -60,6 +60,8 @@ BuildRequires:  libX11-devel
 BuildRequires:  libXcursor-devel
 BuildRequires:  libXrandr-devel
 BuildRequires:  libXi-devel
+# Installs and validates the launcher entry for the --manager window.
+BuildRequires:  desktop-file-utils
 
 # ─── Runtime dependencies ────────────────────────────────────────────────────
 # FFmpeg runtime (AV1 decoder backends)
@@ -76,6 +78,8 @@ Requires:       openssh-clients
 # Wayland / X11 display
 Requires:       libwayland-client
 Requires:       libxkbcommon
+# Owns /usr/share/icons/hicolor, where the app icon is installed.
+Requires:       hicolor-icon-theme
 
 %description
 Termland client connects to a Termland remote desktop server and displays
@@ -124,15 +128,28 @@ cargo build --release --offline --bin termland-client
 # Binary
 install -Dm755 target/release/termland-client %{buildroot}%{_bindir}/termland-client
 
+# Launcher entry + icon. The icon is the project logo itself, so there is one
+# copy of the artwork; its basename must match the desktop entry's Icon= and
+# the app_id the client gives its windows (crates/termland-client/src/desktop.rs).
+desktop-file-install --dir=%{buildroot}%{_datadir}/applications \
+    packaging/io.github.jboero.termland.desktop
+install -Dm644 docs/logo.svg \
+    %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.github.jboero.termland.svg
+
 # Shell completions
 install -Dm644 termland-client.bash %{buildroot}%{_datadir}/bash-completion/completions/termland-client
 install -Dm644 _termland-client     %{buildroot}%{_datadir}/zsh/site-functions/_termland-client
 install -Dm644 termland-client.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/termland-client.fish
 
+%check
+desktop-file-validate %{buildroot}%{_datadir}/applications/io.github.jboero.termland.desktop
+
 %files
 %license LICENSE
 %doc README.md
 %{_bindir}/termland-client
+%{_datadir}/applications/io.github.jboero.termland.desktop
+%{_datadir}/icons/hicolor/scalable/apps/io.github.jboero.termland.svg
 %{_datadir}/bash-completion/completions/termland-client
 %{_datadir}/zsh/site-functions/_termland-client
 %{_datadir}/fish/vendor_completions.d/termland-client.fish

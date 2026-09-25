@@ -655,6 +655,15 @@ impl ApplicationHandler for App {
         let attrs = Window::default_attributes()
             .with_title("Termland")
             .with_inner_size(LogicalSize::new(self.args.width, self.args.height));
+        // Same app_id / WM_CLASS as the manager, so the compositor gives
+        // session windows the Termland icon and groups them with it.
+        #[cfg(target_os = "linux")]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            let attrs = WindowAttributesExtWayland::with_name(attrs, crate::desktop::APP_ID, "termland");
+            WindowAttributesExtX11::with_name(attrs, crate::desktop::APP_ID, "termland")
+        };
 
         match event_loop.create_window(attrs) {
             Ok(window) => {

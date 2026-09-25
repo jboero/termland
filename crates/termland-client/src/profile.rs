@@ -132,7 +132,7 @@ pub fn save(profiles: &[Profile]) -> anyhow::Result<()> {
 
 /// Same tiny XDG helper as `termland-server/src/tls.rs`'s local `dirs` module
 /// — duplicated rather than pulling in the `dirs` crate for a ~10-line lookup.
-mod dirs {
+pub(crate) mod dirs {
     use std::path::PathBuf;
     pub fn config_dir() -> Option<PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME")

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Termland
+GenericName=Remote Desktop
+Comment=Connect to remote Wayland desktops and resume sessions
+Exec=termland-client --manager
+Icon=io.github.jboero.termland
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;wayland;session;rdp;vnc;
+StartupNotify=true
+StartupWMClass=io.github.jboero.termland
+SingleMainWindow=true

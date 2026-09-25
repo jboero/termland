@@ -42,10 +42,13 @@ happen before the project is suitable for outside use.
 - ✅ Bidirectional clipboard sync, real cursor-shape sync, session
   observability CLI (`--list-sessions`/`--close-session`)
 - ✅ Desktop session manager (`--manager`, egui): saved multi-host profiles,
-  live per-host session list, resume/new/close
+  live per-host session list, resume/new/close; single instance living in
+  the system tray, with an app-menu entry, icon and optional autostart
 - ✅ Embedded SSH (`russh`) and QUIC (Q1 + Q2: split video/audio planes)
   transports, on both the desktop server and the Android core
-- ✅ Native Android client (M1 core + M2 app) — see "Mobile clients" below
+- ✅ Native Android client (M1 core + M2 app) and iOS/iPadOS/macOS SwiftUI
+  client (M3) — see "Mobile clients" below
+- ✅ Desktop client (`termland-client`) builds and runs on macOS
 - ✅ Session isolation (setuid into the PAM-authenticated user), clipboard
   file transfer, seamless reconnect, Android audio playback
 
@@ -170,7 +173,8 @@ the server process (compositor survives via `setsid`) → fresh server process �
 attach resumes and decodes. Tray registers and lists live sessions.
 
 Deferred to a later pass: session-sink audio continuity across detach/attach;
-a `.desktop`/autostart entry for the tray; per-session idle-timeout policy.
+per-session idle-timeout policy. (The `.desktop`/autostart entry shipped in
+v0.8.0 — see section C.)
 
 The "richer UI" this note said might never be needed turned out to be
 needed: `--tray` requires a server address on the CLI every launch, with no
@@ -224,6 +228,17 @@ not with cxx-qt.
   to it (`std::env::current_exe()` + `Command`, same pattern the tray already
   used), never runs it in-process, since winit's event loop and egui's can't
   share a process.
+- ✅ **Single instance in the tray** (v0.8.0). `--manager` takes an `flock`
+  in `$XDG_RUNTIME_DIR/termland` and listens on a Unix socket beside it; a
+  second launch asks the running one to show its window and exits, instead
+  of opening a second window with a second tray icon. It registers its own
+  tray icon (click to open; per-profile "New session"; Quit), and closing the
+  window leaves it there. eframe keeps its winit event loop in a
+  thread-local so a window can be closed and reopened in one process —
+  necessary, because winit can't hide a window on Wayland. Without a tray
+  host, closing the window quits as before. Packaged with a launcher entry
+  and icon (`io.github.jboero.termland`, also the windows' Wayland `app_id`)
+  and an opt-in per-user autostart entry (`--manager --minimized`).
 - Supersedes the deferred v0.2 "Qt6 GUI client rewrite" item, and closes the
   "foreground session observability" desktop-client half of that stretch-list
   item (the server-side half — `--list-sessions`/`--close-session` on
@@ -237,7 +252,7 @@ not with cxx-qt.
 2. Control-plane messages (B) — small, unblocks the UI.
 3. Tray + manager (C) — build on the working attach/resume flow.
 
-## Mobile clients — Android SHIPPED (M1 + M2), iOS M3a/M3b in progress
+## Mobile clients — Android SHIPPED (M1 + M2), iOS/macOS SHIPPED (M3)
 
 Native touch clients for phones/tablets. Full design in
 [docs/mobile-clients.md](docs/mobile-clients.md); this section tracks what's
@@ -283,8 +298,11 @@ actually built.
   expects Ogg/WebM-Opus container CSD, but the stream is headerless raw Opus,
   so the mandatory 19-byte OpusHead (RFC 7845 §5.1) is synthesized by hand from
   the two fixed, never-negotiated stream parameters (48kHz stereo).
-  iOS M3a/M3b now has the dynamic XCFramework build and SwiftUI control plane;
-  VideoToolbox streaming (M3c) has not been started.
+- ✅ **M3 — iOS/iPadOS/macOS** (SwiftUI over the same UniFFI core, no Rust
+  changes): M3a/M3b dynamic XCFramework build, profile/session control plane
+  and Keychain credentials; M3c New Session / resume with VideoToolbox decode
+  (HEVC when hardware-supported, H.264 always) and input. Audio, QUIC and AV1
+  on Apple platforms are M4.
 - Not runtime-verified: no device or emulator was available while building
   this. Everything above is confirmed at the build/compile/unit-test level
   (including two independent live QUIC handshake proofs — see below — and a
@@ -367,8 +385,9 @@ and the mobile core (`Transport::Quic`).
   (workaround), or patch labwc (upstream work).
 - SDDM / greetd integration — proper login screen + session selection
   for multi-user deployments
-- Native Windows / macOS clients — currently Linux only; the server
-  is Wayland-specific by design but the client can be cross-platform
+- Native Windows client — the desktop client builds on Linux and macOS
+  (macOS has no tray; `--manager` is a plain window there). The server is
+  Wayland-specific by design.
 
 ## Architecture notes
 

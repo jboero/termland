@@ -1,8 +1,11 @@
 mod connection;
 mod display;
+mod desktop;
 mod manager;
 mod overlay;
 mod profile;
+#[cfg(unix)]
+mod single_instance;
 #[cfg(target_os = "linux")]
 mod tray;
 
@@ -110,8 +113,15 @@ pub struct Args {
     /// Open the desktop session manager window: saved multi-host connection
     /// profiles plus each host's resumable-session list. Manages its own
     /// profiles, so unlike --tray it takes no server address up front.
+    /// Runs as a single instance that stays in the system tray when its
+    /// window is closed; running it again shows the existing window.
     #[arg(long)]
     pub manager: bool,
+
+    /// With --manager: start in the system tray without opening the window
+    /// (what the "start at login" autostart entry runs).
+    #[arg(long, requires = "manager")]
+    pub minimized: bool,
 
     /// For --mode desktop: startup command to run inside labwc.
     /// Examples: "konsole", "startplasma-wayland", "dbus-run-session sway".
@@ -200,7 +210,7 @@ fn main() -> Result<()> {
     // argument up front, so it has to branch before the other one-shot modes
     // below unconditionally require one.
     if args.manager {
-        return manager::run();
+        return manager::run(args.minimized);
     }
 
     // One-shot session-management ops (and the tray) run without a session
