@@ -115,7 +115,7 @@ EOF
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>${name}</string>
   <key>CFBundlePackageType</key><string>FMWK</string>
-  <key>CFBundleShortVersionString</key><string>0.8.0</string>
+  <key>CFBundleShortVersionString</key><string>0.8.1</string>
   <key>CFBundleVersion</key><string>1</string>
   ${min_os}
 </dict></plist>
