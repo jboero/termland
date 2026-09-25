@@ -20,7 +20,7 @@
 
 Name:           termland-server
 Version:        %{version}
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Termland remote desktop server — stream Wayland sessions via AV1/VP9/HEVC/H.264/Opus
 
 License:        LGPL-3.0-or-later
@@ -123,6 +123,14 @@ directory = "vendor"
 CARGOEOF
 
 %build
+%ifarch %{ix86}
+# ffmpeg-sys-next 9.0.0 generates its bindings against its own stub vulkan.h,
+# which asserts sizeof(VkPhysicalDeviceFeatures2) == 240. That is the 64-bit
+# size; on i386 the struct is 228 bytes, as in the real Vulkan headers, so the
+# assertion fails and bindgen aborts. It only checks the stub, never changes a
+# layout, so compile it out for bindgen's parse. Drop once the crate is fixed.
+export BINDGEN_EXTRA_CLANG_ARGS='-D_Static_assert(a,b)='
+%endif
 cargo build --release --offline --bin termland-server
 
 # Generate shell completions
@@ -207,6 +215,11 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Fri Sep 25 2026 John Boero - 0.8.0-2
+- Fix the i386 build: work around ffmpeg-sys-next 9.0.0's Vulkan stub
+  header asserting a 64-bit struct size, which aborted binding generation on
+  32-bit x86. No change on other architectures.
+
 * Fri Sep 25 2026 John Boero - 0.8.0-1
 - First packaged release since 0.6.1: 0.7.0 was tagged but never built, so
   the 0.7.0 changes below - including its UPGRADE NOTE about the runtime
