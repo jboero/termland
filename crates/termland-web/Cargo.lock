@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "termland-protocol"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "ciborium",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "termland-web"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "ciborium",
