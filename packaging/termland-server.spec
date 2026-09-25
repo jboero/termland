@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.7.0
+%global version 0.8.0
 # find-debuginfo can produce an empty debugsourcefiles.list for a Rust
 # binary (unlike typical C sources), which newer Fedora's rpmbuild tolerates
 # but EL8's treats as a hard error ("Empty %%files file ... debugsourcefiles
@@ -207,7 +207,10 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
-* Thu Sep 24 2026 John Boero - 0.7.0-1
+* Fri Sep 25 2026 John Boero - 0.8.0-1
+- First packaged release since 0.6.1: 0.7.0 was tagged but never built, so
+  the 0.7.0 changes below - including its UPGRADE NOTE about the runtime
+  directory move - reach RPM users with this release.
 - Fix the service passing multi-word TERMLAND_TLS_FLAGS/TERMLAND_AUTH_FLAGS as
   a single argument, which made every documented non-default setting in
   /etc/sysconfig/termland-server fail to start. systemd's "${VAR}" always
@@ -217,6 +220,21 @@ echo ""
   --tls-cert/--tls-key paths and the documented "disable" settings both work.
   TERMLAND_BIND/TERMLAND_PORT also gained Environment= defaults so a missing
   or partially-commented environment file no longer yields an empty --bind.
+- Session teardown now confirms the session's process group is actually gone
+  (SIGTERM the leader, then the group, then SIGKILL, checking in between)
+  instead of assuming SIGTERM worked and deleting the record. Stranded
+  plasmashell stacks left behind this way were colliding with the host
+  desktop's global shortcuts and taking kded6/plasmashell down with them.
+- Find terminals and desktop shells by searching PATH directly instead of
+  running which(1). Without which(1) installed - the default on minimal and
+  container installs - every lookup failed and sessions died with
+  "exec: xterm: not found".
+- Experimental WebTransport listener (--webtransport) for the browser clients
+  in web/. Off by default, and refuses every browser origin unless allowed
+  with --webtransport-origin. The browser client page is not packaged yet;
+  see docs/webtransport.md.
+
+* Fri Aug 14 2026 John Boero - 0.7.0-1
 - Fix service sandboxing that blocked session startup and cert generation.
   ProtectHome=read-only covers /home, /root AND /run/user, all three of which
   the server must write. This was the single cause of three user reports:

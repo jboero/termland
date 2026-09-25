@@ -17,18 +17,20 @@ Attribution lives in the git history, per commit, using the standard
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 ```
 
-At the time of writing, 49 of the 64 commits on `main` carry such a trailer,
-naming the specific model that assisted:
+As of the v0.8.0 release, 91 of the 119 non-merge commits on `main` carry
+such a trailer, naming the specific model that assisted:
 
 | Model | Commits |
 |---|---|
-| Claude Opus 5 | 25 |
+| Claude Opus 5.5 | 4 |
+| Claude Opus 5 | 63 |
 | Claude Opus 4.8 | 16 |
 | Claude Opus 4.6 | 8 |
 
-The commits without a trailer are the earliest ones, plus a few small manual
-changes (release packaging, the licence commit, README and demo-video edits).
-They are not hidden authorship — they predate the convention.
+The commits without a trailer are the earliest ones, a few small manual
+changes (release packaging, the licence commit, README and demo-video edits),
+and contributions from other people, which carry whatever attribution their
+authors gave them. They are not hidden authorship.
 
 `git log --format='%h %an %(trailers:key=Co-Authored-By,valueonly)'` gives the
 full picture at any time, and is authoritative. This file is a summary and can

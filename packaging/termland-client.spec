@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.7.0
+%global version 0.8.0
 # See termland-server.spec's comment: EL8's rpmbuild fails hard on the empty
 # debugsourcefiles.list find-debuginfo can produce for a Rust binary.
 %global debug_package %{nil}
@@ -155,6 +155,23 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/io.github.jboero.term
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Fri Sep 25 2026 John Boero - 0.8.0-1
+- First packaged release since 0.6.1: 0.7.0 was tagged but never built, so
+  the 0.7.0 changes below reach RPM users with this release.
+- "Termland" in the application menu, with an icon. It opens the session
+  manager (termland-client --manager), which was already installed but only
+  reachable by typing the flag.
+- The session manager runs as a single instance and stays in the system tray:
+  launching it again shows the existing window, closing the window keeps it
+  in the tray (click to reopen; its menu starts a session from any saved
+  profile), and an opt-in "Start in the system tray at login" adds a per-user
+  autostart entry running --manager --minimized. On a desktop without a tray,
+  closing the window quits, as before.
+- Session windows use the same app id (io.github.jboero.termland), so the
+  desktop shows them with the Termland icon.
+- The desktop client also builds on macOS (FFmpeg bindings updated to
+  ffmpeg-next 9, which still supports older FFmpeg releases).
+
 * Fri Aug 14 2026 John Boero - 0.7.0-1
 - Negotiate the audio codec with the server instead of assuming Opus.
   Wire-compatible in both directions; Opus remains the only codec.
