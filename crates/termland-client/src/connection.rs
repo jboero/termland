@@ -45,6 +45,12 @@ pub enum ServerEvent {
     /// display layer should show a "Reconnecting..." status and keep
     /// showing the last frame rather than exiting.
     Reconnecting { attempt: u32 },
+    /// The session never started: the first connection failed before the
+    /// server sent `SessionReady` (unreachable host, ssh refusing the host
+    /// key, failed authentication...). Nothing is running to reattach to and
+    /// retrying would fail the same way, so this is final; the display layer
+    /// should show `reason` until the user closes the window.
+    ConnectFailed { reason: String },
 }
 
 /// Opus packet for the audio playback thread.
@@ -114,18 +120,111 @@ pub struct ConnectParams {
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
+/// How an `ssh` child ended: `None` while it runs, then `Ok` for a clean
+/// exit or `Err` with what ssh said about why it failed.
+type SshExit = Option<std::result::Result<(), String>>;
+
+/// ssh's stdout, which is the protocol stream from the server. When ssh
+/// fails - host key mismatch, authentication, name resolution - all the
+/// protocol side sees is the pipe closing, and the reason is only on ssh's
+/// stderr. This turns that EOF into an error carrying ssh's last line of
+/// stderr, so it reaches the log, the session window and the manager instead
+/// of an unexplained "closed".
+struct SshStdout {
+    stdout: tokio::process::ChildStdout,
+    exit: tokio::sync::watch::Receiver<SshExit>,
+    /// Set at EOF: resolves to ssh's failure, if it failed.
+    at_eof: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>>,
+}
+
+impl AsyncRead for SshStdout {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::{ready, Poll};
+        let this = self.get_mut();
+        if this.at_eof.is_none() {
+            let before = buf.filled().len();
+            ready!(std::pin::Pin::new(&mut this.stdout).poll_read(cx, buf))?;
+            if buf.filled().len() > before {
+                return Poll::Ready(Ok(()));
+            }
+            // EOF. ssh exits right after closing the pipe; give it a moment
+            // to be reaped, then report it if it failed. A clean exit (the
+            // session ending normally) stays a plain EOF, with no delay.
+            let mut exit = this.exit.clone();
+            this.at_eof = Some(Box::pin(async move {
+                let exited = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    exit.wait_for(|e| e.is_some()),
+                )
+                .await;
+                match exited {
+                    Ok(Ok(e)) => e.clone().and_then(|r| r.err()),
+                    _ => None,
+                }
+            }));
+        }
+        match ready!(this.at_eof.as_mut().unwrap().as_mut().poll(cx)) {
+            Some(why) => Poll::Ready(Err(std::io::Error::other(why))),
+            None => Poll::Ready(Ok(())),
+        }
+    }
+}
+
+/// Spawn `ssh -s <server> termland`. ssh's stderr is still passed through to
+/// ours, as before; a background task also keeps its last line and reaps the
+/// process, which is what `SshStdout` reports if ssh fails.
+fn open_ssh(server: &str, params: &ConnectParams) -> Result<Box<dyn Io>> {
+    let mut ssh_args: Vec<String> = params.ssh_opts.clone();
+    ssh_args.extend(["-s".into(), server.to_string(), "termland".into()]);
+    spawn_ssh_transport("ssh", &ssh_args)
+}
+
+/// `open_ssh` with the program as a parameter, so tests can stand in a
+/// script that behaves like a failing or succeeding ssh.
+fn spawn_ssh_transport(program: &str, args: &[String]) -> Result<Box<dyn Io>> {
+    use tokio::io::AsyncBufReadExt;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn ssh")?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stderr = child.stderr.take().expect("piped stderr");
+
+    let (exit_tx, exit) = tokio::sync::watch::channel::<SshExit>(None);
+    tokio::spawn(async move {
+        let mut last = String::new();
+        let mut lines = tokio::io::BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("{line}");
+            if !line.trim().is_empty() {
+                last = line.trim().to_string();
+            }
+        }
+        let result = match child.wait().await {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) if last.is_empty() => Err(format!("ssh failed ({status})")),
+            Ok(_) => Err(format!("ssh: {last}")),
+            Err(e) => Err(format!("ssh: {e}")),
+        };
+        let _ = exit_tx.send(Some(result));
+    });
+
+    let stdout = SshStdout { stdout, exit, at_eof: None };
+    Ok(Box::new(tokio::io::join(stdout, stdin)))
+}
+
 /// Open the transport to the server: SSH subsystem, plain TCP, or TLS.
 async fn open_io(server: &str, ssh: bool, params: &ConnectParams) -> Result<Box<dyn Io>> {
     if ssh {
-        let mut ssh_args: Vec<String> = params.ssh_opts.clone();
-        ssh_args.extend(["-s".into(), server.to_string(), "termland".into()]);
-        let child = Command::new("ssh")
-            .args(&ssh_args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn().context("failed to spawn ssh")?;
-        Ok(Box::new(tokio::io::join(child.stdout.unwrap(), child.stdin.unwrap())))
+        open_ssh(server, params)
     } else if params.tls {
         let stream = TcpStream::connect(server).await
             .context(format!("failed to connect to {server}"))?;
@@ -177,7 +276,7 @@ pub async fn fetch_sessions(
     let mut framed = Framed::new(io, TermlandCodec);
     handshake(&mut framed, params).await?;
     framed.send(Message::SessionList(SessionList {})).await.context("send SessionList")?;
-    let resp = framed.next().await.context("closed")?.context("decode")?;
+    let resp = framed.next().await.context("closed")?.context("reading from the server")?;
     match resp {
         Message::SessionListResult(r) => Ok(r.sessions),
         other => anyhow::bail!("expected SessionListResult, got {:?}", other.message_id()),
@@ -193,7 +292,7 @@ pub async fn run_control(server: &str, ssh: bool, params: ConnectParams, op: Con
     match op {
         ControlOp::List => {
             framed.send(Message::SessionList(SessionList {})).await.context("send SessionList")?;
-            let resp = framed.next().await.context("closed")?.context("decode")?;
+            let resp = framed.next().await.context("closed")?.context("reading from the server")?;
             match resp {
                 Message::SessionListResult(r) => {
                     if r.sessions.is_empty() {
@@ -238,9 +337,20 @@ pub async fn connect(
     let (server_tx, server_rx) = mpsc::unbounded_channel();
     let (client_tx, client_rx) = mpsc::unbounded_channel();
 
-    let io = open_io(server, ssh, &params).await?;
+    // Everything, the first connection included, happens in the background:
+    // the caller is the window's event loop, and a TCP connect to an
+    // unreachable host can take minutes to fail. A failure arrives as
+    // ServerEvent::ConnectFailed.
     let server = server.to_string();
     tokio::spawn(async move {
+        let io = match open_io(&server, ssh, &params).await {
+            Ok(io) => io,
+            Err(e) => {
+                tracing::error!("Connect failed: {e:#}");
+                let _ = server_tx.send(ServerEvent::ConnectFailed { reason: format!("{e:#}") });
+                return;
+            }
+        };
         run_with_reconnect(server, ssh, params, io, server_tx, client_rx).await;
     });
     Ok((server_rx, client_tx))
@@ -279,11 +389,22 @@ async fn run_with_reconnect(
     // Session id from the last SessionReady we saw, so a reconnect resumes
     // THIS session instead of accidentally creating a new one.
     let mut session_id: Option<String> = None;
+    // Reconnect attempts since a connection last got as far as SessionReady.
+    // Only that resets it: an ssh transport "connects" as soon as ssh is
+    // spawned, so counting a spawned transport as success restarted the
+    // backoff at 1s on every failure and retried at 1 Hz forever.
+    let mut attempt: u32 = 0;
+    let mut ever_ready = false;
 
     loop {
-        let outcome = session_loop(io, params.clone(), server_tx.clone(), &mut client_rx, &mut session_id).await;
+        let mut ready = false;
+        let outcome = session_loop(io, params.clone(), server_tx.clone(), &mut client_rx, &mut session_id, &mut ready).await;
+        ever_ready |= ready;
+        if ready {
+            attempt = 0;
+        }
 
-        match outcome {
+        let failure = match outcome {
             Ok(LoopExit::ClientQuit) => return,
             Ok(LoopExit::SessionEnded { reason }) => {
                 tracing::info!("Session ended by server: {reason}");
@@ -292,10 +413,21 @@ async fn run_with_reconnect(
             }
             Ok(LoopExit::ConnectionLost) => {
                 tracing::warn!("Connection lost unexpectedly");
+                "the connection closed before the session started".to_string()
             }
             Err(e) => {
                 tracing::warn!("Connection error: {e:#}");
+                format!("{e:#}")
             }
+        };
+
+        // Reconnecting is for resuming a session that was running. If none
+        // ever started, there is nothing to resume, and whatever stopped it -
+        // a host key, a password, a wrong address - will stop the next try
+        // the same way. Say why instead of retrying.
+        if !ever_ready {
+            let _ = server_tx.send(ServerEvent::ConnectFailed { reason: failure });
+            return;
         }
 
         if !params.reconnect {
@@ -315,7 +447,6 @@ async fn run_with_reconnect(
         // e.g. leave a key looking stuck down.
         while client_rx.try_recv().is_ok() {}
 
-        let mut attempt: u32 = 0;
         io = loop {
             attempt += 1;
             let _ = server_tx.send(ServerEvent::Reconnecting { attempt });
@@ -378,7 +509,7 @@ async fn handshake<T: AsyncRead + AsyncWrite + Unpin>(
     params: &ConnectParams,
 ) -> Result<()> {
     framed.send(Message::Hello(Hello { protocol_version: PROTOCOL_VERSION, client_name: "termland-client".into() })).await?;
-    let msg = framed.next().await.context("closed")?.context("decode")?;
+    let msg = framed.next().await.context("closed")?.context("reading from the server")?;
     let auth_required = match &msg {
         Message::HelloAck(ha) => {
             tracing::info!("Server: {} (v{}, session {})", ha.server_name, ha.protocol_version, ha.session_id);
@@ -388,7 +519,7 @@ async fn handshake<T: AsyncRead + AsyncWrite + Unpin>(
     };
 
     if auth_required {
-        let msg = framed.next().await.context("closed")?.context("decode")?;
+        let msg = framed.next().await.context("closed")?.context("reading from the server")?;
         match msg {
             Message::AuthRequest(ar) => {
                 tracing::info!("Server requires authentication (methods: {:?})", ar.methods);
@@ -409,7 +540,7 @@ async fn handshake<T: AsyncRead + AsyncWrite + Unpin>(
             credential: password,
         })).await.context("send AuthResponse")?;
 
-        let result = framed.next().await.context("closed")?.context("decode")?;
+        let result = framed.next().await.context("closed")?.context("reading from the server")?;
         match result {
             Message::AuthResult(ar) if ar.success => tracing::info!("Authenticated as '{username}'"),
             Message::AuthResult(ar) => anyhow::bail!("Authentication failed: {}", ar.message),
@@ -439,6 +570,7 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
     server_tx: mpsc::UnboundedSender<ServerEvent>,
     client_rx: &mut mpsc::UnboundedReceiver<ClientCommand>,
     session_id: &mut Option<String>,
+    ready: &mut bool,
 ) -> Result<LoopExit> {
     let mut framed = Framed::new(io, TermlandCodec);
     handshake(&mut framed, &params).await?;
@@ -483,7 +615,7 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
             })).await?;
         }
     }
-    let msg = framed.next().await.context("closed")?.context("decode")?;
+    let msg = framed.next().await.context("closed")?.context("reading from the server")?;
     let negotiated_codec = match &msg {
         Message::SessionReady(sr) => {
             match sr.codec {
@@ -493,6 +625,7 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
             if !sr.session_id.is_empty() {
                 *session_id = Some(sr.session_id.clone());
             }
+            *ready = true;
             let _ = server_tx.send(ServerEvent::SessionReady(sr.clone()));
             sr.codec
         }
@@ -1036,6 +1169,82 @@ fn receive_file_transfer(payload: FileTransferPayload) {
         dir.display(),
         if cfg!(target_os = "linux") { " and set local clipboard" } else { "" },
     );
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn params() -> ConnectParams {
+        ConnectParams {
+            mode: SessionMode::Desktop,
+            width: 640,
+            height: 480,
+            quality: 50,
+            audio: false,
+            ssh_opts: Vec::new(),
+            tls: false,
+            accept_invalid_certs: false,
+            username: None,
+            password: None,
+            desktop_shell: None,
+            encoder_preset: None,
+            encoder_crf: None,
+            encoder_extra_params: None,
+            codec: None,
+            attach: None,
+            reconnect: true,
+        }
+    }
+
+    fn sh(script: &str) -> Vec<String> {
+        vec!["-c".into(), script.into()]
+    }
+
+    #[tokio::test]
+    async fn a_failing_ssh_turns_eof_into_its_stderr() {
+        let mut io = spawn_ssh_transport(
+            "sh",
+            &sh("echo 'Offending ECDSA key in known_hosts:134' >&2; \
+                 echo 'Host key verification failed.' >&2; exit 255"),
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let err = io.read_to_end(&mut buf).await.expect_err("ssh failed, so EOF must be an error");
+        assert_eq!(err.to_string(), "ssh: Host key verification failed.");
+    }
+
+    #[tokio::test]
+    async fn a_clean_ssh_exit_is_a_plain_eof() {
+        let mut io = spawn_ssh_transport("sh", &sh("printf hello")).unwrap();
+        let mut buf = Vec::new();
+        io.read_to_end(&mut buf).await.expect("clean exit is not an error");
+        assert_eq!(buf, b"hello");
+    }
+
+    /// A session that never started must be reported, not retried: before
+    /// this, an ssh transport that failed at once (a changed host key) had
+    /// the client "reconnecting" every second for as long as it was open.
+    #[tokio::test]
+    async fn a_connection_that_never_started_is_not_retried() {
+        let (client, server) = tokio::io::duplex(1024);
+        drop(server);
+        let (server_tx, mut server_rx) = mpsc::unbounded_channel();
+        let (_client_tx, client_rx) = mpsc::unbounded_channel();
+        let run = run_with_reconnect("127.0.0.1:9".into(), false, params(), Box::new(client), server_tx, client_rx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("must give up rather than retry");
+        match server_rx.recv().await {
+            Some(ServerEvent::ConnectFailed { .. }) => {}
+            other => panic!("expected ConnectFailed, got {}", match other {
+                Some(ServerEvent::Reconnecting { .. }) => "Reconnecting",
+                Some(_) => "another event",
+                None => "nothing",
+            }),
+        }
+    }
 }
 
 #[cfg(test)]

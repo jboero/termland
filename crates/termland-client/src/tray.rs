@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::connection::{self, ConnectParams};
 use crate::desktop;
-use crate::manager::Control;
+use crate::manager::HostEvent;
 use crate::profile::{self, Profile};
 use termland_protocol::SessionInfo;
 
@@ -192,7 +192,7 @@ pub fn run(server: String, ssh: bool, params: ConnectParams) -> Result<()> {
                         t.error = None;
                     }
                     Err(e) => {
-                        t.error = Some(e.to_string());
+                        t.error = Some(format!("{e:#}"));
                     }
                 })
                 .await;
@@ -209,7 +209,7 @@ pub fn run(server: String, ssh: bool, params: ConnectParams) -> Result<()> {
 /// background — over SSH, for SSH profiles — for as long as the manager sits
 /// in the tray. The window polls only the selected host, and only while open.
 struct ManagerTray {
-    control: Arc<Control>,
+    host: std::sync::mpsc::Sender<HostEvent>,
     profiles: Vec<Profile>,
 }
 
@@ -232,7 +232,7 @@ impl ksni::Tray for ManagerTray {
         }
     }
     fn activate(&mut self, _x: i32, _y: i32) {
-        self.control.request_show();
+        let _ = self.host.send(HostEvent::Show);
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -240,7 +240,9 @@ impl ksni::Tray for ManagerTray {
         let mut items: Vec<ksni::MenuItem<Self>> = vec![
             StandardItem {
                 label: "Open Session Manager".into(),
-                activate: Box::new(|t: &mut Self| t.control.request_show()),
+                activate: Box::new(|t: &mut Self| {
+                    let _ = t.host.send(HostEvent::Show);
+                }),
                 ..Default::default()
             }
             .into(),
@@ -283,7 +285,9 @@ impl ksni::Tray for ManagerTray {
             StandardItem {
                 label: "Quit Termland".into(),
                 icon_name: "application-exit".into(),
-                activate: Box::new(|t: &mut Self| t.control.request_quit()),
+                activate: Box::new(|t: &mut Self| {
+                    let _ = t.host.send(HostEvent::Quit);
+                }),
                 ..Default::default()
             }
             .into(),
@@ -300,7 +304,10 @@ impl ksni::Tray for ManagerTray {
 /// `wait_for_host` is for starting at login, when the panel's
 /// StatusNotifierWatcher may not be up yet: registration is assumed to
 /// succeed, and ksni attaches the icon whenever the watcher appears.
-pub fn spawn_manager_tray(control: Arc<Control>, wait_for_host: bool) -> Option<Arc<tokio::sync::Notify>> {
+pub fn spawn_manager_tray(
+    host: std::sync::mpsc::Sender<HostEvent>,
+    wait_for_host: bool,
+) -> Option<Arc<tokio::sync::Notify>> {
     let profiles_changed = Arc::new(tokio::sync::Notify::new());
     let changed = profiles_changed.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -316,7 +323,7 @@ pub fn spawn_manager_tray(control: Arc<Control>, wait_for_host: bool) -> Option<
         };
         rt.block_on(async move {
             use ksni::TrayMethods;
-            let tray = ManagerTray { control, profiles: profile::load() };
+            let tray = ManagerTray { host, profiles: profile::load() };
             let handle = match tray.assume_sni_available(wait_for_host).spawn().await {
                 Ok(h) => h,
                 Err(e) => {

@@ -233,10 +233,12 @@ not with cxx-qt.
   second launch asks the running one to show its window and exits, instead
   of opening a second window with a second tray icon. It registers its own
   tray icon (click to open; per-profile "New session"; Quit), and closing the
-  window leaves it there. eframe keeps its winit event loop in a
-  thread-local so a window can be closed and reopened in one process —
-  necessary, because winit can't hide a window on Wayland. Without a tray
-  host, closing the window quits as before. Packaged with a launcher entry
+  window leaves it there. The window runs as a child process of the tray
+  process (`--manager-window`): winit can't hide a window on Wayland, and a
+  window closed by an event loop that then stops running is never actually
+  destroyed — v0.8.0 reopened eframe windows in one process and every closed
+  one stayed on screen, frozen. A process that exits takes its surfaces with
+  it. Without a tray host, closing the window quits as before. Packaged with a launcher entry
   and icon (`io.github.jboero.termland`, also the windows' Wayland `app_id`)
   and an opt-in per-user autostart entry (`--manager --minimized`).
 - Supersedes the deferred v0.2 "Qt6 GUI client rewrite" item, and closes the

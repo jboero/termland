@@ -44,7 +44,7 @@ impl CodecArg {
 #[command(name = "termland-client", about = "Termland remote desktop client", version)]
 pub struct Args {
     /// Server address (host:port for TCP, user@host for SSH)
-    #[arg(required_unless_present_any = ["completions", "manager"])]
+    #[arg(required_unless_present_any = ["completions", "manager", "manager_window"])]
     pub server: Option<String>,
 
     /// Use SSH subsystem instead of direct TCP.
@@ -122,6 +122,11 @@ pub struct Args {
     /// (what the "start at login" autostart entry runs).
     #[arg(long, requires = "manager")]
     pub minimized: bool,
+
+    /// Internal: the session manager's window, run as a child process of a
+    /// tray-resident `--manager`.
+    #[arg(long, hide = true)]
+    pub manager_window: bool,
 
     /// For --mode desktop: startup command to run inside labwc.
     /// Examples: "konsole", "startplasma-wayland", "dbus-run-session sway".
@@ -211,6 +216,9 @@ fn main() -> Result<()> {
     // below unconditionally require one.
     if args.manager {
         return manager::run(args.minimized);
+    }
+    if args.manager_window {
+        return manager::run_window_process();
     }
 
     // One-shot session-management ops (and the tray) run without a session

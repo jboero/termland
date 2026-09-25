@@ -189,6 +189,10 @@ struct App {
     /// connected normally. Drives the "Reconnecting..." banner in render()
     /// and is cleared on the next `SessionReady` (a successful reattach).
     reconnecting: Option<u32>,
+    /// Why the session could not be started (`ServerEvent::ConnectFailed`).
+    /// Shown in the window until the user closes it: a window launched from
+    /// the session manager has no terminal to print it to.
+    connect_failed: Option<String>,
 }
 
 impl App {
@@ -215,6 +219,7 @@ impl App {
             osk_child: None,
             session_id: None,
             reconnecting: None,
+            connect_failed: None,
         }
     }
 
@@ -373,7 +378,10 @@ impl App {
                 // should NOT composite cursor (client renders it locally).
                 self.send_cmd(ClientCommand::SetCursorInFrame(!self.menu.client_cursor));
             }
-            Err(e) => tracing::error!("Connect failed: {e:#}"),
+            Err(e) => {
+                tracing::error!("Connect failed: {e:#}");
+                self.connect_failed = Some(format!("{e:#}"));
+            }
         }
     }
 
@@ -427,6 +435,14 @@ impl App {
                     tracing::info!("Session ended: {reason}");
                     self.should_exit = true;
                 }
+                ServerEvent::ConnectFailed { reason } => {
+                    tracing::error!("Could not connect: {reason}");
+                    self.reconnecting = None;
+                    self.connect_failed = Some(reason);
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
                 ServerEvent::Reconnecting { attempt } => {
                     // Connection dropped unexpectedly; connection.rs is
                     // retrying in the background. Do NOT exit - keep the
@@ -459,7 +475,9 @@ impl App {
     /// Update the window title based on current flags.
     fn update_title(&mut self) {
         let Some(win) = &self.window else { return; };
-        let title = if let Some(attempt) = self.reconnecting {
+        let title = if self.connect_failed.is_some() {
+            "Termland  [Could not connect]".to_string()
+        } else if let Some(attempt) = self.reconnecting {
             format!("Termland  [Reconnecting... attempt {attempt}]")
         } else if self.menu.show_data_rate {
             format!("Termland  [{}]", overlay::format_rate(self.data_rate))
@@ -475,6 +493,17 @@ impl App {
     fn render(&mut self) {
         let Some(surface) = &mut self.surface else { return; };
         let Some(window) = &self.window else { return; };
+        if let Some(reason) = &self.connect_failed {
+            let size = window.inner_size();
+            let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return; };
+            if surface.resize(w, h).is_err() { return; }
+            if let Ok(mut buffer) = surface.buffer_mut() {
+                buffer.fill(0x11111B);
+                overlay::draw_status_banner(&mut buffer, w.get(), h.get(), &format!("Could not connect: {reason}"));
+                let _ = buffer.present();
+            }
+            return;
+        }
         if self.frame_buffer.is_empty() || self.frame_width == 0 { return; }
 
         // Size softbuffer to the *window*, not the frame. This is the key

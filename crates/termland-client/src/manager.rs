@@ -18,18 +18,29 @@
 //!    appears promptly instead of waiting for the next input event.
 //!
 //! Lifetime: the manager is a single instance (see `single_instance`) that
-//! lives in the system tray where there is one. Closing the window ends that
-//! eframe run but not the process; the tray icon, or launching
-//! `--manager` again, opens a fresh window. eframe keeps its winit event loop
-//! in a thread-local precisely so a window can be closed and reopened like
-//! this — and it has to be done that way, because winit cannot hide a window
-//! on Wayland (`set_visible` is a no-op there).
+//! lives in the system tray where there is one. `--manager` is then the tray
+//! process, and the window is a child process of it (`--manager-window`):
+//! closing the window ends that child, and the tray icon, or launching
+//! `--manager` again, starts a new one. Where there is no tray, the window
+//! runs in-process and closing it quits.
+//!
+//! The window is a separate process because a Wayland window has to be taken
+//! down by its own event loop. winit cannot hide one (`set_visible` is a
+//! no-op there), and closing it only queues the surface's destruction — which
+//! is never sent if the event loop then stops running. An earlier version
+//! kept one process and reopened eframe windows in it; every closed window
+//! stayed on screen, frozen, until the compositor offered to kill it. A
+//! process that exits has its surfaces destroyed with its connection.
+//!
+//! The tray process talks to the window over the child's stdin and stdout,
+//! one line per message: `show` and `quit` in, `profiles-changed` out.
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::io::{BufRead, Write};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::connection::{self, ConnectParams};
@@ -74,93 +85,48 @@ impl EditState {
     }
 }
 
-/// Requests from the tray icon and the single-instance socket — both on other
-/// threads — to whichever of the manager window or the idle main thread is
-/// currently running.
-#[derive(Default)]
-pub struct Control {
-    state: Mutex<ControlState>,
-    changed: Condvar,
-}
+/// Tray process -> window process: bring the window forward.
+const MSG_SHOW: &str = "show";
+/// Tray process -> window process: close the window and exit.
+const MSG_QUIT: &str = "quit";
+/// Window process -> tray process: profiles.json changed. Namespaced because
+/// the window's log output shares its stdout, and is passed through.
+const MSG_PROFILES_CHANGED: &str = "termland-manager:profiles-changed";
 
-#[derive(Default)]
-struct ControlState {
-    show: bool,
-    quit: bool,
-    /// The open window's context, so a request can wake its event loop.
-    ctx: Option<egui::Context>,
-}
-
-enum Wake {
+/// What the tray process reacts to: requests from the tray icon and the
+/// single-instance socket, and its window process exiting.
+// Only Show is sent where there is no tray (macOS); the rest are Linux-only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum HostEvent {
     Show,
     Quit,
+    /// The window process with this pid has exited.
+    WindowClosed(u32),
 }
 
-impl Control {
-    /// Open the window, or bring it forward if it is already open.
-    pub fn request_show(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.show = true;
-        if let Some(ctx) = &state.ctx {
+/// Requests that reach the window from another thread, for its next frame.
+#[derive(Default)]
+struct WindowLink {
+    show: AtomicBool,
+    quit: AtomicBool,
+    /// The window's context, so a request can wake its event loop.
+    ctx: Mutex<Option<egui::Context>>,
+}
+
+impl WindowLink {
+    fn request(&self, flag: &AtomicBool) {
+        flag.store(true, Ordering::Relaxed);
+        if let Some(ctx) = &*self.ctx.lock().unwrap() {
             ctx.request_repaint();
-        }
-        self.changed.notify_all();
-    }
-
-    /// Close the window, if open, and exit.
-    // Only the tray asks this, and the tray is Linux-only.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn request_quit(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.quit = true;
-        if let Some(ctx) = &state.ctx {
-            ctx.request_repaint();
-            // The close is carried out by the window's next frame, which a
-            // minimized Wayland window may never get: the compositor stops
-            // sending it frame callbacks. Exit regardless after a grace
-            // period. Nothing is lost — profiles are saved on every edit.
-            std::thread::spawn(|| {
-                std::thread::sleep(Duration::from_secs(2));
-                std::process::exit(0);
-            });
-        }
-        self.changed.notify_all();
-    }
-
-    fn attach(&self, ctx: egui::Context) {
-        self.state.lock().unwrap().ctx = Some(ctx);
-    }
-
-    fn detach(&self) {
-        self.state.lock().unwrap().ctx = None;
-    }
-
-    fn take_show(&self) -> bool {
-        std::mem::take(&mut self.state.lock().unwrap().show)
-    }
-
-    fn quit_requested(&self) -> bool {
-        self.state.lock().unwrap().quit
-    }
-
-    /// Block the idle main thread until the window should reopen or the
-    /// process should exit.
-    fn wait(&self) -> Wake {
-        let mut state = self.changed.wait_while(self.state.lock().unwrap(), |s| !s.show && !s.quit).unwrap();
-        if state.quit {
-            Wake::Quit
-        } else {
-            state.show = false;
-            Wake::Show
         }
     }
 }
 
 pub struct ManagerApp {
-    control: Arc<Control>,
-    /// Tells the tray icon to reload profiles. `None` when there is no tray,
-    /// in which case closing the window quits.
-    tray_refresh: Option<Arc<tokio::sync::Notify>>,
+    link: Arc<WindowLink>,
+    /// Running as the window process of a tray process, which has to be told
+    /// when profiles change. False when there is no tray.
+    in_tray: bool,
     // Shown only alongside the tray, which is Linux-only.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     autostart: bool,
@@ -171,28 +137,22 @@ pub struct ManagerApp {
     poll_target: Arc<Mutex<Option<PollRequest>>>,
     poll_notify: Arc<tokio::sync::Notify>,
     poll_rx: std::sync::mpsc::Receiver<PollResult>,
-    poll_stop: Arc<AtomicBool>,
     delete_confirm: Option<String>,
 }
 
 impl ManagerApp {
-    fn new(
-        cc: &eframe::CreationContext<'_>,
-        control: Arc<Control>,
-        tray_refresh: Option<Arc<tokio::sync::Notify>>,
-    ) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, link: Arc<WindowLink>, in_tray: bool) -> Self {
         let profiles = profile::load();
         let poll_target: Arc<Mutex<Option<PollRequest>>> = Arc::new(Mutex::new(None));
         let poll_notify = Arc::new(tokio::sync::Notify::new());
-        let poll_stop = Arc::new(AtomicBool::new(false));
         let (tx, poll_rx) = std::sync::mpsc::channel();
 
-        spawn_poll_thread(poll_target.clone(), poll_notify.clone(), poll_stop.clone(), tx, cc.egui_ctx.clone());
-        control.attach(cc.egui_ctx.clone());
+        spawn_poll_thread(poll_target.clone(), poll_notify.clone(), tx, cc.egui_ctx.clone());
+        *link.ctx.lock().unwrap() = Some(cc.egui_ctx.clone());
 
         ManagerApp {
-            control,
-            tray_refresh,
+            link,
+            in_tray,
             autostart: crate::desktop::autostart_enabled(),
             profiles,
             selected: None,
@@ -201,7 +161,6 @@ impl ManagerApp {
             poll_target,
             poll_notify,
             poll_rx,
-            poll_stop,
             delete_confirm: None,
         }
     }
@@ -225,8 +184,10 @@ impl ManagerApp {
         if let Err(e) = profile::save(&self.profiles) {
             tracing::warn!("failed to save profiles.json: {e}");
         }
-        if let Some(tray) = &self.tray_refresh {
-            tray.notify_one();
+        if self.in_tray {
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{MSG_PROFILES_CHANGED}");
+            let _ = out.flush();
         }
     }
 
@@ -244,30 +205,19 @@ impl ManagerApp {
     }
 }
 
-/// The window closes and reopens within one process, so each window's poll
-/// thread and control hookup must go with it rather than pile up.
-impl Drop for ManagerApp {
-    fn drop(&mut self) {
-        self.control.detach();
-        self.poll_stop.store(true, Ordering::Relaxed);
-        self.poll_notify.notify_one();
-    }
-}
-
 impl eframe::App for ManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.control.quit_requested() {
+        if self.link.quit.load(Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        if self.control.take_show() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        if self.link.show.swap(false, Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         self.drain_poll_results();
 
         #[cfg(target_os = "linux")]
-        if self.tray_refresh.is_some() {
+        if self.in_tray {
             egui::TopBottomPanel::bottom("tray_panel").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.checkbox(&mut self.autostart, "Start in the system tray at login").changed() {
@@ -560,7 +510,6 @@ impl eframe::App for ManagerApp {
 fn spawn_poll_thread(
     target: Arc<Mutex<Option<PollRequest>>>,
     notify: Arc<tokio::sync::Notify>,
-    stop: Arc<AtomicBool>,
     tx: std::sync::mpsc::Sender<PollResult>,
     ctx: egui::Context,
 ) {
@@ -573,13 +522,13 @@ fn spawn_poll_thread(
             }
         };
         rt.block_on(async move {
-            while !stop.load(Ordering::Relaxed) {
+            loop {
                 let req = target.lock().unwrap().clone();
                 if let Some(req) = req {
                     let result = connection::fetch_sessions(&req.server, req.ssh, &req.params).await;
                     let msg = match result {
                         Ok(sessions) => PollResult::Sessions(req.profile_id, sessions),
-                        Err(e) => PollResult::Error(req.profile_id, e.to_string()),
+                        Err(e) => PollResult::Error(req.profile_id, format!("{e:#}")),
                     };
                     let _ = tx.send(msg);
                     ctx.request_repaint();
@@ -733,7 +682,7 @@ pub fn spawn_manager_window() {
 /// opening the window (the autostart entry uses this); without a tray to
 /// start in, the window opens anyway.
 pub fn run(minimized: bool) -> Result<()> {
-    let control = Arc::new(Control::default());
+    let (tx, rx) = std::sync::mpsc::channel::<HostEvent>();
 
     #[cfg(unix)]
     {
@@ -751,8 +700,10 @@ pub fn run(minimized: bool) -> Result<()> {
                 return Ok(());
             }
             Ok(Instance::Primary(primary)) => {
-                let control = control.clone();
-                primary.serve(move || control.request_show());
+                let tx = tx.clone();
+                primary.serve(move || {
+                    let _ = tx.send(HostEvent::Show);
+                });
             }
             // Not being able to guarantee a single instance is no reason to
             // refuse to open the manager at all.
@@ -762,30 +713,158 @@ pub fn run(minimized: bool) -> Result<()> {
 
     tracing::info!("Starting Termland session manager");
     #[cfg(target_os = "linux")]
-    let tray_refresh = crate::tray::spawn_manager_tray(control.clone(), minimized);
-    #[cfg(not(target_os = "linux"))]
-    let tray_refresh: Option<Arc<tokio::sync::Notify>> = None;
+    if let Some(tray_refresh) = crate::tray::spawn_manager_tray(tx.clone(), minimized) {
+        return run_tray_host(rx, tx, tray_refresh, !minimized);
+    }
 
-    let mut open = !minimized || tray_refresh.is_none();
-    loop {
-        if open {
-            run_window(control.clone(), tray_refresh.clone())?;
+    // No tray to live in: the window is the whole app, and closing it quits.
+    let link = Arc::new(WindowLink::default());
+    {
+        let link = link.clone();
+        std::thread::spawn(move || {
+            for event in rx {
+                if let HostEvent::Show = event {
+                    link.request(&link.show);
+                }
+            }
+        });
+    }
+    run_window(link, false)
+}
+
+/// The tray process: owns the tray icon and runs the window as a child
+/// process on demand, until Quit.
+#[cfg(target_os = "linux")]
+fn run_tray_host(
+    rx: std::sync::mpsc::Receiver<HostEvent>,
+    tx: std::sync::mpsc::Sender<HostEvent>,
+    tray_refresh: Arc<tokio::sync::Notify>,
+    open_now: bool,
+) -> Result<()> {
+    let mut window = None;
+    if open_now {
+        window = WindowProcess::spawn(&tx, &tray_refresh);
+    }
+    for event in rx {
+        match event {
+            HostEvent::Show => match &mut window {
+                Some(w) => w.send(MSG_SHOW),
+                None => window = WindowProcess::spawn(&tx, &tray_refresh),
+            },
+            // Only the current window's exit counts: one that was closed
+            // just before a new one opened must not orphan the new one.
+            HostEvent::WindowClosed(pid) => {
+                if window.as_ref().is_some_and(|w| w.child.id() == pid) {
+                    window.take().unwrap().reap();
+                    tracing::info!("Session manager window closed; Termland stays in the system tray");
+                }
+            }
+            HostEvent::Quit => {
+                if let Some(w) = window.take() {
+                    w.close();
+                }
+                return Ok(());
+            }
         }
-        if tray_refresh.is_none() || control.quit_requested() {
-            return Ok(());
+    }
+    Ok(())
+}
+
+/// The manager window, running as `--manager-window` under the tray process.
+#[cfg(target_os = "linux")]
+struct WindowProcess {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+}
+
+#[cfg(target_os = "linux")]
+impl WindowProcess {
+    fn spawn(
+        tx: &std::sync::mpsc::Sender<HostEvent>,
+        tray_refresh: &Arc<tokio::sync::Notify>,
+    ) -> Option<Self> {
+        use std::process::Stdio;
+        let exe = std::env::current_exe().unwrap_or_else(|_| "termland-client".into());
+        let mut child = match Command::new(exe)
+            .arg("--manager-window")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                tracing::error!("failed to open the session manager window: {e}");
+                return None;
+            }
+        };
+        tracing::info!("Opening the session manager window");
+        let pid = child.id();
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let (tx, tray_refresh) = (tx.clone(), tray_refresh.clone());
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line == MSG_PROFILES_CHANGED {
+                    tray_refresh.notify_one();
+                } else {
+                    // The window's own log output.
+                    println!("{line}");
+                }
+            }
+            // stdout closes when the window process exits.
+            let _ = tx.send(HostEvent::WindowClosed(pid));
+        });
+        Some(WindowProcess { child, stdin })
+    }
+
+    fn send(&mut self, msg: &str) {
+        let _ = writeln!(self.stdin, "{msg}").and_then(|_| self.stdin.flush());
+    }
+
+    fn reap(mut self) {
+        let _ = self.child.wait();
+    }
+
+    /// Ask the window to close, and kill it if it hasn't within a couple of
+    /// seconds: a minimized Wayland window may never get the frame that
+    /// would act on the request. Nothing is lost — profiles are saved on
+    /// every edit.
+    fn close(mut self) {
+        self.send(MSG_QUIT);
+        for _ in 0..20 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        if open {
-            tracing::info!("Session manager window closed; Termland stays in the system tray");
-        }
-        match control.wait() {
-            Wake::Show => open = true,
-            Wake::Quit => return Ok(()),
-        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
-fn run_window(control: Arc<Control>, tray_refresh: Option<Arc<tokio::sync::Notify>>) -> Result<()> {
-    tracing::info!("Opening the session manager window");
+/// `--manager-window`: the window half of a tray-resident manager, run by
+/// `run_tray_host`. Requests arrive on stdin; stdin closing means the tray
+/// process is gone, and the window goes with it.
+pub fn run_window_process() -> Result<()> {
+    let link = Arc::new(WindowLink::default());
+    {
+        let link = link.clone();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                match line {
+                    Ok(l) if l.trim() == MSG_SHOW => link.request(&link.show),
+                    Ok(l) if l.trim() == MSG_QUIT => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            link.request(&link.quit);
+        });
+    }
+    run_window(link, true)
+}
+
+fn run_window(link: Arc<WindowLink>, in_tray: bool) -> Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(crate::desktop::APP_ID)
@@ -795,7 +874,7 @@ fn run_window(control: Arc<Control>, tray_refresh: Option<Arc<tokio::sync::Notif
     eframe::run_native(
         "Termland Session Manager",
         native_options,
-        Box::new(move |cc| Ok(Box::new(ManagerApp::new(cc, control, tray_refresh)))),
+        Box::new(move |cc| Ok(Box::new(ManagerApp::new(cc, link, in_tray)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))
 }
