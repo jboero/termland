@@ -97,8 +97,10 @@ Each session runs an isolated headless Wayland compositor with its own screen ca
 - Client-side cursor rendering for low-latency mouse interaction
 - Data rate overlay, fullscreen toggle (F11), menubar toggle (F10)
 - Shell tab completion for bash, zsh, fish
-- Desktop session manager (`--manager`): saved multi-host connection
-  profiles, live per-host session list, resume/new/close
+- Desktop session manager — "Termland" in the application menu, or
+  `--manager`: saved multi-host connection profiles, live per-host session
+  list, resume/new/close. Runs as a single instance that stays in the system
+  tray, optionally from login
 - Seamless reconnect: auto-retry with backoff, reattaches to the same
   session after an unexpected drop instead of exiting
 
@@ -174,6 +176,24 @@ termland-client --tls --accept-invalid-certs --user john --password xxx server:7
 # Plaintext (localhost/tunnel only)
 termland-client localhost:7867
 ```
+
+### Session Manager
+
+The RPM adds **Termland** to the application menu. It opens the session
+manager, where you save hosts as profiles and resume or start sessions on
+them without typing a command line:
+
+```bash
+termland-client --manager               # what the menu entry runs
+termland-client --manager --minimized   # start in the tray, no window
+```
+
+Only one manager runs at a time; launching it again brings up the existing
+window. Closing the window leaves it in the system tray — click the icon to
+reopen it, or use its menu to start a session from any profile or to quit.
+"Start in the system tray at login" in the window adds a per-user autostart
+entry. On a desktop without a system tray (GNOME without the AppIndicator
+extension, for example), closing the window quits instead.
 
 ### Options
 
@@ -352,7 +372,8 @@ The client RPM installs:
       see [docs/mobile-clients.md](docs/mobile-clients.md))
 - [x] Embedded SSH transport (`russh`) for the mobile client
 - [x] Desktop session manager (`termland-client --manager`, egui): saved
-      multi-host profiles, per-host session list, resume/new/close (not
+      multi-host profiles, per-host session list, resume/new/close; single
+      instance in the system tray, app-menu entry, optional autostart (not
       Qt6/cxx-qt — see [ROADMAP.md](ROADMAP.md) for why)
 - [x] Session isolation: `setuid` into the PAM-authenticated user, with
       ownership enforcement on session list/attach/close

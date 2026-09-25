@@ -4932,6 +4932,7 @@ dependencies = [
  "font8x8",
  "futures",
  "ksni",
+ "libc",
  "opus",
  "raw-window-handle",
  "rustls",
