@@ -380,7 +380,9 @@ The client RPM installs:
 - [x] Clipboard file transfer (copy files, real files land on the other side)
 - [x] Seamless reconnect (auto-retry + reattach on an unexpected drop)
 - [x] Android audio playback (MediaCodec Opus → AudioTrack)
-- [ ] iOS client
+- [x] iOS/iPadOS/macOS client (SwiftUI + VideoToolbox: sessions, streaming,
+      input; audio not yet — see [docs/mobile-clients.md](docs/mobile-clients.md))
+- [x] Desktop client builds on macOS (no tray there; `--manager` is a window)
 - [ ] Audio bitrate configuration
 - [ ] Multi-monitor support
 - [x] Experimental web client (WebCodecs + WebTransport) — see

@@ -1,7 +1,8 @@
 # Termland mobile clients (Android + iOS) — design
 
-Status: **M1 (core) + M2 (Android app) shipped.** iOS M3a/M3b's SwiftUI
-control plane is in progress; VideoToolbox streaming is M3c.
+Status: **M1 (core) + M2 (Android app) + M3 (iOS/iPadOS/macOS SwiftUI app,
+VideoToolbox streaming) shipped.** M4 (audio, QUIC and AV1 on Apple
+platforms, trackpad mode) is next.
 This doc is kept as the design reference; see [ROADMAP.md](../ROADMAP.md)'s
 "Mobile clients" section for what's actually built and verified. Known
 deviations from the original plan below:
