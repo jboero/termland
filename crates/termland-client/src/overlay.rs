@@ -327,10 +327,20 @@ const RECONNECT_FG: u32 = 0xF9E2AF; // amber - distinct from the menubar's green
 /// rather than clearing first - a reconnect should never look like a crash
 /// to black.
 pub fn draw_reconnect_banner(buf: &mut [u32], fb_width: u32, fb_height: u32, attempt: u32) {
-    let text = format!(" Reconnecting... (attempt {attempt}) ");
+    draw_status_banner(buf, fb_width, fb_height, &format!("Reconnecting... (attempt {attempt})"));
+}
+
+/// A one-line status banner centred below the menubar, truncated with "..."
+/// to fit the window.
+pub fn draw_status_banner(buf: &mut [u32], fb_width: u32, fb_height: u32, text: &str) {
     let char_w = 8 * 2;
-    let text_w = text.chars().count() * char_w;
     let pad = 8usize;
+    let max_chars = (fb_width as usize).saturating_sub(pad * 2) / char_w;
+    if max_chars < 8 {
+        return;
+    }
+    let text = fit_banner_text(text, max_chars);
+    let text_w = text.chars().count() * char_w;
     let h = 28usize;
     let w = text_w + pad * 2;
     let x = (fb_width as usize).saturating_sub(w) / 2;
@@ -344,6 +354,18 @@ pub fn draw_reconnect_banner(buf: &mut [u32], fb_width: u32, fb_height: u32, att
     draw_text(buf, stride, x + pad, y + (h - 16) / 2, &text, RECONNECT_FG);
 
     let _ = fb_height;
+}
+
+/// `text` padded with a space each side, cut to `max_chars` with "..." when
+/// it doesn't fit.
+fn fit_banner_text(text: &str, max_chars: usize) -> String {
+    let padded = format!(" {text} ");
+    if padded.chars().count() <= max_chars {
+        return padded;
+    }
+    let mut cut: String = padded.chars().take(max_chars.saturating_sub(4)).collect();
+    cut.push_str("... ");
+    cut
 }
 
 // ─── Menubar (persistent, always visible unless fullscreen) ───────────────
@@ -637,5 +659,18 @@ mod window_list_tests {
         let s = "日本語のウィンドウタイトル";
         let out = truncate(s, 5);
         assert_eq!(out.chars().count(), 5);
+    }
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::*;
+
+    #[test]
+    fn banner_text_fits_or_is_cut_with_an_ellipsis() {
+        assert_eq!(fit_banner_text("ok", 10), " ok ");
+        let cut = fit_banner_text("Could not connect: ssh: Host key verification failed.", 20);
+        assert_eq!(cut.chars().count(), 20);
+        assert!(cut.ends_with("... "), "got {cut:?}");
     }
 }

@@ -24,7 +24,7 @@ pub enum CodecError {
     Encode(#[from] EncodeError),
     #[error("decode error: {0}")]
     Decode(#[from] DecodeError),
-    #[error("io error: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 

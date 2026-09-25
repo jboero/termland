@@ -528,7 +528,7 @@ fn spawn_poll_thread(
                     let result = connection::fetch_sessions(&req.server, req.ssh, &req.params).await;
                     let msg = match result {
                         Ok(sessions) => PollResult::Sessions(req.profile_id, sessions),
-                        Err(e) => PollResult::Error(req.profile_id, e.to_string()),
+                        Err(e) => PollResult::Error(req.profile_id, format!("{e:#}")),
                     };
                     let _ = tx.send(msg);
                     ctx.request_repaint();

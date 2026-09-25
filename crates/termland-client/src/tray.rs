@@ -192,7 +192,7 @@ pub fn run(server: String, ssh: bool, params: ConnectParams) -> Result<()> {
                         t.error = None;
                     }
                     Err(e) => {
-                        t.error = Some(e.to_string());
+                        t.error = Some(format!("{e:#}"));
                     }
                 })
                 .await;
