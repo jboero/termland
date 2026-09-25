@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.8.0
+%global version 0.8.1
 # find-debuginfo can produce an empty debugsourcefiles.list for a Rust
 # binary (unlike typical C sources), which newer Fedora's rpmbuild tolerates
 # but EL8's treats as a hard error ("Empty %%files file ... debugsourcefiles
@@ -20,7 +20,7 @@
 
 Name:           termland-server
 Version:        %{version}
-Release:        2%{?dist}
+Release:        1%{?dist}
 Summary:        Termland remote desktop server — stream Wayland sessions via AV1/VP9/HEVC/H.264/Opus
 
 License:        LGPL-3.0-or-later
@@ -215,6 +215,11 @@ echo ""
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Fri Sep 25 2026 John Boero - 0.8.1-1
+- No functional server changes; version kept in step with termland-client
+  0.8.1. I/O errors in the log no longer repeat their message
+  ("io error: X: X").
+
 * Fri Sep 25 2026 John Boero - 0.8.0-2
 - Fix the i386 build: work around ffmpeg-sys-next 9.0.0's Vulkan stub
   header asserting a 64-bit struct size, which aborted binding generation on

@@ -8,14 +8,14 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.8.0
+%global version 0.8.1
 # See termland-server.spec's comment: EL8's rpmbuild fails hard on the empty
 # debugsourcefiles.list find-debuginfo can produce for a Rust binary.
 %global debug_package %{nil}
 
 Name:           termland-client
 Version:        %{version}
-Release:        2%{?dist}
+Release:        1%{?dist}
 Summary:        Termland remote desktop client — view and interact with remote Wayland sessions
 
 License:        LGPL-3.0-or-later
@@ -163,6 +163,21 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/io.github.jboero.term
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Fri Sep 25 2026 John Boero - 0.8.1-1
+- Fix the session manager window staying on screen, frozen, after it was
+  closed (0.8.0 on Wayland). The window now runs as a child process of the
+  tray icon, so closing it always takes it away; the tray icon, or starting
+  Termland again, opens a new one.
+- A session that cannot start now says why in its window - for example
+  "ssh: Host key verification failed." - instead of showing
+  "Reconnecting..." forever and retrying once a second. Automatic
+  reconnect still resumes sessions that were running and dropped, and its
+  backoff now actually backs off.
+- The session manager and --list-sessions/--close report ssh's own error
+  instead of "closed".
+- The first connection no longer runs on the window's UI thread, so an
+  unreachable host cannot freeze the window.
+
 * Fri Sep 25 2026 John Boero - 0.8.0-2
 - Fix the i386 build: work around ffmpeg-sys-next 9.0.0's Vulkan stub
   header asserting a 64-bit struct size, which aborted binding generation on
