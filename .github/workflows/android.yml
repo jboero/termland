@@ -13,8 +13,11 @@ name: Android APKs
 # one long-lived key held in repository secrets:
 #   ANDROID_KEYSTORE_BASE64   base64 of the .jks keystore
 #   ANDROID_KEYSTORE_PASSWORD keystore password
-#   ANDROID_KEY_ALIAS         key alias inside it
 #   ANDROID_KEY_PASSWORD      key password
+# The key's alias is not a secret, and must not be one: Actions masks every
+# occurrence of a secret's value in the logs, and the alias is "termland",
+# which would star out the project's name throughout. It is the repository
+# variable ANDROID_KEY_ALIAS, defaulting to "termland".
 # With them, a release gets termland-android-<tag>.apk (signed release build)
 # and termland-android-<tag>-debug.apk (debug build, signed with the same key).
 # Without them it gets the release build unsigned and the debug build with
@@ -116,7 +119,7 @@ jobs:
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_ALIAS: ${{ vars.ANDROID_KEY_ALIAS || 'termland' }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           apk=android/app/build/outputs/apk
@@ -133,6 +136,7 @@ jobs:
               [ "$build" = debug ] && out="dist/$name-debug.apk"
               "$apksigner" sign --ks "$ks" --ks-pass env:KEYSTORE_PASSWORD \
                 --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD \
+                --v4-signing-enabled false \
                 --out "$out" "$src"
               "$apksigner" verify "$out"
             done
