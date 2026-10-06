@@ -1,0 +1,159 @@
+name: Android APKs
+
+# Builds the Android client from a release's tag and attaches the APKs to that
+# release, so publishing a GitHub release is all a release takes.
+#
+# On pull requests that touch the Android build it only builds (and keeps the
+# APKs as a run artifact), so a broken Android build shows up in review rather
+# than at release time.
+#
+# Signing. CI starts from a fresh machine, so a debug APK built here carries a
+# new throwaway key every run - and Android refuses to install an update signed
+# by a different key than the installed app. Releases are therefore signed with
+# one long-lived key held in repository secrets:
+#   ANDROID_KEYSTORE_BASE64   base64 of the .jks keystore
+#   ANDROID_KEYSTORE_PASSWORD keystore password
+#   ANDROID_KEY_ALIAS         key alias inside it
+#   ANDROID_KEY_PASSWORD      key password
+# With them, a release gets termland-android-<tag>.apk (signed release build)
+# and termland-android-<tag>-debug.apk (debug build, signed with the same key).
+# Without them it gets the release build unsigned and the debug build with
+# CI's throwaway key, as v0.8.1 did by hand.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and attach APKs to (e.g. v0.9.0)
+        required: true
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'crates/termland-mobile-core/**'
+      - 'crates/termland-protocol/**'
+      - 'Cargo.lock'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: write
+
+env:
+  # Empty on pull requests: build the PR's own commit and upload nothing.
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  # Matches android/app/build.gradle.kts (compileSdk) and AGP 8.7.3's default
+  # NDK; the cdylib is cross-compiled by cargo-ndk against this NDK.
+  ANDROID_PLATFORM: platforms;android-35
+  ANDROID_NDK: ndk;27.0.12077973
+  ANDROID_BUILD_TOOLS: '34.0.0'
+  CARGO_NDK_VERSION: '4.1.2'
+
+jobs:
+  apk:
+    name: Build APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.sha }}
+
+      - name: Set up JDK 21
+        # Gradle 8.9 cannot run on the runner's newest JDKs.
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Android SDK packages
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null
+          "$SDKMANAGER" --install "$ANDROID_PLATFORM" "$ANDROID_NDK" "build-tools;$ANDROID_BUILD_TOOLS" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ANDROID_NDK#ndk;}" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        # stable at 6bed0761d98439e5a578e2877258200ad565ba87, as in ci.yml
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Use the stable toolchain for the APK's Rust core
+        # The build script pins RUSTUP_TOOLCHAIN=nightly unless told otherwise.
+        # Tags from before TERMLAND_RUST_TOOLCHAIN existed (v0.8.1 and older)
+        # still need that nightly, so install it for them.
+        run: |
+          echo "TERMLAND_RUST_TOOLCHAIN=stable" >> "$GITHUB_ENV"
+          if ! grep -q TERMLAND_RUST_TOOLCHAIN android/app/build.gradle.kts; then
+            rustup toolchain install nightly --profile minimal \
+              --target aarch64-linux-android --target x86_64-linux-android
+          fi
+
+      - name: Cache cargo registry and cargo-ndk
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-ndk
+          key: ${{ runner.os }}-android-${{ env.CARGO_NDK_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-android-${{ env.CARGO_NDK_VERSION }}-
+
+      - name: Install cargo-ndk
+        run: |
+          if ! cargo ndk --version 2> /dev/null | grep -q " $CARGO_NDK_VERSION$"; then
+            cargo install --locked --force cargo-ndk --version "$CARGO_NDK_VERSION"
+          fi
+
+      - name: Build APKs
+        working-directory: android
+        # org.gradle.java.home is passed explicitly: tags up to v0.8.1 set it
+        # in gradle.properties to a path on the maintainer's machine.
+        run: ./gradlew --no-daemon -Dorg.gradle.java.home="$JAVA_HOME" assembleDebug assembleRelease
+
+      - name: Sign and name the APKs
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          apk=android/app/build/outputs/apk
+          name="termland-android-${TAG:-${GITHUB_SHA::12}}"
+          apksigner="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
+          mkdir -p dist
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            ks="$RUNNER_TEMP/release.jks"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$ks"
+            for build in release debug; do
+              src="$apk/$build/app-$build.apk"
+              [ "$build" = release ] && src="$apk/release/app-release-unsigned.apk"
+              out="dist/$name.apk"
+              [ "$build" = debug ] && out="dist/$name-debug.apk"
+              "$apksigner" sign --ks "$ks" --ks-pass env:KEYSTORE_PASSWORD \
+                --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD \
+                --out "$out" "$src"
+              "$apksigner" verify "$out"
+            done
+            rm -f "${ks:?}"
+          else
+            echo "::warning::No signing key in secrets: the release APK is unsigned, and the debug APK's throwaway key will not upgrade a previous release's."
+            cp "$apk/release/app-release-unsigned.apk" "dist/$name-release-unsigned.apk"
+            cp "$apk/debug/app-debug.apk" "dist/$name-debug.apk"
+          fi
+          ls -l dist
+
+      - name: Attach to the release
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/*.apk --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Keep the APKs from a pull request build
+        if: env.TAG == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: termland-android-apks
+          path: dist/*.apk
+          retention-days: 7

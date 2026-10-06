@@ -79,7 +79,10 @@ fun cargoEnv(): Map<String, String> {
         // is exactly one toolchain here with all three Android std targets
         // verified installed (nightly); pin to it so builds are
         // reproducible regardless of what else rustup has lying around.
-        put("RUSTUP_TOOLCHAIN", "nightly")
+        // TERMLAND_RUST_TOOLCHAIN overrides that: CI installs a pinned
+        // stable toolchain with the Android targets instead of tracking a
+        // floating nightly (.github/workflows/android.yml).
+        put("RUSTUP_TOOLCHAIN", System.getenv("TERMLAND_RUST_TOOLCHAIN") ?: "nightly")
         if (sdk != null) put("ANDROID_HOME", sdk)
         if (ndk != null) put("ANDROID_NDK_HOME", ndk)
     }
