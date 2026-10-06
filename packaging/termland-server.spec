@@ -67,10 +67,20 @@ BuildRequires:  wayland-devel
 BuildRequires:  wayland-protocols-devel
 
 # ─── Runtime dependencies ────────────────────────────────────────────────────
-# Headless Wayland compositors — at least one required:
-#   labwc: multi-window desktop sessions (recommended)
-#   cage:  single-app kiosk mode
+# Headless Wayland compositors. Desktop sessions - the default mode - always
+# run labwc; there is no fallback to cage, which only serves --mode app:<cmd>.
+# This used to be "Requires: (labwc or cage)", which a machine that already
+# had cage satisfied without labwc: the package installed, and every desktop
+# session then failed to start.
+%if 0%{?fedora}
+Requires:       labwc
+Recommends:     cage
+%else
+# EPEL packages no labwc (8, 9, 10) and cage only in 10, so requiring labwc
+# would make the package uninstallable there rather than desktop-less. Keep
+# the old either-or; desktop mode needs a labwc built or installed locally.
 Requires:       (labwc or cage)
+%endif
 
 # FFmpeg runtime (AV1 encoder backends: QSV, NVENC, VA-API, SVT-AV1)
 Requires:       (ffmpeg-libs or libavcodec-free)
@@ -180,13 +190,36 @@ if [ ! -s %{_sysconfdir}/pki/termland/cert.pem ] || [ ! -s %{_sysconfdir}/pki/te
     fi
 fi
 
+# Activate the sshd drop-in, which registers the "termland" subsystem: sshd
+# only reads its configuration at start and on reload, so until then every
+# client gets "subsystem request failed". Reload, never restart, and only if
+# the whole configuration validates - a reload with a broken config can leave
+# sshd down, on a machine that may only be reachable over ssh. Existing ssh
+# sessions are separate processes and survive a reload. Done on upgrades too,
+# so an install that missed it is repaired. Skipped when sshd isn't running
+# (build roots, containers).
+sshd_reloaded=0
+if systemctl is-active --quiet sshd.service 2>/dev/null; then
+    if %{_sbindir}/sshd -t >/dev/null 2>&1; then
+        systemctl reload sshd.service >/dev/null 2>&1 && sshd_reloaded=1
+    else
+        echo "  Note: 'sshd -t' reports a configuration problem, so sshd was not"
+        echo "  reloaded and the termland ssh subsystem is not active yet. Fix the"
+        echo "  sshd configuration, then: systemctl reload sshd"
+    fi
+fi
+
 # Hint about setup
 echo ""
 echo "  Termland server installed. Two ways to run:"
 echo ""
 echo "  1) SSH subsystem (recommended — auto-configured):"
 echo "     An sshd drop-in was installed at /etc/ssh/sshd_config.d/50-termland.conf"
-echo "     Restart sshd to activate: systemctl restart sshd"
+if [ "$sshd_reloaded" = 1 ]; then
+echo "     sshd was reloaded, so it is active now."
+else
+echo "     Activate it with: systemctl reload sshd"
+fi
 echo "     Clients connect with: termland-client --ssh user@host"
 echo ""
 echo "  2) Standalone TCP service (with TLS + PAM auth):"
@@ -200,6 +233,11 @@ echo ""
 
 %postun
 %systemd_postun_with_restart termland-server.service
+# On removal the drop-in is gone; reload so sshd stops offering a subsystem
+# whose binary no longer exists. Same guard as in %%post.
+if [ $1 -eq 0 ] && systemctl is-active --quiet sshd.service 2>/dev/null; then
+    %{_sbindir}/sshd -t >/dev/null 2>&1 && systemctl reload sshd.service >/dev/null 2>&1 || :
+fi
 
 %files
 %license LICENSE

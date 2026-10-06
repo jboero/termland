@@ -174,6 +174,22 @@ impl AsyncRead for SshStdout {
     }
 }
 
+/// What to report for an ssh that failed with `last` as its final line of
+/// stderr. ssh's own words, plus a pointer for the one failure that is about
+/// termland rather than ssh: sshd answering "subsystem request failed" means
+/// it has no `termland` subsystem - termland-server is not installed there,
+/// or sshd has not been reloaded since it was.
+fn ssh_failure_message(last: &str) -> String {
+    if last.contains("subsystem request failed") {
+        format!(
+            "ssh: {last} - sshd on that host has no termland subsystem. Install \
+             termland-server there, then reload sshd (systemctl reload sshd)."
+        )
+    } else {
+        format!("ssh: {last}")
+    }
+}
+
 /// Spawn `ssh -s <server> termland`. ssh's stderr is still passed through to
 /// ours, as before; a background task also keeps its last line and reaps the
 /// process, which is what `SshStdout` reports if ssh fails.
@@ -211,7 +227,7 @@ fn spawn_ssh_transport(program: &str, args: &[String]) -> Result<Box<dyn Io>> {
         let result = match child.wait().await {
             Ok(status) if status.success() => Ok(()),
             Ok(status) if last.is_empty() => Err(format!("ssh failed ({status})")),
-            Ok(_) => Err(format!("ssh: {last}")),
+            Ok(_) => Err(ssh_failure_message(&last)),
             Err(e) => Err(format!("ssh: {e}")),
         };
         let _ = exit_tx.send(Some(result));
@@ -1213,6 +1229,19 @@ mod transport_tests {
         let mut buf = Vec::new();
         let err = io.read_to_end(&mut buf).await.expect_err("ssh failed, so EOF must be an error");
         assert_eq!(err.to_string(), "ssh: Host key verification failed.");
+    }
+
+    #[tokio::test]
+    async fn a_missing_subsystem_says_how_to_fix_it() {
+        let mut io = spawn_ssh_transport(
+            "sh",
+            &sh("echo 'subsystem request failed on channel 0' >&2; exit 1"),
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let err = io.read_to_end(&mut buf).await.unwrap_err().to_string();
+        assert!(err.starts_with("ssh: subsystem request failed on channel 0"), "got {err:?}");
+        assert!(err.contains("reload sshd"), "got {err:?}");
     }
 
     #[tokio::test]
