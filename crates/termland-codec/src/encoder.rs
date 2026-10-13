@@ -731,7 +731,7 @@ pub fn probe_best_encoder(
 
     for backend in candidates(allowed) {
         tracing::info!("Probing video encoder: {backend}...");
-        match FfmpegVideoEncoder::new(backend, config) {
+        match crate::quiet_ffmpeg(|| FfmpegVideoEncoder::new(backend, config)) {
             Ok(enc) => {
                 tracing::info!("Selected video encoder: {backend} (codec {})", backend.codec());
                 return Ok(Box::new(enc));

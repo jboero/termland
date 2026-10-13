@@ -259,7 +259,7 @@ impl VideoDecoder {
                 }
             }
             tracing::info!("Probing video decoder: {backend}...");
-            match Self::open_codec(*backend) {
+            match crate::quiet_ffmpeg(|| Self::open_codec(*backend)) {
                 Ok(decoder) => {
                     tracing::info!("Selected video decoder: {backend}");
                     return Ok(Self {
@@ -311,6 +311,17 @@ impl VideoDecoder {
     /// On repeated decode errors with an unconfirmed backend, automatically
     /// falls back to the next decoder in the priority list.
     pub fn decode(&mut self, data: &[u8]) -> Result<(u32, u32, Vec<u32>), DecoderError> {
+        // Until a frame has decoded, a backend that opened may still turn out
+        // not to work here (QSV without an Intel GPU), and decode() falls back
+        // to the next: the same probing noise as opening one.
+        if self.confirmed_working {
+            self.decode_packet(data)
+        } else {
+            crate::quiet_ffmpeg(|| self.decode_packet(data))
+        }
+    }
+
+    fn decode_packet(&mut self, data: &[u8]) -> Result<(u32, u32, Vec<u32>), DecoderError> {
         let packet = ffmpeg_next::Packet::copy(data);
 
         let send_result = self.decoder.send_packet(&packet);
@@ -478,7 +489,9 @@ impl VideoDecoder {
 
     /// Mark the current backend as failed and retry with the next one.
     fn fallback_and_retry(&mut self, data: &[u8], reason: String) -> Result<(u32, u32, Vec<u32>), DecoderError> {
-        tracing::warn!("Decoder {} failed ({}), trying next backend", self.backend, reason);
+        // Only reached before this backend has decoded anything: still probing,
+        // and expected wherever its hardware is absent, so not a warning.
+        tracing::info!("Decoder {} does not work here ({}), trying the next one", self.backend, reason);
         let mut failed = std::mem::take(&mut self.failed_backends);
         failed.push(self.backend);
         let next_index = self.backend_index + 1;
