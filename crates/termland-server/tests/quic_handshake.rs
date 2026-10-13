@@ -173,3 +173,78 @@ async fn quic_hello_hello_ack_round_trip() {
     // guarantees cleanup on early-return/panic paths too.
     let _ = ack;
 }
+
+/// The server must keep an idle QUIC connection alive. When nothing on screen
+/// changes, a damage-capturing server sends no video, and nothing else need
+/// cross the connection; without keep-alives it would hit the idle timeout
+/// and drop. The client here lowers the timeout to 8 s (QUIC uses the lower
+/// of the two peers'), then sends nothing for 12 s.
+#[tokio::test]
+async fn quic_connection_survives_an_idle_period() {
+    let port: u16 = 27869;
+
+    let bin = env!("CARGO_BIN_EXE_termland-server");
+    let child = Command::new(bin)
+        .args(["--bind", "127.0.0.1", "--port", "27868",
+               "--quic", "--quic-port", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn termland-server");
+    let mut guard = ChildGuard(child);
+
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+        .expect("rustls config usable for QUIC");
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(8).try_into().unwrap()));
+    client_config.transport_config(Arc::new(transport));
+
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+        .expect("bind local QUIC socket");
+    endpoint.set_default_client_config(client_config);
+    let connection = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        endpoint
+            .connect(format!("127.0.0.1:{port}").parse().unwrap(), "localhost")
+            .expect("start QUIC connect"),
+    )
+    .await
+    .expect("QUIC handshake timed out")
+    .expect("QUIC handshake failed");
+
+    let (send, recv) = connection.open_bi().await.expect("open bidi stream");
+    let mut framed = Framed::new(tokio::io::join(recv, send), TermlandCodec);
+    framed
+        .send(Message::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "quic-idle-test".into(),
+        }))
+        .await
+        .expect("send Hello");
+    match tokio::time::timeout(std::time::Duration::from_secs(10), framed.next()).await {
+        Ok(Some(Ok(Message::HelloAck(_)))) => {}
+        other => panic!("expected HelloAck, got {other:?}"),
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+    assert_eq!(
+        connection.close_reason(),
+        None,
+        "the connection was closed while idle: the server sends no keep-alives",
+    );
+
+    endpoint.close(0u32.into(), b"test done");
+    let _ = guard.0.kill();
+    let _ = guard.0.wait();
+}
