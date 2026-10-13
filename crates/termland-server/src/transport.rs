@@ -880,6 +880,10 @@ where
                             }
                         }
                     }
+                } else {
+                    // The sending thread has exited. Without this, recv()
+                    // returns None at once on every poll and the loop spins.
+                    audio_rx = None;
                 }
             }
 
@@ -898,6 +902,10 @@ where
                         tracing::error!("Failed to send clipboard: {e}");
                         break;
                     }
+                } else {
+                    // The sending thread has exited. Without this, recv()
+                    // returns None at once on every poll and the loop spins.
+                    clip_rx = None;
                 }
             }
 
@@ -912,6 +920,10 @@ where
                         tracing::error!("Failed to send cursor update: {e}");
                         break;
                     }
+                } else {
+                    // The sending thread has exited. Without this, recv()
+                    // returns None at once on every poll and the loop spins.
+                    cursor_rx = None;
                 }
             }
 
