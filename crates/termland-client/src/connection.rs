@@ -613,6 +613,9 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                 encoder_extra_params: params.encoder_extra_params,
                 supported_codecs,
                 supported_audio_codecs,
+                // This loop waits on input directly, so it does not depend
+                // on video frames arriving to wake it.
+                video_may_idle: true,
             })).await?;
         }
         None => {
@@ -628,6 +631,9 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                 encoder_extra_params: params.encoder_extra_params,
                 supported_codecs,
                 supported_audio_codecs,
+                // This loop waits on input directly, so it does not depend
+                // on video frames arriving to wake it.
+                video_may_idle: true,
             })).await?;
         }
     }
@@ -672,11 +678,18 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
     let mut bytes_since_report: u64 = 0;
     let mut last_report = std::time::Instant::now();
     let report_interval = std::time::Duration::from_millis(1000);
+    // A command already taken off client_rx by the select! below.
+    let mut next_cmd: Option<ClientCommand> = None;
+    let mut commands_open = true;
 
     loop {
         // Drain input commands first - must not be starved by video
         loop {
-            match client_rx.try_recv() {
+            let cmd = match next_cmd.take() {
+                Some(cmd) => Ok(cmd),
+                None => client_rx.try_recv(),
+            };
+            match cmd {
                 Ok(ClientCommand::Disconnect) => {
                     let _ = framed.send(Message::SessionEnd(SessionEnd { reason: "client disconnect".into() })).await;
                     return Ok(LoopExit::ClientQuit);
@@ -766,6 +779,15 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                         tracing::info!("Connection closed (EOF)");
                         return Ok(LoopExit::ConnectionLost);
                     }
+                }
+            }
+            // Wake for input as soon as it arrives. While the server sends
+            // no video for an idle screen (video_may_idle), nothing else wakes
+            // this loop, and input would wait for the 100 ms tick below.
+            cmd = client_rx.recv(), if commands_open => {
+                match cmd {
+                    Some(cmd) => next_cmd = Some(cmd),
+                    None => commands_open = false,
                 }
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}

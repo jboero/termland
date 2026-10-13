@@ -125,6 +125,7 @@ auth state only, never from anything the client sends in `SessionCreate`.
 | `encoder_extra_params` | `Option<String>` | Passed verbatim as `svtav1-params` |
 | `supported_codecs` | `Vec<VideoCodec>` | Client's decodable video codecs, in preference order |
 | `supported_audio_codecs` | `Vec<AudioCodec>` | Client's decodable audio codecs |
+| `video_may_idle` | `bool` | Client copes with no video while the screen is idle; default `false` |
 
 `desktop_shell` and `App.command` are **client-supplied strings that the server
 executes**. They are validated by `validate_shell_command` before any shell use.
@@ -133,6 +134,15 @@ Treat that validation as security-critical.
 `SessionAttach` resumes an existing session by `session_id`, carrying the same
 quality/encoder/codec fields — a session can be resumed by a different client
 build than created it, so capabilities are re-advertised rather than remembered.
+
+`video_may_idle` exists because the server captures on damage: it encodes a
+frame only when something on screen changed (unless started with
+`--capture-mode full`). The video stream itself is unchanged, but it can go
+quiet. A client that sets `video_may_idle` gets no frames at all while the
+screen is idle. A client that omits it predates damage capture and may have
+relied on frames arriving (the desktop client, for one, forwarded input when a
+frame woke it, or otherwise on a 100 ms tick), so it is still sent a frame about
+once a second.
 
 `SessionReady` closes either path:
 

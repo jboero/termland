@@ -78,6 +78,7 @@ fn canonical_messages() -> Vec<(&'static str, Message)> {
                 encoder_extra_params: None,
                 supported_codecs: vec![VideoCodec::Av1, VideoCodec::Vp9],
                 supported_audio_codecs: vec![AudioCodec::Opus],
+                video_may_idle: false,
             }),
         ),
         (
@@ -91,6 +92,7 @@ fn canonical_messages() -> Vec<(&'static str, Message)> {
                 encoder_extra_params: None,
                 supported_codecs: vec![VideoCodec::Av1],
                 supported_audio_codecs: vec![AudioCodec::Opus],
+                video_may_idle: false,
             }),
         ),
         (

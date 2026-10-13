@@ -316,6 +316,7 @@ mod tests {
             encoder_extra_params: None,
             supported_codecs: p.advertised_codecs(),
             supported_audio_codecs: termland_protocol::AudioCodec::all_preferred(),
+            video_may_idle: false,
         });
 
         let mut codec = TermlandCodec;

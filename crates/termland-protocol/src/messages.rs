@@ -272,6 +272,13 @@ pub struct SessionCreate {
     /// `AudioCodec::legacy_default`. Ignored when `audio` is false.
     #[serde(default = "AudioCodec::legacy_default")]
     pub supported_audio_codecs: Vec<AudioCodec>,
+    /// The client copes with video that stops while nothing on screen
+    /// changes. A server that captures on damage then sends no frames at all
+    /// for an idle screen. An omitted field (client predating this) means
+    /// false: such a client may treat a silent stream as stalled, so it is
+    /// still sent a frame about once a second.
+    #[serde(default)]
+    pub video_may_idle: bool,
 }
 
 fn default_quality() -> u8 { 75 }
@@ -344,6 +351,9 @@ pub struct SessionAttach {
     /// the one that created it.
     #[serde(default = "AudioCodec::legacy_default")]
     pub supported_audio_codecs: Vec<AudioCodec>,
+    /// See `SessionCreate::video_may_idle`.
+    #[serde(default)]
+    pub video_may_idle: bool,
 }
 
 /// Client -> server: permanently close (terminate) a persistent session.
@@ -809,6 +819,7 @@ mod audio_codec_tests {
             encoder_extra_params: None,
             supported_codecs: VideoCodec::all_preferred(),
             supported_audio_codecs: vec![AudioCodec::Opus],
+            video_may_idle: false,
         };
 
         let parsed: SessionCreate = reencode(&create);
@@ -845,6 +856,7 @@ mod audio_codec_tests {
             encoder_extra_params: None,
             supported_codecs: vec![VideoCodec::Av1],
             supported_audio_codecs: vec![AudioCodec::Opus],
+            video_may_idle: false,
         };
 
         let old: OldSessionCreate = reencode(&new);
@@ -852,6 +864,76 @@ mod audio_codec_tests {
         assert_eq!(old.height, 1080);
         assert!(old.audio);
         assert_eq!(old.supported_codecs, vec![VideoCodec::Av1]);
+    }
+
+    /// A client predating `video_may_idle` must be read as not coping with a
+    /// silent video stream, so the server keeps sending it frames when idle.
+    #[test]
+    fn client_omitting_video_may_idle_is_not_sent_an_idle_stream() {
+        #[derive(Serialize)]
+        struct OldSessionCreate {
+            mode: SessionMode,
+            width: u32,
+            height: u32,
+            audio: bool,
+            supported_codecs: Vec<VideoCodec>,
+            supported_audio_codecs: Vec<AudioCodec>,
+        }
+        #[derive(Serialize)]
+        struct OldSessionAttach {
+            session_id: String,
+            audio: bool,
+            supported_codecs: Vec<VideoCodec>,
+        }
+
+        let create: SessionCreate = reencode(&OldSessionCreate {
+            mode: SessionMode::Desktop,
+            width: 1920,
+            height: 1080,
+            audio: false,
+            supported_codecs: vec![VideoCodec::Av1],
+            supported_audio_codecs: vec![AudioCodec::Opus],
+        });
+        assert!(!create.video_may_idle);
+
+        let attach: SessionAttach = reencode(&OldSessionAttach {
+            session_id: "s123".into(),
+            audio: false,
+            supported_codecs: vec![VideoCodec::Av1],
+        });
+        assert!(!attach.video_may_idle);
+    }
+
+    /// New client -> OLD server: `video_may_idle` is skipped, and the session
+    /// is created as before (with an old server's continuous video).
+    #[test]
+    fn old_server_ignores_video_may_idle() {
+        #[derive(Deserialize)]
+        struct OldSessionCreate {
+            width: u32,
+            supported_audio_codecs: Vec<AudioCodec>,
+        }
+
+        let new = SessionCreate {
+            mode: SessionMode::Desktop,
+            width: 1920,
+            height: 1080,
+            audio: false,
+            quality: 75,
+            desktop_shell: None,
+            encoder_preset: None,
+            encoder_crf: None,
+            encoder_extra_params: None,
+            supported_codecs: vec![VideoCodec::Av1],
+            supported_audio_codecs: vec![AudioCodec::Opus],
+            video_may_idle: true,
+        };
+
+        let old: OldSessionCreate = reencode(&new);
+        assert_eq!(old.width, 1920);
+        assert_eq!(old.supported_audio_codecs, vec![AudioCodec::Opus]);
+        let parsed: SessionCreate = reencode(&new);
+        assert!(parsed.video_may_idle, "an explicit true must survive the round trip");
     }
 
     /// New server -> OLD client, the mirror of the above: an old client must

@@ -14,4 +14,5 @@ pub use session::{Compositor, CompositorConfig, CompositorError, SessionMode};
 pub use input::InputInjector;
 pub use backend::validate_shell_command;
 pub use cursor_capture::{CursorCapture, CursorCaptureError, CursorCapturer};
+pub use screencopy::{DamageRect, ScreenFrame};
 pub use toplevels::{Toplevel, ToplevelError, ToplevelWatcher};

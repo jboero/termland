@@ -84,6 +84,12 @@ struct Args {
     #[arg(long = "webtransport-origin", value_name = "ORIGIN")]
     webtransport_origins: Vec<String>,
 
+    /// When to capture and encode a frame: on damage (only when something on
+    /// screen changed), or full (every frame interval, the behaviour before
+    /// damage tracking).
+    #[arg(long, value_enum, default_value_t = transport::CaptureMode::Damage)]
+    capture_mode: transport::CaptureMode,
+
     /// Generate shell completion script and exit.
     /// Usage: termland-server --completions bash > /etc/bash_completion.d/termland-server
     #[arg(long, value_name = "SHELL")]
@@ -106,6 +112,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    transport::set_capture_mode(args.capture_mode);
 
     if let Some(shell) = args.completions {
         clap_complete::generate(

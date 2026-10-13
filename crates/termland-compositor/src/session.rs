@@ -211,6 +211,24 @@ impl Compositor {
             .map_err(|e| CompositorError::CaptureError(e.to_string()))
     }
 
+    /// Capture the next frame that differs from the previous capture, waiting
+    /// at most `timeout`. `Ok(None)` means nothing changed in that time.
+    /// See [`crate::screencopy::ScreenCapturer::capture_damaged`].
+    pub fn capture_damaged(
+        &mut self,
+        overlay_cursor: bool,
+        timeout: std::time::Duration,
+    ) -> Result<Option<crate::ScreenFrame>, CompositorError> {
+        let capturer = self
+            .capturer
+            .as_mut()
+            .ok_or_else(|| CompositorError::CaptureError("capturer not initialized".into()))?;
+
+        capturer
+            .capture_damaged(overlay_cursor, timeout)
+            .map_err(|e| CompositorError::CaptureError(e.to_string()))
+    }
+
     /// Capture the current pointer cursor bitmap (image + hotspot +
     /// visibility), independent of the video frame. Used for client-side
     /// cursor rendering: see `CursorModeMsg` in termland-protocol for why
