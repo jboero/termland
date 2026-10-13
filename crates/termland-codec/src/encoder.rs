@@ -322,6 +322,9 @@ impl FfmpegVideoEncoder {
                 opts.set("preset", preset);
                 opts.set("tune", "ull");
                 opts.set("rc", "cbr");
+                // Without this a forced keyframe comes out as a plain intra
+                // frame, which a decoder cannot start from.
+                opts.set("forced-idr", "1");
                 tracing::info!("NVENC tuning: preset={preset}");
             }
             EncoderBackend::AmdAmf | EncoderBackend::AmdVaapi => {
@@ -359,6 +362,9 @@ impl FfmpegVideoEncoder {
                 opts.set("preset", preset);
                 opts.set("tune", "ull");
                 opts.set("rc", "cbr");
+                // Without this a forced keyframe comes out as a plain intra
+                // frame, which a decoder cannot start from.
+                opts.set("forced-idr", "1");
                 tracing::info!("NVENC HEVC tuning: preset={preset}");
             }
             EncoderBackend::H265Amf | EncoderBackend::H265Vaapi | EncoderBackend::H265V4l2m2m => {
@@ -373,6 +379,8 @@ impl FfmpegVideoEncoder {
                 opts.set("preset", preset);
                 let crf = config.crf.map(|c| c.to_string()).unwrap_or_else(|| "23".to_string());
                 opts.set("crf", &crf);
+                // As for NVENC: otherwise a forced keyframe is a non-IDR intra frame.
+                opts.set("forced-idr", "1");
                 tracing::info!("libx265 tuning: preset={preset} crf={crf}");
             }
 
@@ -392,6 +400,9 @@ impl FfmpegVideoEncoder {
                 opts.set("preset", preset);
                 opts.set("tune", "ull");
                 opts.set("rc", "cbr");
+                // Without this a forced keyframe comes out as a plain intra
+                // frame, which a decoder cannot start from.
+                opts.set("forced-idr", "1");
                 tracing::info!("NVENC H.264 tuning: preset={preset}");
             }
             EncoderBackend::H264Amf | EncoderBackend::H264Vaapi | EncoderBackend::H264V4l2m2m => {
@@ -873,6 +884,53 @@ mod tests {
                 "{codec} has only {} backend(s), so a failure has no fallback",
                 picked.len(),
             );
+        }
+    }
+
+    /// A forced keyframe must come out as one the decoder can start from.
+    ///
+    /// The server forces one after a resize, and anything that later asks for
+    /// a keyframe on demand (a client attaching mid-stream) depends on it too.
+    /// NVENC, left to its defaults, honours the request with a plain intra
+    /// frame that is not a keyframe; `forced-idr` fixes that. The GOP is
+    /// longer than the run, so any keyframe after the first was forced.
+    ///
+    /// Runs every backend this machine can open and skips the rest, so on a
+    /// CI runner without a GPU it covers the software encoders only.
+    #[test]
+    fn forced_keyframe_is_a_real_keyframe() {
+        let (w, h) = (320u32, 240u32);
+        let config = EncoderConfig {
+            width: w,
+            height: h,
+            fps: 30,
+            bitrate_kbps: 1000,
+            keyframe_interval: 300,
+            ..Default::default()
+        };
+        let mut tested = 0;
+        for &backend in ENCODER_PRIORITY {
+            let Ok(mut encoder) = FfmpegVideoEncoder::new(backend, &config) else {
+                continue;
+            };
+            let mut keyframes = 0;
+            for i in 0..12u64 {
+                // Vary the content so no encoder can treat frames as repeats.
+                let rgba = vec![(i * 16) as u8; (w * h * 4) as usize];
+                let packets = encoder
+                    .encode_frame(&rgba, i * 33_000, i == 0 || i == 6)
+                    .unwrap_or_else(|e| panic!("{backend}: frame {i}: {e}"));
+                keyframes += packets.iter().filter(|p| p.keyframe).count();
+            }
+            let flushed = encoder
+                .flush()
+                .unwrap_or_else(|e| panic!("{backend}: flush: {e}"));
+            keyframes += flushed.iter().filter(|p| p.keyframe).count();
+            assert_eq!(keyframes, 2, "{backend}: the keyframe forced at frame 6 was not a keyframe");
+            tested += 1;
+        }
+        if tested == 0 {
+            eprintln!("skipping: no video encoder in this environment");
         }
     }
 

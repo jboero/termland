@@ -1244,8 +1244,11 @@ fn capture_thread(
 
         match compositor.capture_frame(overlay_cursor.load(Ordering::Relaxed)) {
             Ok((w, h, rgba)) => {
-                // Rebuild the encoder if the captured frame size changed.
-                if (w, h) != encoder_dims {
+                // Rebuild the encoder if the captured frame size changed, and
+                // force a keyframe. A fresh encoder starts on one anyway, but
+                // this must be decided before encoder_dims is updated below.
+                let dims_changed = (w, h) != encoder_dims;
+                if dims_changed {
                     tracing::info!("Capture dims changed {}x{} → {w}x{h}, reinitializing encoder",
                         encoder_dims.0, encoder_dims.1);
                     // Flush the old encoder before dropping it. This sends
@@ -1261,10 +1264,7 @@ fn capture_thread(
                     .unwrap_or_default()
                     .as_micros() as u64;
 
-                // Force a keyframe when dimensions change
-                let force_keyframe = (w, h) != encoder_dims;
-
-                let frames: Vec<CapturedFrame> = match video_encoder.encode_frame(&rgba, timestamp_us, force_keyframe) {
+                let frames: Vec<CapturedFrame> = match video_encoder.encode_frame(&rgba, timestamp_us, dims_changed) {
                     Ok(packets) if !packets.is_empty() => {
                         packets.into_iter().map(|p| {
                             let keyframe_str = if p.keyframe { "keyframe" } else { "frame" };
