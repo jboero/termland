@@ -92,6 +92,8 @@ pub struct ConnectParams {
     pub width: u32,
     pub height: u32,
     pub quality: u8,
+    /// Explicit target bitrate, overriding `quality` (`--bitrate`).
+    pub bitrate_kbps: Option<u32>,
     pub audio: bool,
     pub ssh_opts: Vec<String>,
     pub tls: bool,
@@ -616,6 +618,7 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                 // This loop waits on input directly, so it does not depend
                 // on video frames arriving to wake it.
                 video_may_idle: true,
+                bitrate_kbps: params.bitrate_kbps,
             })).await?;
         }
         None => {
@@ -634,6 +637,7 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                 // This loop waits on input directly, so it does not depend
                 // on video frames arriving to wake it.
                 video_may_idle: true,
+                bitrate_kbps: params.bitrate_kbps,
             })).await?;
         }
     }
@@ -1220,6 +1224,7 @@ mod transport_tests {
             width: 640,
             height: 480,
             quality: 50,
+            bitrate_kbps: None,
             audio: false,
             ssh_opts: Vec::new(),
             tls: false,

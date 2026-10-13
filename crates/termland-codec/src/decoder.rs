@@ -669,7 +669,7 @@ mod tests {
             width: w,
             height: h,
             fps: 30,
-            bitrate_kbps: 1000,
+            rate: crate::encoder::RateTarget::Kbps(1000),
             keyframe_interval: 300,
             ..Default::default()
         };

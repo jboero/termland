@@ -28,7 +28,7 @@ fn main() {
         width: width as u32,
         height: height as u32,
         fps: 30,
-        bitrate_kbps: 8000,
+        rate: RateTarget::Kbps(8000),
         keyframe_interval: 30,
         ..Default::default()
     };

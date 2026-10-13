@@ -356,6 +356,7 @@ impl App {
             width: phys_w,
             height: phys_h,
             quality: self.args.quality,
+            bitrate_kbps: self.args.bitrate,
             audio: self.args.audio,
             ssh_opts: self.args.ssh_opt.clone(),
             tls: self.args.tls || self.args.accept_invalid_certs,

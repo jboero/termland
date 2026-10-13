@@ -161,6 +161,7 @@ impl WebClient {
             // requires, so the browser path does not carry audio yet.
             supported_audio_codecs: Vec::<AudioCodec>::new(),
             video_may_idle: false,
+            bitrate_kbps: None,
         }));
     }
 
@@ -179,6 +180,7 @@ impl WebClient {
             supported_codecs: codecs,
             supported_audio_codecs: Vec::<AudioCodec>::new(),
             video_may_idle: false,
+            bitrate_kbps: None,
         }));
     }
 
@@ -382,6 +384,7 @@ fn render_sessions(
                     supported_codecs: codecs.clone(),
                     supported_audio_codecs: Vec::<AudioCodec>::new(),
                     video_may_idle: false,
+                    bitrate_kbps: None,
                 }));
             }
         });

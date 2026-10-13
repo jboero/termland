@@ -416,7 +416,22 @@ impl eframe::App for ManagerApp {
                     ui.end_row();
 
                     ui.label("Quality (1-100)");
-                    ui.add(egui::Slider::new(&mut edit.profile.quality, 1..=100));
+                    ui.add_enabled(
+                        edit.profile.bitrate_kbps.is_none(),
+                        egui::Slider::new(&mut edit.profile.quality, 1..=100),
+                    );
+                    ui.end_row();
+
+                    ui.label("Fixed bitrate");
+                    ui.horizontal(|ui| {
+                        let mut fixed = edit.profile.bitrate_kbps.is_some();
+                        if ui.checkbox(&mut fixed, "").changed() {
+                            edit.profile.bitrate_kbps = fixed.then_some(1000);
+                        }
+                        if let Some(kbps) = edit.profile.bitrate_kbps.as_mut() {
+                            ui.add(egui::DragValue::new(kbps).range(50..=100_000).suffix(" kbps"));
+                        }
+                    });
                     ui.end_row();
 
                     ui.label("Mode");
@@ -584,6 +599,7 @@ fn connect_params_for_profile(p: &Profile) -> ConnectParams {
         width: p.width,
         height: p.height,
         quality: p.quality,
+        bitrate_kbps: p.bitrate_kbps,
         audio: false,
         ssh_opts: p.ssh_opts.clone(),
         tls: p.tls || p.accept_invalid_certs,
@@ -641,6 +657,10 @@ fn client_args(profile: &Profile, extra: &[String]) -> Vec<String> {
     args.push(profile.mode.clone());
     args.push("--quality".into());
     args.push(profile.quality.to_string());
+    if let Some(kbps) = profile.bitrate_kbps {
+        args.push("--bitrate".into());
+        args.push(kbps.to_string());
+    }
     if let Some(c) = &profile.codec {
         args.push("--codec".into());
         args.push(c.clone());

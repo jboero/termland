@@ -211,6 +211,7 @@ async fn start_session(port: u16) -> (ChildGuard, SessionGuard, String, i32) {
             supported_codecs: VideoCodec::all_preferred(),
             supported_audio_codecs: AudioCodec::all_preferred(),
             video_may_idle: false,
+            bitrate_kbps: None,
         }))
         .await
         .expect("send SessionCreate");
@@ -398,6 +399,7 @@ async fn an_auto_detected_plasma_shell_is_fully_reaped() {
             supported_codecs: VideoCodec::all_preferred(),
             supported_audio_codecs: AudioCodec::all_preferred(),
             video_may_idle: false,
+            bitrate_kbps: None,
         }))
         .await
         .expect("send SessionCreate");

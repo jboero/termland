@@ -75,6 +75,11 @@ pub struct Args {
     #[arg(short, long, default_value = "75")]
     pub quality: u8,
 
+    /// Target video bitrate in kbps, instead of deriving one from --quality.
+    /// A mostly still desktop needs little: a few hundred kbps is usable.
+    #[arg(long, value_name = "KBPS")]
+    pub bitrate: Option<u32>,
+
     /// Force a specific video codec instead of negotiating the best available.
     /// When set, the server MUST encode with this codec (falling back to a
     /// software encoder for it if no hardware is available); the session fails
@@ -231,6 +236,7 @@ fn main() -> Result<()> {
             width: args.width,
             height: args.height,
             quality: args.quality,
+            bitrate_kbps: args.bitrate,
             audio: false,
             ssh_opts: args.ssh_opt.clone(),
             tls: args.tls || args.accept_invalid_certs,

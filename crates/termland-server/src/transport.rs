@@ -392,6 +392,7 @@ where
         supported_codecs,
         supported_audio_codecs,
         video_may_idle,
+        bitrate_kbps,
         audio,
         start_kind,
         is_new,
@@ -451,6 +452,7 @@ where
                 sc.supported_audio_codecs
             };
             video_may_idle = sc.video_may_idle;
+            bitrate_kbps = sc.bitrate_kbps;
             audio = sc.audio;
             start_kind = StartKind::Create { log_path: crate::registry::log_path(&id) };
             is_new = true;
@@ -513,6 +515,7 @@ where
                 sa.supported_codecs
             };
             video_may_idle = sa.video_may_idle;
+            bitrate_kbps = sa.bitrate_kbps;
             supported_audio_codecs = if sa.supported_audio_codecs.is_empty() {
                 termland_protocol::AudioCodec::legacy_default()
             } else {
@@ -563,7 +566,7 @@ where
     let capture_handle = std::thread::spawn(move || {
         capture_thread(width, height, quality, mode, desktop_shell,
                        encoder_preset, encoder_crf, encoder_extra_params,
-                       capture_codecs, video_may_idle, start_kind, capture_audio_sink, run_as,
+                       capture_codecs, video_may_idle, bitrate_kbps, start_kind, capture_audio_sink, run_as,
                        overlay_cursor_capture, resize_rx, frame_tx, display_tx, stop_rx);
     });
 
@@ -1097,7 +1100,7 @@ enum SessionOutcome {
 
 /// Encoder tuning collected once per session from the client.
 struct EncoderTuning {
-    bitrate_kbps: u32,
+    rate: termland_codec::RateTarget,
     preset: Option<String>,
     crf: Option<u8>,
     extra_svt_params: Option<String>,
@@ -1109,7 +1112,7 @@ impl EncoderTuning {
             width,
             height,
             fps: 30,
-            bitrate_kbps: self.bitrate_kbps,
+            rate: self.rate,
             keyframe_interval: 30,
             preset: self.preset.clone(),
             crf: self.crf,
@@ -1174,6 +1177,10 @@ fn capture_mode() -> CaptureMode {
     CAPTURE_MODE.get().copied().unwrap_or(CaptureMode::Damage)
 }
 
+/// Bounds on a client-supplied bitrate, in kbps.
+const MIN_BITRATE_KBPS: u32 = 50;
+const MAX_BITRATE_KBPS: u32 = 100_000;
+
 /// Longest a wait for damage blocks before the capture loop comes round to
 /// check for stop and resize requests. Also bounds how late a legacy idle frame is.
 const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -1205,6 +1212,8 @@ fn capture_thread(
     // The client copes with no frames while the screen is idle
     // (`SessionCreate::video_may_idle`).
     video_may_idle: bool,
+    // Explicit target bitrate (`SessionCreate::bitrate_kbps`), overriding quality.
+    bitrate_kbps: Option<u32>,
     start_kind: StartKind,
     // Sink that session applications should play to, exported as
     // `PULSE_SINK`. `None` when the client did not request audio.
@@ -1254,12 +1263,16 @@ fn capture_thread(
         compositor.runtime_dir().to_path_buf(),
     ));
 
-    // Map quality 1-100 to bitrate. quality 100 → 15 Mbps, 50 → 7.5 Mbps, 1 → 500 kbps
-    let bitrate_kbps = (quality as u32 * 150).max(500);
-    tracing::info!("Video quality={quality} → bitrate={bitrate_kbps}kbps");
+    // An explicit bitrate wins; otherwise each encoder maps the quality to its
+    // own rate control (see RateTarget), which it logs once chosen.
+    let rate = match bitrate_kbps {
+        Some(kbps) => termland_codec::RateTarget::Kbps(kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)),
+        None => termland_codec::RateTarget::Quality(quality),
+    };
+    tracing::info!("Video rate target: {rate:?}");
 
     let tuning = EncoderTuning {
-        bitrate_kbps,
+        rate,
         preset: encoder_preset,
         crf: encoder_crf,
         extra_svt_params: encoder_extra_params,

@@ -162,17 +162,92 @@ impl std::fmt::Display for EncoderBackend {
     }
 }
 
+/// How much the encoder may spend on the video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateTarget {
+    /// The session's quality, 1-100. Each backend turns it into its own rate
+    /// control: a bitrate scaled for the codec, or for SVT-AV1 a CRF.
+    Quality(u8),
+    /// A bitrate the client asked for explicitly, in kbps.
+    Kbps(u32),
+}
+
+impl RateTarget {
+    /// The bitrate for a backend whose rate control is bitrate-based.
+    ///
+    /// AV1 needs far less than the older codecs for the same picture, and a
+    /// remote desktop is mostly still images, so quality 100 is 1.5 Mbps for
+    /// AV1 against 15 Mbps for the rest.
+    pub fn kbps(self, codec: VideoCodec) -> u32 {
+        match self {
+            RateTarget::Kbps(kbps) => kbps,
+            RateTarget::Quality(q) => {
+                let q = u32::from(q.clamp(1, 100));
+                match codec {
+                    VideoCodec::Av1 => (q * 15).max(MIN_AV1_KBPS),
+                    _ => (q * 150).max(500),
+                }
+            }
+        }
+    }
+}
+
+/// Lowest bitrate a quality setting maps to for AV1.
+const MIN_AV1_KBPS: u32 = 50;
+
+/// A CRF for a quality, on an encoder's own scale: `best` at quality 100 to
+/// `worst` at 1. The scales below put quality 75, the default, at the CRF
+/// each encoder used before quality applied to it (35 for SVT-AV1 and
+/// libvpx-vp9, 23 for x264/x265).
+fn crf_for_quality(quality: u8, best: u8, worst: u8) -> u8 {
+    let q = f64::from(quality.clamp(1, 100));
+    (f64::from(worst) - (q - 1.0) * f64::from(worst - best) / 99.0).round() as u8
+}
+
+/// Rate control for an encoder that rates by CRF (the software ones): an
+/// explicit CRF override, else a CRF from the quality, else, for an explicit
+/// bitrate, constant bitrate. A CRF encoder ignores a plain bitrate, which is
+/// why quality used to have no effect on these. Returns a description to log.
+fn crf_rate_control(
+    config: &EncoderConfig,
+    encoder: &mut ffmpeg_next::codec::encoder::video::Video,
+    opts: &mut ffmpeg_next::Dictionary,
+    best: u8,
+    worst: u8,
+) -> String {
+    match (config.crf, config.rate) {
+        (Some(crf), _) => {
+            opts.set("crf", &crf.to_string());
+            format!("crf={crf}")
+        }
+        (None, RateTarget::Quality(q)) => {
+            let crf = crf_for_quality(q, best, worst);
+            opts.set("crf", &crf.to_string());
+            format!("crf={crf} (quality {q})")
+        }
+        (None, RateTarget::Kbps(k)) => {
+            // maxrate == bitrate is constant bitrate; x264/x265 need a buffer
+            // size for maxrate to apply. One second's worth.
+            encoder.set_bit_rate(k as usize * 1000);
+            opts.set("maxrate", &format!("{k}k"));
+            opts.set("bufsize", &format!("{k}k"));
+            format!("cbr {k} kbps")
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    pub bitrate_kbps: u32,
+    pub rate: RateTarget,
     pub keyframe_interval: u32,
     /// Override encoder preset. None = backend default.
     /// SVT-AV1: "0".."13", QSV: "veryfast".."veryslow", NVENC: "p1".."p7".
     pub preset: Option<String>,
-    /// Override constant rate factor (SVT-AV1 only). None = 35.
+    /// Override constant rate factor (SVT-AV1 only), taking precedence over
+    /// `rate`. None = derived from `rate`.
     pub crf: Option<u8>,
     /// Extra svtav1-params to merge with the mandatory low-delay ones.
     /// Format: "key=value:key=value". SVT-AV1 only.
@@ -185,7 +260,7 @@ impl Default for EncoderConfig {
             width: 1920,
             height: 1080,
             fps: 30,
-            bitrate_kbps: 5000,
+            rate: RateTarget::Quality(75),
             keyframe_interval: 60,
             preset: None,
             crf: None,
@@ -283,6 +358,9 @@ impl FfmpegVideoEncoder {
         encoder.set_time_base(ffmpeg_next::Rational::new(1, config.fps as i32));
         encoder.set_gop(config.keyframe_interval);
 
+        // For the backends with bitrate-based rate control.
+        let kbps = config.rate.kbps(backend.codec());
+
         // Backend-specific tuning
         let mut opts = ffmpeg_next::Dictionary::new();
         match backend {
@@ -291,8 +369,7 @@ impl FfmpegVideoEncoder {
                 let preset = config.preset.as_deref().unwrap_or("10");
                 opts.set("preset", preset);
 
-                let crf = config.crf.map(|c| c.to_string()).unwrap_or_else(|| "35".to_string());
-                opts.set("crf", &crf);
+                let rc = crf_rate_control(config, &mut encoder, &mut opts, 25, 63);
 
                 let mut svt_params = String::from("pred-struct=1");
                 if let Some(extra) = &config.extra_svt_params {
@@ -304,10 +381,10 @@ impl FfmpegVideoEncoder {
                 opts.set("svtav1-params", &svt_params);
                 encoder.set_max_b_frames(0);
 
-                tracing::info!("SVT-AV1 tuning: preset={preset} crf={crf} svtav1-params={svt_params}");
+                tracing::info!("SVT-AV1 tuning: preset={preset} {rc} svtav1-params={svt_params}");
             }
             EncoderBackend::IntelQsv => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                encoder.set_bit_rate(kbps as usize * 1000);
                 let preset = config.preset.as_deref().unwrap_or("veryfast");
                 opts.set("preset", preset);
                 opts.set("look_ahead", "0");
@@ -317,7 +394,7 @@ impl FfmpegVideoEncoder {
                 tracing::info!("QSV tuning: preset={preset}");
             }
             EncoderBackend::NvidiaEnc => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                encoder.set_bit_rate(kbps as usize * 1000);
                 let preset = config.preset.as_deref().unwrap_or("p1");
                 opts.set("preset", preset);
                 opts.set("tune", "ull");
@@ -328,7 +405,7 @@ impl FfmpegVideoEncoder {
                 tracing::info!("NVENC tuning: preset={preset}");
             }
             EncoderBackend::AmdAmf | EncoderBackend::AmdVaapi => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                encoder.set_bit_rate(kbps as usize * 1000);
                 if let Some(preset) = &config.preset {
                     opts.set("preset", preset);
                 }
@@ -339,16 +416,15 @@ impl FfmpegVideoEncoder {
                 let preset = config.preset.as_deref().unwrap_or("8");
                 opts.set("preset", preset);
 
-                let crf = config.crf.map(|c| c.to_string()).unwrap_or_else(|| "35".to_string());
-                opts.set("crf", &crf);
+                let rc = crf_rate_control(config, &mut encoder, &mut opts, 25, 63);
                 encoder.set_max_b_frames(0);
 
-                tracing::info!("SVT-VP9 tuning: preset={preset} crf={crf}");
+                tracing::info!("SVT-VP9 tuning: preset={preset} {rc}");
             }
 
             // H.265/HEVC tuning
             EncoderBackend::H265Qsv => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                encoder.set_bit_rate(kbps as usize * 1000);
                 let preset = config.preset.as_deref().unwrap_or("veryfast");
                 opts.set("preset", preset);
                 opts.set("look_ahead", "0");
@@ -357,7 +433,7 @@ impl FfmpegVideoEncoder {
                 tracing::info!("QSV HEVC tuning: preset={preset}");
             }
             EncoderBackend::H265Nvenc => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                encoder.set_bit_rate(kbps as usize * 1000);
                 let preset = config.preset.as_deref().unwrap_or("p1");
                 opts.set("preset", preset);
                 opts.set("tune", "ull");
@@ -368,25 +444,23 @@ impl FfmpegVideoEncoder {
                 tracing::info!("NVENC HEVC tuning: preset={preset}");
             }
             EncoderBackend::H265Amf | EncoderBackend::H265Vaapi | EncoderBackend::H265V4l2m2m => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                encoder.set_bit_rate(kbps as usize * 1000);
                 if let Some(preset) = &config.preset {
                     opts.set("preset", preset);
                 }
             }
             EncoderBackend::Libx265 => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
                 let preset = config.preset.as_deref().unwrap_or("fast");
                 opts.set("preset", preset);
-                let crf = config.crf.map(|c| c.to_string()).unwrap_or_else(|| "23".to_string());
-                opts.set("crf", &crf);
+                let rc = crf_rate_control(config, &mut encoder, &mut opts, 14, 51);
                 // As for NVENC: otherwise a forced keyframe is a non-IDR intra frame.
                 opts.set("forced-idr", "1");
-                tracing::info!("libx265 tuning: preset={preset} crf={crf}");
+                tracing::info!("libx265 tuning: preset={preset} {rc}");
             }
 
             // H.264 tuning
             EncoderBackend::H264Qsv => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                encoder.set_bit_rate(kbps as usize * 1000);
                 let preset = config.preset.as_deref().unwrap_or("veryfast");
                 opts.set("preset", preset);
                 opts.set("look_ahead", "0");
@@ -395,7 +469,7 @@ impl FfmpegVideoEncoder {
                 tracing::info!("QSV H.264 tuning: preset={preset}");
             }
             EncoderBackend::H264Nvenc => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                encoder.set_bit_rate(kbps as usize * 1000);
                 let preset = config.preset.as_deref().unwrap_or("p1");
                 opts.set("preset", preset);
                 opts.set("tune", "ull");
@@ -406,29 +480,34 @@ impl FfmpegVideoEncoder {
                 tracing::info!("NVENC H.264 tuning: preset={preset}");
             }
             EncoderBackend::H264Amf | EncoderBackend::H264Vaapi | EncoderBackend::H264V4l2m2m => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                encoder.set_bit_rate(kbps as usize * 1000);
                 if let Some(preset) = &config.preset {
                     opts.set("preset", preset);
                 }
             }
             EncoderBackend::Libx264 => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
                 let preset = config.preset.as_deref().unwrap_or("fast");
                 opts.set("preset", preset);
-                let crf = config.crf.map(|c| c.to_string()).unwrap_or_else(|| "23".to_string());
-                opts.set("crf", &crf);
-                tracing::info!("libx264 tuning: preset={preset} crf={crf}");
+                let rc = crf_rate_control(config, &mut encoder, &mut opts, 14, 51);
+                tracing::info!("libx264 tuning: preset={preset} {rc}");
             }
 
             // VP8 and other backends with generic settings
             _ => {
-                encoder.set_bit_rate(config.bitrate_kbps as usize * 1000);
+                encoder.set_bit_rate(kbps as usize * 1000);
             }
         }
 
         let encoder = encoder.open_with(opts).map_err(|e| {
             EncoderError::InitFailed(format!("{backend}: open encoder: {e}"))
         })?;
+        // The CRF-based backends log their rate control above; the rest use `kbps`.
+        if !matches!(
+            backend,
+            EncoderBackend::SvtAv1 | EncoderBackend::SvtVp9 | EncoderBackend::Libx264 | EncoderBackend::Libx265
+        ) {
+            tracing::info!("{backend}: target bitrate {kbps} kbps");
+        }
 
         // Create RGBA -> target pixel format converter
         let converter = SendScaler(ffmpeg_next::software::scaling::Context::get(
@@ -904,7 +983,7 @@ mod tests {
             width: w,
             height: h,
             fps: 30,
-            bitrate_kbps: 1000,
+            rate: RateTarget::Kbps(1000),
             keyframe_interval: 300,
             ..Default::default()
         };
@@ -934,6 +1013,70 @@ mod tests {
         }
     }
 
+    /// Encode a second of busy, moving content and return the bytes per second
+    /// produced, or None if the backend does not open here.
+    fn bytes_per_sec(backend: EncoderBackend, rate: RateTarget) -> Option<f64> {
+        let (w, h) = (320u32, 240u32);
+        let config = EncoderConfig { width: w, height: h, fps: 30, rate, keyframe_interval: 300, ..Default::default() };
+        let mut encoder = FfmpegVideoEncoder::new(backend, &config).ok()?;
+        // Noise, shifted each frame: costly enough that the rate control,
+        // not the content, decides the size.
+        let mut seed: u32 = 1;
+        let noise: Vec<u8> = (0..w * h * 4)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let mut bytes = 0usize;
+        for i in 0..30u64 {
+            let mut rgba = noise.clone();
+            rgba.rotate_left(i as usize * 28);
+            bytes += encoder.encode_frame(&rgba, i * 33_333, false).ok()?.iter().map(|p| p.data.len()).sum::<usize>();
+        }
+        bytes += encoder.flush().ok()?.iter().map(|p| p.data.len()).sum::<usize>();
+        Some(bytes as f64)
+    }
+
+    /// Quality and an explicit bitrate must both change what every encoder
+    /// produces. The CRF-based software encoders (SVT-AV1, libvpx-vp9,
+    /// libx264, libx265) used to ignore both and always use a fixed CRF.
+    #[test]
+    fn quality_and_bitrate_change_the_output() {
+        let mut tested = 0;
+        for &backend in ENCODER_PRIORITY {
+            let Some(q10) = bytes_per_sec(backend, RateTarget::Quality(10)) else { continue };
+            let q90 = bytes_per_sec(backend, RateTarget::Quality(90)).unwrap();
+            let low = bytes_per_sec(backend, RateTarget::Kbps(300)).unwrap();
+            let high = bytes_per_sec(backend, RateTarget::Kbps(3000)).unwrap();
+            assert!(q10 * 2.0 < q90, "{backend}: quality 10 gave {q10} B/s, quality 90 {q90} B/s");
+            assert!(low * 2.0 < high, "{backend}: 300 kbps gave {low} B/s, 3000 kbps {high} B/s");
+            tested += 1;
+        }
+        if tested == 0 {
+            eprintln!("skipping: no video encoder in this environment");
+        }
+    }
+
+    #[test]
+    fn quality_maps_to_a_bitrate_scaled_for_the_codec() {
+        assert_eq!(RateTarget::Quality(100).kbps(VideoCodec::Av1), 1500);
+        assert_eq!(RateTarget::Quality(75).kbps(VideoCodec::Av1), 1125);
+        assert_eq!(RateTarget::Quality(1).kbps(VideoCodec::Av1), MIN_AV1_KBPS);
+        assert_eq!(RateTarget::Quality(75).kbps(VideoCodec::H264), 11_250);
+        assert_eq!(RateTarget::Quality(1).kbps(VideoCodec::H264), 500);
+        assert_eq!(RateTarget::Kbps(42).kbps(VideoCodec::Av1), 42, "an explicit bitrate is used as given");
+    }
+
+    #[test]
+    fn quality_maps_to_a_crf_with_the_old_default_at_75() {
+        assert_eq!(crf_for_quality(100, 25, 63), 25);
+        assert_eq!(crf_for_quality(75, 25, 63), 35);
+        assert_eq!(crf_for_quality(1, 25, 63), 63);
+        assert_eq!(crf_for_quality(75, 14, 51), 23);
+        assert_eq!(crf_for_quality(0, 14, 51), 51, "out-of-range quality is clamped");
+    }
+
     /// FFmpeg packets are an elementary stream (AV1 OBUs / Annex-B), which is
     /// what WebCodecs `EncodedVideoChunk` expects — not IVF/MP4.
     ///
@@ -946,7 +1089,7 @@ mod tests {
             width: 320,
             height: 240,
             fps: 30,
-            bitrate_kbps: 200,
+            rate: RateTarget::Kbps(200),
             keyframe_interval: 1,
             ..Default::default()
         };

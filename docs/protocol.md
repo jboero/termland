@@ -118,7 +118,7 @@ auth state only, never from anything the client sends in `SessionCreate`.
 | `mode` | `SessionMode` | `Desktop`, or `App { command, args }` for kiosk mode |
 | `width`, `height` | `u32` | Initial output size |
 | `audio` | `bool` | Whether to capture and stream audio |
-| `quality` | `u8` | 1–100, default 75; maps to encoder bitrate/CRF |
+| `quality` | `u8` | 1–100, default 75; see below |
 | `desktop_shell` | `Option<String>` | Startup command inside labwc; auto-detected when absent |
 | `encoder_preset` | `Option<String>` | Backend-specific override |
 | `encoder_crf` | `Option<u8>` | Backend-specific override |
@@ -126,6 +126,7 @@ auth state only, never from anything the client sends in `SessionCreate`.
 | `supported_codecs` | `Vec<VideoCodec>` | Client's decodable video codecs, in preference order |
 | `supported_audio_codecs` | `Vec<AudioCodec>` | Client's decodable audio codecs |
 | `video_may_idle` | `bool` | Client copes with no video while the screen is idle; default `false` |
+| `bitrate_kbps` | `Option<u32>` | Target bitrate, overriding `quality`; `None` (default) derives it from `quality` |
 
 `desktop_shell` and `App.command` are **client-supplied strings that the server
 executes**. They are validated by `validate_shell_command` before any shell use.
@@ -134,6 +135,15 @@ Treat that validation as security-critical.
 `SessionAttach` resumes an existing session by `session_id`, carrying the same
 quality/encoder/codec fields — a session can be resumed by a different client
 build than created it, so capabilities are re-advertised rather than remembered.
+
+`quality` is turned into each encoder's own rate control. A bitrate-based
+encoder (the hardware ones, and libvpx for VP8) gets quality × 15 kbps for AV1
+(100 is 1.5 Mbps) and quality × 150 kbps for the other codecs, which need more
+for the same picture. A CRF-based one (SVT-AV1, libvpx-vp9, x264, x265) gets a
+CRF on its own scale, with quality 75 at its long-standing default (35, or 23
+for x264/x265). `bitrate_kbps` replaces all of that with one bitrate, which the
+CRF-based encoders then hold with constant-bitrate rate control. The server
+clamps it to 50–100000 kbps.
 
 `video_may_idle` exists because the server captures on damage: it encodes a
 frame only when something on screen changed (unless started with

@@ -279,6 +279,11 @@ pub struct SessionCreate {
     /// still sent a frame about once a second.
     #[serde(default)]
     pub video_may_idle: bool,
+    /// Target video bitrate in kbps, overriding the one derived from
+    /// `quality`. An omitted field (older client) means none: the server
+    /// derives the rate from `quality`, as it always did.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
 }
 
 fn default_quality() -> u8 { 75 }
@@ -354,6 +359,9 @@ pub struct SessionAttach {
     /// See `SessionCreate::video_may_idle`.
     #[serde(default)]
     pub video_may_idle: bool,
+    /// See `SessionCreate::bitrate_kbps`.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
 }
 
 /// Client -> server: permanently close (terminate) a persistent session.
@@ -820,6 +828,7 @@ mod audio_codec_tests {
             supported_codecs: VideoCodec::all_preferred(),
             supported_audio_codecs: vec![AudioCodec::Opus],
             video_may_idle: false,
+            bitrate_kbps: None,
         };
 
         let parsed: SessionCreate = reencode(&create);
@@ -857,6 +866,7 @@ mod audio_codec_tests {
             supported_codecs: vec![VideoCodec::Av1],
             supported_audio_codecs: vec![AudioCodec::Opus],
             video_may_idle: false,
+            bitrate_kbps: None,
         };
 
         let old: OldSessionCreate = reencode(&new);
@@ -927,6 +937,7 @@ mod audio_codec_tests {
             supported_codecs: vec![VideoCodec::Av1],
             supported_audio_codecs: vec![AudioCodec::Opus],
             video_may_idle: true,
+            bitrate_kbps: None,
         };
 
         let old: OldSessionCreate = reencode(&new);
@@ -934,6 +945,46 @@ mod audio_codec_tests {
         assert_eq!(old.supported_audio_codecs, vec![AudioCodec::Opus]);
         let parsed: SessionCreate = reencode(&new);
         assert!(parsed.video_may_idle, "an explicit true must survive the round trip");
+    }
+
+    /// A client predating `bitrate_kbps` leaves the rate to `quality`; a
+    /// current client's bitrate survives; an old server skips the field.
+    #[test]
+    fn bitrate_kbps_is_optional_in_both_directions() {
+        #[derive(Serialize)]
+        struct OldCreate {
+            mode: SessionMode,
+            width: u32,
+            height: u32,
+            audio: bool,
+            quality: u8,
+        }
+        #[derive(Serialize)]
+        struct OldAttach {
+            session_id: String,
+            audio: bool,
+            quality: u8,
+        }
+        let create: SessionCreate = reencode(&OldCreate {
+            mode: SessionMode::Desktop,
+            width: 1920,
+            height: 1080,
+            audio: false,
+            quality: 40,
+        });
+        assert_eq!((create.bitrate_kbps, create.quality), (None, 40));
+        let attach: SessionAttach = reencode(&OldAttach { session_id: "s1".into(), audio: false, quality: 40 });
+        assert_eq!(attach.bitrate_kbps, None);
+
+        let new = SessionCreate { bitrate_kbps: Some(800), ..create };
+        assert_eq!(reencode::<_, SessionCreate>(&new).bitrate_kbps, Some(800));
+
+        #[derive(Deserialize)]
+        struct OldServerView {
+            quality: u8,
+        }
+        let old: OldServerView = reencode(&new);
+        assert_eq!(old.quality, 40);
     }
 
     /// New server -> OLD client, the mirror of the above: an old client must

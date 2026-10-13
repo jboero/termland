@@ -18,6 +18,7 @@
 //! - `TERMLAND_BENCH_SERVER_ARGS`: extra server arguments, space-separated,
 //!   e.g. `--capture-mode full`.
 //! - `TERMLAND_BENCH_QUALITY`: the session's quality, 1-100 (default 75).
+//! - `TERMLAND_BENCH_BITRATE`: an explicit bitrate in kbps, instead of quality.
 //! - `TERMLAND_BENCH_MAY_IDLE=1`: create the session with `video_may_idle`, as
 //!   a current client does. Otherwise it is created as an older client would.
 //! - `TERMLAND_BENCH_OUT`: append one CSV line per workload to this file.
@@ -196,6 +197,7 @@ impl Bench {
                 supported_codecs: vec![VideoCodec::Av1],
                 supported_audio_codecs: AudioCodec::all_preferred(),
                 video_may_idle,
+                bitrate_kbps: std::env::var("TERMLAND_BENCH_BITRATE").ok().and_then(|b| b.parse().ok()),
             }))
             .await
             .expect("send SessionCreate");
@@ -445,6 +447,7 @@ async fn idle_session_still_answers_resize_and_attach() {
             supported_codecs: vec![VideoCodec::Av1],
             supported_audio_codecs: AudioCodec::all_preferred(),
             video_may_idle: true,
+            bitrate_kbps: None,
         }))
         .await
         .expect("send SessionAttach");
