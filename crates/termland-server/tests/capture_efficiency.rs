@@ -17,6 +17,7 @@
 //! - `TERMLAND_BENCH_WORKLOADS`: comma-separated subset of the names below.
 //! - `TERMLAND_BENCH_SERVER_ARGS`: extra server arguments, space-separated,
 //!   e.g. `--capture-mode full`.
+//! - `TERMLAND_BENCH_QUALITY`: the session's quality, 1-100 (default 75).
 //! - `TERMLAND_BENCH_MAY_IDLE=1`: create the session with `video_may_idle`, as
 //!   a current client does. Otherwise it is created as an older client would.
 //! - `TERMLAND_BENCH_OUT`: append one CSV line per workload to this file.
@@ -183,7 +184,10 @@ impl Bench {
                 width: WIDTH,
                 height: HEIGHT,
                 audio: false,
-                quality: 75,
+                quality: std::env::var("TERMLAND_BENCH_QUALITY")
+                    .ok()
+                    .and_then(|q| q.parse().ok())
+                    .unwrap_or(75),
                 desktop_shell: Some(shell.into()),
                 encoder_preset: None,
                 encoder_crf: None,
