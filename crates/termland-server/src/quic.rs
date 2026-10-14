@@ -178,5 +178,13 @@ fn build_quic_server_config(
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .context("rustls config is not usable for QUIC (needs TLS 1.3)")?;
 
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_crypto)))
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    // An idle screen sends no video under damage capture, and nothing else
+    // need cross the connection, so keep it from reaching the idle timeout
+    // (30 s by default, or less if the client asks). WebTransport does the
+    // same, every 10 s.
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    config.transport_config(Arc::new(transport));
+    Ok(config)
 }

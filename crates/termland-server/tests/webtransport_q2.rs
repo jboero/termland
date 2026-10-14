@@ -151,6 +151,8 @@ async fn webtransport_q2_video_stream_carries_a_real_keyframe() -> Result<()> {
             encoder_extra_params: None,
             supported_codecs: VideoCodec::all_preferred(),
             supported_audio_codecs: vec![],
+            video_may_idle: false,
+            bitrate_kbps: None,
         }))
         .await?;
 

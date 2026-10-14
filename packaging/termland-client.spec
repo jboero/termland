@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.8.1
+%global version 0.9.0
 # See termland-server.spec's comment: EL8's rpmbuild fails hard on the empty
 # debugsourcefiles.list find-debuginfo can produce for a Rust binary.
 %global debug_package %{nil}
@@ -163,6 +163,16 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/io.github.jboero.term
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Wed Oct 14 2026 John Boero - 0.9.0-1
+- --bitrate, and a "Fixed bitrate" profile setting, to set the video
+  bitrate directly instead of through quality.
+- Tells a 0.9.0 server it copes with video stopping while the screen is
+  idle, and sends input as soon as it is typed rather than on a 100 ms tick.
+- Video decoders open in low-delay mode. NVIDIA's decoder held 3-5 frames
+  back, over 100 ms of latency.
+- Trying decoders no longer prints FFmpeg errors for hardware the machine
+  does not have.
+
 * Fri Sep 25 2026 John Boero - 0.8.1-1
 - Fix the session manager window staying on screen, frozen, after it was
   closed (0.8.0 on Wayland). The window now runs as a child process of the

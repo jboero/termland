@@ -478,7 +478,7 @@ impl CursorCapturer {
         let shm = self.state.shm.as_ref().ok_or(CursorCaptureError::NoShm)?.clone();
 
         // wl_shm requires a byte-aligned stride; 4 bytes/pixel for every
-        // format screencopy's decoder accepts (see read_shm_to_rgba).
+        // format screencopy's decoder accepts (see screencopy's to_rgba).
         let bpp = if matches!(format, 875710274 | 875710290) { 3 } else { 4 };
         let stride = width * bpp as u32;
         let size = (stride * height) as usize;
@@ -539,7 +539,7 @@ impl CursorCapturer {
 /// Read a captured cursor buffer from shm and convert to RGBA, preserving the
 /// REAL per-pixel alpha channel.
 ///
-/// This deliberately does NOT reuse screencopy.rs's `read_shm_to_rgba`: that
+/// This deliberately does NOT reuse screencopy.rs's `to_rgba`: that
 /// one hardcodes alpha=255 for every pixel, which is correct for a full
 /// screen capture (the output is opaque) but wrong here - a cursor bitmap's
 /// whole point is a transparent surround around an opaque glyph, and

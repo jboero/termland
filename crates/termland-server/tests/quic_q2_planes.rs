@@ -293,6 +293,8 @@ async fn quic_q2_video_stream_carries_real_frames() {
             encoder_extra_params: None,
             supported_codecs: VideoCodec::all_preferred(),
             supported_audio_codecs: AudioCodec::all_preferred(),
+            video_may_idle: false,
+            bitrate_kbps: None,
         }))
         .await
         .expect("send SessionCreate");

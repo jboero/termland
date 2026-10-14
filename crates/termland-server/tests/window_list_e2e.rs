@@ -128,6 +128,8 @@ async fn a_real_session_delivers_a_window_list() {
             encoder_extra_params: None,
             supported_codecs: VideoCodec::all_preferred(),
             supported_audio_codecs: AudioCodec::all_preferred(),
+            video_may_idle: false,
+            bitrate_kbps: None,
         }))
         .await
         .expect("send SessionCreate");

@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.8.1
+%global version 0.9.0
 # find-debuginfo can produce an empty debugsourcefiles.list for a Rust
 # binary (unlike typical C sources), which newer Fedora's rpmbuild tolerates
 # but EL8's treats as a hard error ("Empty %%files file ... debugsourcefiles
@@ -253,6 +253,21 @@ fi
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Wed Oct 14 2026 John Boero - 0.9.0-1
+- Capture and encode only when the screen changes (#40). An idle 1080p
+  session drops from 65% CPU (NVENC) or 268% (SVT-AV1) to under 1%.
+  --capture-mode full restores the old every-frame capture. Clients older
+  than 0.9.0 are still sent a frame a second while the screen is idle.
+- Quality now affects every encoder: SVT-AV1, libvpx-vp9, x264 and x265
+  used to ignore it. For AV1 it maps to a tenth of the old bitrate (quality
+  75 is about 1.1 Mbps), and a client can ask for an explicit bitrate.
+- QUIC connections send keep-alives, so an idle session is not dropped.
+- Fix the session loop spinning a CPU core when the cursor or clipboard
+  watcher thread exits.
+- Forced keyframes are now real keyframes on NVENC and libx265.
+- Trying encoders no longer prints FFmpeg errors for hardware the machine
+  does not have.
+
 * Fri Sep 25 2026 John Boero - 0.8.1-1
 - No functional server changes; version kept in step with termland-client
   0.8.1. I/O errors in the log no longer repeat their message

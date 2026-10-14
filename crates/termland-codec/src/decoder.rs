@@ -259,7 +259,7 @@ impl VideoDecoder {
                 }
             }
             tracing::info!("Probing video decoder: {backend}...");
-            match Self::open_codec(*backend) {
+            match crate::quiet_ffmpeg(|| Self::open_codec(*backend)) {
                 Ok(decoder) => {
                     tracing::info!("Selected video decoder: {backend}");
                     return Ok(Self {
@@ -288,7 +288,11 @@ impl VideoDecoder {
         let codec = ffmpeg_next::decoder::find_by_name(backend.codec_name())
             .ok_or_else(|| DecoderError::InitFailed(format!("codec '{}' not found", backend.codec_name())))?;
 
-        let ctx = ffmpeg_next::codec::context::Context::new_with_codec(codec);
+        let mut ctx = ffmpeg_next::codec::context::Context::new_with_codec(codec);
+        // Output each frame as soon as its packet is decoded. The stream has
+        // no B-frames to reorder, and without this cuvid holds back up to
+        // four frames, which a stream that goes quiet would leave unshown.
+        ctx.set_flags(ffmpeg_next::codec::Flags::LOW_DELAY);
         ctx.decoder().video()
             .map_err(|e| DecoderError::InitFailed(format!("{backend}: {e}")))
     }
@@ -307,6 +311,17 @@ impl VideoDecoder {
     /// On repeated decode errors with an unconfirmed backend, automatically
     /// falls back to the next decoder in the priority list.
     pub fn decode(&mut self, data: &[u8]) -> Result<(u32, u32, Vec<u32>), DecoderError> {
+        // Until a frame has decoded, a backend that opened may still turn out
+        // not to work here (QSV without an Intel GPU), and decode() falls back
+        // to the next: the same probing noise as opening one.
+        if self.confirmed_working {
+            self.decode_packet(data)
+        } else {
+            crate::quiet_ffmpeg(|| self.decode_packet(data))
+        }
+    }
+
+    fn decode_packet(&mut self, data: &[u8]) -> Result<(u32, u32, Vec<u32>), DecoderError> {
         let packet = ffmpeg_next::Packet::copy(data);
 
         let send_result = self.decoder.send_packet(&packet);
@@ -474,7 +489,9 @@ impl VideoDecoder {
 
     /// Mark the current backend as failed and retry with the next one.
     fn fallback_and_retry(&mut self, data: &[u8], reason: String) -> Result<(u32, u32, Vec<u32>), DecoderError> {
-        tracing::warn!("Decoder {} failed ({}), trying next backend", self.backend, reason);
+        // Only reached before this backend has decoded anything: still probing,
+        // and expected wherever its hardware is absent, so not a warning.
+        tracing::info!("Decoder {} does not work here ({}), trying the next one", self.backend, reason);
         let mut failed = std::mem::take(&mut self.failed_backends);
         failed.push(self.backend);
         let next_index = self.backend_index + 1;
@@ -642,6 +659,58 @@ mod tests {
             assert!(
                 backends.len() > 1,
                 "{codec} has only one decoder backend, so a failure has no fallback",
+            );
+        }
+    }
+
+    /// Frames a decoder may still hold after the last packet: an H.264/HEVC
+    /// parser that needs the next packet to see a picture has ended, plus
+    /// B-frame reordering from libx264/libx265. After the screen stops
+    /// changing, the server sends this many repeats of the last frame
+    /// (termland-server's SETTLE_FRAMES) to push the final picture out.
+    const MAX_HELD_FRAMES: usize = 2;
+
+    /// A decoder must return frames promptly. One that holds them back
+    /// (FFmpeg's cuvid wrapper keeps up to four for display reordering unless
+    /// told the stream is low-delay) leaves the client showing a stale
+    /// picture once the server stops sending, as it does for an idle screen.
+    #[test]
+    fn decoder_returns_each_frame_without_delay() {
+        use crate::encoder::{probe_best_encoder, EncoderConfig};
+        let (w, h) = (320u32, 240u32);
+        let config = EncoderConfig {
+            width: w,
+            height: h,
+            fps: 30,
+            rate: crate::encoder::RateTarget::Kbps(1000),
+            keyframe_interval: 300,
+            ..Default::default()
+        };
+        for codec in VideoCodec::all_preferred() {
+            let Ok(mut encoder) = probe_best_encoder(&config, &[codec]) else {
+                eprintln!("skipping {codec}: no encoder in this environment");
+                continue;
+            };
+            let Ok(mut decoder) = VideoDecoder::for_codec(codec) else {
+                eprintln!("skipping {codec}: no decoder in this environment");
+                continue;
+            };
+            // Some encoders (libvpx with its lookahead) emit nothing until
+            // flushed, so the packets are collected first; the decoder must
+            // still answer each one with a frame.
+            let mut encoded = Vec::new();
+            for i in 0..12u64 {
+                let rgba = vec![(i * 16) as u8; (w * h * 4) as usize];
+                encoded.extend(encoder.encode_frame(&rgba, i * 33_000, false).expect("encode"));
+            }
+            encoded.extend(encoder.flush().expect("flush"));
+            let packets = encoded.len();
+            let frames = encoded.iter().filter(|p| decoder.decode(&p.data).is_ok()).count();
+            assert!(packets > 0, "{}: produced no packets", encoder.backend());
+            assert!(
+                packets - frames <= MAX_HELD_FRAMES,
+                "{} decoder held back {} of {packets} frames",
+                decoder.backend(), packets - frames,
             );
         }
     }

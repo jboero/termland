@@ -391,6 +391,8 @@ where
         encoder_extra_params,
         supported_codecs,
         supported_audio_codecs,
+        video_may_idle,
+        bitrate_kbps,
         audio,
         start_kind,
         is_new,
@@ -449,6 +451,8 @@ where
             } else {
                 sc.supported_audio_codecs
             };
+            video_may_idle = sc.video_may_idle;
+            bitrate_kbps = sc.bitrate_kbps;
             audio = sc.audio;
             start_kind = StartKind::Create { log_path: crate::registry::log_path(&id) };
             is_new = true;
@@ -510,6 +514,8 @@ where
             } else {
                 sa.supported_codecs
             };
+            video_may_idle = sa.video_may_idle;
+            bitrate_kbps = sa.bitrate_kbps;
             supported_audio_codecs = if sa.supported_audio_codecs.is_empty() {
                 termland_protocol::AudioCodec::legacy_default()
             } else {
@@ -560,7 +566,7 @@ where
     let capture_handle = std::thread::spawn(move || {
         capture_thread(width, height, quality, mode, desktop_shell,
                        encoder_preset, encoder_crf, encoder_extra_params,
-                       capture_codecs, start_kind, capture_audio_sink, run_as,
+                       capture_codecs, video_may_idle, bitrate_kbps, start_kind, capture_audio_sink, run_as,
                        overlay_cursor_capture, resize_rx, frame_tx, display_tx, stop_rx);
     });
 
@@ -880,6 +886,10 @@ where
                             }
                         }
                     }
+                } else {
+                    // The sending thread has exited. Without this, recv()
+                    // returns None at once on every poll and the loop spins.
+                    audio_rx = None;
                 }
             }
 
@@ -898,6 +908,10 @@ where
                         tracing::error!("Failed to send clipboard: {e}");
                         break;
                     }
+                } else {
+                    // The sending thread has exited. Without this, recv()
+                    // returns None at once on every poll and the loop spins.
+                    clip_rx = None;
                 }
             }
 
@@ -912,6 +926,10 @@ where
                         tracing::error!("Failed to send cursor update: {e}");
                         break;
                     }
+                } else {
+                    // The sending thread has exited. Without this, recv()
+                    // returns None at once on every poll and the loop spins.
+                    cursor_rx = None;
                 }
             }
 
@@ -1082,7 +1100,7 @@ enum SessionOutcome {
 
 /// Encoder tuning collected once per session from the client.
 struct EncoderTuning {
-    bitrate_kbps: u32,
+    rate: termland_codec::RateTarget,
     preset: Option<String>,
     crf: Option<u8>,
     extra_svt_params: Option<String>,
@@ -1094,7 +1112,7 @@ impl EncoderTuning {
             width,
             height,
             fps: 30,
-            bitrate_kbps: self.bitrate_kbps,
+            rate: self.rate,
             keyframe_interval: 30,
             preset: self.preset.clone(),
             crf: self.crf,
@@ -1138,6 +1156,49 @@ enum StartKind {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// How the capture loop decides when to capture and encode a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum CaptureMode {
+    /// When the compositor reports damage, i.e. something on screen changed.
+    Damage,
+    /// Every frame interval, changed or not (the behaviour before damage
+    /// tracking). Kept as a fallback and as the baseline to compare against.
+    Full,
+}
+
+static CAPTURE_MODE: std::sync::OnceLock<CaptureMode> = std::sync::OnceLock::new();
+
+/// Set the server-wide capture mode, once, at startup.
+pub(crate) fn set_capture_mode(mode: CaptureMode) {
+    let _ = CAPTURE_MODE.set(mode);
+}
+
+fn capture_mode() -> CaptureMode {
+    CAPTURE_MODE.get().copied().unwrap_or(CaptureMode::Damage)
+}
+
+/// Bounds on a client-supplied bitrate, in kbps.
+const MIN_BITRATE_KBPS: u32 = 50;
+const MAX_BITRATE_KBPS: u32 = 100_000;
+
+/// Longest a wait for damage blocks before the capture loop comes round to
+/// check for stop and resize requests. Also bounds how late a legacy idle frame is.
+const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A client that has not set `video_may_idle` is sent a frame at least this
+/// often while the screen is idle, as it may treat a silent stream as stalled.
+const LEGACY_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Repeats of the last frame after the screen stops changing. They let the
+/// encoder refine the still image, and they push the last change out of the
+/// client's decoder: an H.264/HEVC decoder can hold up to two frames
+/// (termland-codec's `decoder_returns_each_frame_without_delay`).
+const SETTLE_FRAMES: u32 = 2;
+
+/// The same, for a client without `video_may_idle`. Its decoder may predate
+/// the low-delay flag; FFmpeg's cuvid then holds up to five frames.
+const LEGACY_SETTLE_FRAMES: u32 = 5;
+
 fn capture_thread(
     width: u32,
     height: u32,
@@ -1148,6 +1209,11 @@ fn capture_thread(
     encoder_crf: Option<u8>,
     encoder_extra_params: Option<String>,
     supported_codecs: Vec<termland_protocol::VideoCodec>,
+    // The client copes with no frames while the screen is idle
+    // (`SessionCreate::video_may_idle`).
+    video_may_idle: bool,
+    // Explicit target bitrate (`SessionCreate::bitrate_kbps`), overriding quality.
+    bitrate_kbps: Option<u32>,
     start_kind: StartKind,
     // Sink that session applications should play to, exported as
     // `PULSE_SINK`. `None` when the client did not request audio.
@@ -1197,12 +1263,16 @@ fn capture_thread(
         compositor.runtime_dir().to_path_buf(),
     ));
 
-    // Map quality 1-100 to bitrate. quality 100 → 15 Mbps, 50 → 7.5 Mbps, 1 → 500 kbps
-    let bitrate_kbps = (quality as u32 * 150).max(500);
-    tracing::info!("Video quality={quality} → bitrate={bitrate_kbps}kbps");
+    // An explicit bitrate wins; otherwise each encoder maps the quality to its
+    // own rate control (see RateTarget), which it logs once chosen.
+    let rate = match bitrate_kbps {
+        Some(kbps) => termland_codec::RateTarget::Kbps(kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)),
+        None => termland_codec::RateTarget::Quality(quality),
+    };
+    tracing::info!("Video rate target: {rate:?}");
 
     let tuning = EncoderTuning {
-        bitrate_kbps,
+        rate,
         preset: encoder_preset,
         crf: encoder_crf,
         extra_svt_params: encoder_extra_params,
@@ -1213,6 +1283,35 @@ fn capture_thread(
     let mut encoder_dims = (width, height);
 
     let frame_duration = std::time::Duration::from_millis(33);
+    let capture_mode = capture_mode();
+    tracing::info!(
+        "Capture mode: {capture_mode:?}{}",
+        if capture_mode == CaptureMode::Damage && !video_may_idle {
+            " (client predates video_may_idle: at least one frame a second while idle)"
+        } else {
+            ""
+        }
+    );
+
+    // The most recent frame captured, re-encoded when a frame is owed but
+    // nothing has changed.
+    let mut last: Option<termland_compositor::ScreenFrame> = None;
+    // Capture without waiting for damage: at start (so a new or re-attached
+    // client gets a picture straight away), after a resize, after an error.
+    let mut need_full = true;
+    // Frames given to the encoder, and packets it has returned. Encoders
+    // return one packet per frame, in order, but some only after a delay
+    // (NVENC holds two frames; libx264 with lookahead, many more).
+    let mut frames_in: u64 = 0;
+    let mut packets_out: u64 = 0;
+    // `frames_in` index of the latest frame with new content. Until its
+    // packet is out, that content is stuck in the encoder and the client has
+    // not seen it, so the last frame is repeated to push it through.
+    let mut newest: Option<u64> = None;
+    // Repeats of the last frame still to send once the screen stops changing
+    // (see SETTLE_FRAMES).
+    let mut settle_left: u32 = 0;
+    let mut last_sent = std::time::Instant::now();
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -1236,69 +1335,41 @@ fn capture_thread(
                     Ok(()) => tracing::info!("Compositor output resized to {rw}x{rh}"),
                     Err(e) => tracing::warn!("Compositor resize failed: {e}"),
                 }
+                // Don't wait on damage across a mode change: take the new size now.
+                need_full = true;
                 // Encoder reinit happens lazily when we detect new frame dims below.
             }
         }
 
         let start = std::time::Instant::now();
+        let overlay = overlay_cursor.load(Ordering::Relaxed);
+        let stuck_in_encoder = newest.is_some_and(|n| packets_out <= n);
 
-        match compositor.capture_frame(overlay_cursor.load(Ordering::Relaxed)) {
-            Ok((w, h, rgba)) => {
-                // Rebuild the encoder if the captured frame size changed, and
-                // force a keyframe. A fresh encoder starts on one anyway, but
-                // this must be decided before encoder_dims is updated below.
-                let dims_changed = (w, h) != encoder_dims;
-                if dims_changed {
-                    tracing::info!("Capture dims changed {}x{} → {w}x{h}, reinitializing encoder",
-                        encoder_dims.0, encoder_dims.1);
-                    // Flush the old encoder before dropping it. This sends
-                    // EOS so the encoder can properly close.
-                    let _ = video_encoder.flush();
-                    video_encoder = init_encoder(&tuning, w, h, &supported_codecs);
-                    encoder_codec = video_encoder.backend().codec();
-                    encoder_dims = (w, h);
-                }
+        let captured = if capture_mode == CaptureMode::Full || need_full || last.is_none() {
+            compositor.capture_frame(overlay).map(|(width, height, rgba)| {
+                Some(termland_compositor::ScreenFrame { width, height, rgba, damage: Vec::new() })
+            })
+        } else {
+            // Wait a frame interval when a repeat may be owed, longer otherwise.
+            let wait = if stuck_in_encoder || settle_left > 0 { frame_duration } else { IDLE_POLL };
+            compositor.capture_damaged(overlay, wait)
+        };
 
-                let timestamp_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros() as u64;
-
-                let frames: Vec<CapturedFrame> = match video_encoder.encode_frame(&rgba, timestamp_us, dims_changed) {
-                    Ok(packets) if !packets.is_empty() => {
-                        packets.into_iter().map(|p| {
-                            let keyframe_str = if p.keyframe { "keyframe" } else { "frame" };
-                            tracing::debug!("{keyframe_str}: {} bytes", p.data.len());
-                            CapturedFrame::Video {
-                                data: p.data,
-                                keyframe: p.keyframe,
-                                width: w as u16,
-                                height: h as u16,
-                                timestamp_us,
-                                codec: encoder_codec,
-                            }
-                        }).collect()
-                    }
-                    Ok(_) => {
-                        // Encoder buffering - send nothing this iteration
+        match captured {
+            Ok(Some(frame)) => {
+                last = Some(frame);
+                need_full = false;
+                newest = Some(frames_in);
+                settle_left = if video_may_idle { SETTLE_FRAMES } else { LEGACY_SETTLE_FRAMES };
+            }
+            Ok(None) => {
+                // Nothing changed. Repeat the last frame only if one is owed.
+                if !stuck_in_encoder {
+                    if settle_left > 0 {
+                        settle_left -= 1;
+                    } else if video_may_idle || last_sent.elapsed() < LEGACY_IDLE_INTERVAL {
                         continue;
                     }
-                    Err(e) => {
-                        tracing::warn!("Video encode failed: {e}");
-                        // Continue capturing - the encoder may recover
-                        continue;
-                    }
-                };
-
-                let mut send_failed = false;
-                for frame in frames {
-                    if frame_tx.blocking_send(frame).is_err() {
-                        send_failed = true;
-                        break;
-                    }
-                }
-                if send_failed {
-                    break;
                 }
             }
             Err(e) => {
@@ -1307,8 +1378,73 @@ fn capture_thread(
                     break;
                 }
                 tracing::warn!("Frame capture failed: {e}");
+                need_full = true;
+                std::thread::sleep(frame_duration);
+                continue;
             }
         }
+        let Some(frame) = last.as_ref() else { continue };
+        let (w, h) = (frame.width, frame.height);
+
+        // Rebuild the encoder if the captured frame size changed, and
+        // force a keyframe. A fresh encoder starts on one anyway, but
+        // this must be decided before encoder_dims is updated below.
+        let dims_changed = (w, h) != encoder_dims;
+        if dims_changed {
+            tracing::info!("Capture dims changed {}x{} → {w}x{h}, reinitializing encoder",
+                encoder_dims.0, encoder_dims.1);
+            // Flush the old encoder before dropping it. This sends
+            // EOS so the encoder can properly close.
+            let _ = video_encoder.flush();
+            video_encoder = init_encoder(&tuning, w, h, &supported_codecs);
+            encoder_codec = video_encoder.backend().codec();
+            encoder_dims = (w, h);
+            // The old encoder's packets are gone with it; count afresh.
+            packets_out = frames_in;
+        }
+
+        let timestamp_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        frames_in += 1;
+        let packets = match video_encoder.encode_frame(&frame.rgba, timestamp_us, dims_changed) {
+            Ok(packets) => packets,
+            Err(e) => {
+                tracing::warn!("Video encode failed: {e}");
+                // Continue capturing - the encoder may recover
+                packets_out = frames_in;
+                continue;
+            }
+        };
+        packets_out += packets.len() as u64;
+        if packets.is_empty() {
+            // Encoder buffering - send nothing this iteration
+            continue;
+        }
+
+        let mut send_failed = false;
+        for p in packets {
+            let keyframe_str = if p.keyframe { "keyframe" } else { "frame" };
+            tracing::debug!("{keyframe_str}: {} bytes", p.data.len());
+            let frame = CapturedFrame::Video {
+                data: p.data,
+                keyframe: p.keyframe,
+                width: w as u16,
+                height: h as u16,
+                timestamp_us,
+                codec: encoder_codec,
+            };
+            if frame_tx.blocking_send(frame).is_err() {
+                send_failed = true;
+                break;
+            }
+        }
+        if send_failed {
+            break;
+        }
+        last_sent = std::time::Instant::now();
 
         let elapsed = start.elapsed();
         if elapsed < frame_duration {

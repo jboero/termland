@@ -190,6 +190,8 @@ pub(crate) async fn open_session(
                     encoder_extra_params: None,
                     supported_codecs,
                     supported_audio_codecs: supported_audio_codecs.clone(),
+                    video_may_idle: false,
+                    bitrate_kbps: None,
                 }))
                 .await?;
         }
@@ -207,6 +209,8 @@ pub(crate) async fn open_session(
                     encoder_extra_params: None,
                     supported_codecs,
                     supported_audio_codecs: supported_audio_codecs.clone(),
+                    video_may_idle: false,
+                    bitrate_kbps: None,
                 }))
                 .await?;
         }

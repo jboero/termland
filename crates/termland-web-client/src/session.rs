@@ -160,6 +160,8 @@ impl WebClient {
             // Q2's audio header has no timestamp field, which WebCodecs
             // requires, so the browser path does not carry audio yet.
             supported_audio_codecs: Vec::<AudioCodec>::new(),
+            video_may_idle: false,
+            bitrate_kbps: None,
         }));
     }
 
@@ -177,6 +179,8 @@ impl WebClient {
             encoder_extra_params: None,
             supported_codecs: codecs,
             supported_audio_codecs: Vec::<AudioCodec>::new(),
+            video_may_idle: false,
+            bitrate_kbps: None,
         }));
     }
 
@@ -379,6 +383,8 @@ fn render_sessions(
                     encoder_extra_params: None,
                     supported_codecs: codecs.clone(),
                     supported_audio_codecs: Vec::<AudioCodec>::new(),
+                    video_may_idle: false,
+                    bitrate_kbps: None,
                 }));
             }
         });

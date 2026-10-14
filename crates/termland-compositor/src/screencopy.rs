@@ -3,10 +3,12 @@
 //! Connects to a Wayland compositor as a client and uses the
 //! zwlr_screencopy_manager_v1 protocol to capture screen frames.
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::io::OwnedFd;
+use std::time::{Duration, Instant};
 use wayland_client::{
-    Connection, Dispatch, EventQueue, QueueHandle,
+    backend::ObjectId,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
     protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool},
 };
 use wayland_protocols_wlr::screencopy::v1::client::{
@@ -43,7 +45,11 @@ struct CaptureState {
     frame_ready: bool,
     frame_failed: bool,
     buffer_ready: bool,
-    _frame_data: Vec<u8>,
+    /// The frame request the events below belong to. Events for any other
+    /// (an abandoned request whose events were already in flight) are ignored.
+    current_frame: Option<ObjectId>,
+    /// Damage reported for the current frame (copy_with_damage only).
+    damage: Vec<DamageRect>,
 }
 
 impl CaptureState {
@@ -59,7 +65,8 @@ impl CaptureState {
             frame_ready: false,
             frame_failed: false,
             buffer_ready: false,
-            _frame_data: Vec::new(),
+            current_frame: None,
+            damage: Vec::new(),
         }
     }
 }
@@ -168,12 +175,15 @@ impl Dispatch<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, ()> for Captu
 impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for CaptureState {
     fn event(
         state: &mut Self,
-        _frame: &zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+        frame: &zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
         event: zwlr_screencopy_frame_v1::Event,
         _: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        if state.current_frame.as_ref() != Some(&frame.id()) {
+            return;
+        }
         match event {
             zwlr_screencopy_frame_v1::Event::Buffer {
                 format,
@@ -218,6 +228,9 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for CaptureSt
                     state.buffer_ready = true;
                 }
             }
+            zwlr_screencopy_frame_v1::Event::Damage { x, y, width, height } => {
+                state.damage.push(DamageRect { x, y, width, height });
+            }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
                 state.frame_ready = true;
             }
@@ -230,6 +243,84 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for CaptureSt
     }
 }
 
+/// A region of the output that changed since the previous capture, in
+/// buffer pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A captured output frame.
+#[derive(Debug)]
+pub struct ScreenFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    /// What changed since the previous capture. Empty for a capture that did
+    /// not ask for damage ([`ScreenCapturer::capture_frame`]).
+    pub damage: Vec<DamageRect>,
+}
+
+/// The wl_shm buffer frames are copied into. Kept, and kept mapped, for as
+/// long as the output's size and format stay the same, instead of creating a
+/// memfd, pool and mapping for every frame.
+struct ShmBuffer {
+    pool: wl_shm_pool::WlShmPool,
+    buffer: wl_buffer::WlBuffer,
+    _fd: OwnedFd,
+    map: *mut libc::c_void,
+    size: usize,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: u32,
+}
+
+// The mapping is private to this buffer and only read through `&self`.
+unsafe impl Send for ShmBuffer {}
+
+impl ShmBuffer {
+    fn new(
+        shm: &wl_shm::WlShm,
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: u32,
+        qh: &QueueHandle<CaptureState>,
+    ) -> Result<Self, CaptureError> {
+        let size = (stride * height) as usize;
+        let (pool, buffer, fd) = create_shm_buffer(shm, width, height, stride, format, qh)?;
+        let map = unsafe {
+            libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_SHARED, fd.as_raw_fd(), 0)
+        };
+        if map == libc::MAP_FAILED {
+            buffer.destroy();
+            pool.destroy();
+            return Err(CaptureError::ShmError("mmap failed".into()));
+        }
+        Ok(Self { pool, buffer, _fd: fd, map, size, width, height, stride, format })
+    }
+
+    fn fits(&self, width: u32, height: u32, stride: u32, format: u32) -> bool {
+        (self.width, self.height, self.stride, self.format) == (width, height, stride, format)
+    }
+
+    fn data(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.map as *const u8, self.size) }
+    }
+}
+
+impl Drop for ShmBuffer {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.map, self.size) };
+        self.buffer.destroy();
+        self.pool.destroy();
+    }
+}
+
 /// High-level screen capturer that manages the Wayland connection and screencopy.
 pub struct ScreenCapturer {
     _conn: Connection,
@@ -237,6 +328,11 @@ pub struct ScreenCapturer {
     state: CaptureState,
     /// Set after we log the first selected format, so we only log it once.
     format_logged: bool,
+    shm_buffer: Option<ShmBuffer>,
+    /// A frame request the compositor has not completed yet. A
+    /// copy_with_damage request stays pending until something changes, and is
+    /// kept across calls so that a wait which times out does not lose it.
+    pending: Option<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1>,
 }
 
 impl ScreenCapturer {
@@ -286,96 +382,180 @@ impl ScreenCapturer {
             event_queue,
             state,
             format_logged: false,
+            shm_buffer: None,
+            pending: None,
         })
     }
 
-    /// Capture a single frame. Returns (width, height, rgba_data).
+    /// Capture a frame now, whether or not anything changed. Returns
+    /// (width, height, rgba_data).
     /// `overlay_cursor`: include the compositor's cursor in the captured frame.
     pub fn capture_frame(&mut self, overlay_cursor: bool) -> Result<(u32, u32, Vec<u8>), CaptureError> {
+        self.abandon_pending();
+        self.request(overlay_cursor, false)?;
+        self.wait(None)?;
+        let frame = self.finish()?;
+        Ok((frame.width, frame.height, frame.rgba))
+    }
+
+    /// Capture the next frame that differs from the previous capture, waiting
+    /// at most `timeout` for something to change. `Ok(None)` means nothing
+    /// did; the request stays pending, so the next call carries on waiting
+    /// for the same change rather than starting over.
+    pub fn capture_damaged(
+        &mut self,
+        overlay_cursor: bool,
+        timeout: Duration,
+    ) -> Result<Option<ScreenFrame>, CaptureError> {
+        if self.pending.is_none() {
+            self.request(overlay_cursor, true)?;
+        }
+        if !self.wait(Some(Instant::now() + timeout))? {
+            return Ok(None);
+        }
+        self.finish().map(Some)
+    }
+
+    /// Ask the compositor for the next frame, into our shm buffer.
+    fn request(&mut self, overlay_cursor: bool, with_damage: bool) -> Result<(), CaptureError> {
         let qh = self.event_queue.handle();
+        let output = self.state.output.as_ref().ok_or(CaptureError::NoOutput)?.clone();
+        let mgr = self.state.screencopy_mgr.as_ref().ok_or(CaptureError::NoScreencopy)?.clone();
 
-        let output = self
-            .state
-            .output
-            .as_ref()
-            .ok_or(CaptureError::NoOutput)?
-            .clone();
-        let mgr = self
-            .state
-            .screencopy_mgr
-            .as_ref()
-            .ok_or(CaptureError::NoScreencopy)?
-            .clone();
-
-        // Reset frame state
         self.state.buffer_ready = false;
         self.state.frame_ready = false;
         self.state.frame_failed = false;
+        self.state.damage.clear();
 
         // overlay_cursor=1 → include the compositor's software cursor in the captured
         // frame. wlroots renders cursors in a separate plane by default, so we have to
         // ask for it explicitly. The client can toggle this off to render its own local
         // cursor for lower latency.
         let frame = mgr.capture_output(overlay_cursor as i32, &output, &qh, ());
+        self.state.current_frame = Some(frame.id());
 
         // Roundtrip to get the Buffer event with dimensions
-        self.event_queue
-            .roundtrip(&mut self.state)
-            .map_err(|e| CaptureError::Failed(format!("roundtrip for buffer info: {e}")))?;
-
+        if let Err(e) = self.event_queue.roundtrip(&mut self.state) {
+            frame.destroy();
+            return Err(CaptureError::Failed(format!("roundtrip for buffer info: {e}")));
+        }
         if !self.state.buffer_ready {
+            frame.destroy();
             return Err(CaptureError::Failed("no buffer info received".into()));
         }
 
-        let width = self.state.frame_width;
-        let height = self.state.frame_height;
-        let stride = self.state.frame_stride;
-        let size = (stride * height) as usize;
+        let (width, height) = (self.state.frame_width, self.state.frame_height);
+        let (stride, format) = (self.state.frame_stride, self.state.frame_format);
 
         // Log the selected format once, at INFO level, so the user can diagnose
         // colorspace issues without enabling debug logging.
         if !self.format_logged {
-            let fmt = self.state.frame_format;
-            let fmt_name = match fmt {
+            let fmt_name = match format {
                 0 => "ARGB8888(wl_shm)", 1 => "XRGB8888(wl_shm)",
                 875713089 => "ARGB8888(AR24)", 875713112 => "XRGB8888(XR24)",
                 875708993 => "ABGR8888(AB24)", 875709016 => "XBGR8888(XB24)",
                 875710274 => "BGR888(BG24)", 875710290 => "RGB888(RG24)",
                 _ => "unknown",
             };
-            tracing::info!("Screencopy format: {fmt_name} ({fmt}), {width}x{height} stride={stride}");
+            tracing::info!("Screencopy format: {fmt_name} ({format}), {width}x{height} stride={stride}");
             self.format_logged = true;
         }
 
-        // Create a shared memory buffer
-        let shm = self.state.shm.as_ref().ok_or(CaptureError::NoShm)?.clone();
-        let (pool, buffer, fd) =
-            create_shm_buffer(&shm, width, height, stride, self.state.frame_format, &qh)?;
-
-        // Tell screencopy to copy into our buffer
-        frame.copy(&buffer);
-
-        // Wait for Ready or Failed
-        while !self.state.frame_ready && !self.state.frame_failed {
-            self.event_queue
-                .roundtrip(&mut self.state)
-                .map_err(|e| CaptureError::Failed(format!("roundtrip for frame: {e}")))?;
+        if !self.shm_buffer.as_ref().is_some_and(|b| b.fits(width, height, stride, format)) {
+            // Drop the old buffer before creating its replacement.
+            self.shm_buffer = None;
+            let shm = self.state.shm.as_ref().ok_or(CaptureError::NoShm)?.clone();
+            match ShmBuffer::new(&shm, width, height, stride, format, &qh) {
+                Ok(b) => self.shm_buffer = Some(b),
+                Err(e) => {
+                    frame.destroy();
+                    return Err(e);
+                }
+            }
         }
+        let buffer = &self.shm_buffer.as_ref().expect("created above").buffer;
+        if with_damage {
+            frame.copy_with_damage(buffer);
+        } else {
+            frame.copy(buffer);
+        }
+        self.pending = Some(frame);
+        Ok(())
+    }
 
+    /// Wait for the pending frame to complete or fail, until `deadline`
+    /// (forever if `None`). Returns false if the deadline passed first.
+    fn wait(&mut self, deadline: Option<Instant>) -> Result<bool, CaptureError> {
+        let failed = |e: &dyn std::fmt::Display| CaptureError::Failed(format!("waiting for frame: {e}"));
+        loop {
+            self.event_queue.dispatch_pending(&mut self.state).map_err(|e| failed(&e))?;
+            if self.state.frame_ready || self.state.frame_failed {
+                return Ok(true);
+            }
+            self.event_queue.flush().map_err(|e| failed(&e))?;
+            // None means events are already queued: dispatch them first.
+            let Some(guard) = self.event_queue.prepare_read() else { continue };
+            let timeout_ms = match deadline {
+                None => -1,
+                Some(d) => {
+                    let left = d.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Ok(false);
+                    }
+                    left.as_millis().clamp(1, i32::MAX as u128) as i32
+                }
+            };
+            let mut pfd = libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(failed(&err));
+            }
+            if n == 0 {
+                // Timed out; dropping the guard cancels the read.
+                return Ok(false);
+            }
+            match guard.read() {
+                Ok(_) => {}
+                Err(wayland_client::backend::WaylandError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(failed(&e)),
+            }
+        }
+    }
+
+    /// Collect the completed pending frame.
+    fn finish(&mut self) -> Result<ScreenFrame, CaptureError> {
+        if let Some(frame) = self.pending.take() {
+            frame.destroy();
+        }
+        self.state.current_frame = None;
         if self.state.frame_failed {
-            buffer.destroy();
-            pool.destroy();
             return Err(CaptureError::Failed("compositor reported failure".into()));
         }
+        let buf = self.shm_buffer.as_ref().ok_or_else(|| CaptureError::Failed("no buffer".into()))?;
+        let rgba = to_rgba(buf.data(), buf.width, buf.height, buf.stride, buf.format);
+        Ok(ScreenFrame {
+            width: buf.width,
+            height: buf.height,
+            rgba,
+            damage: std::mem::take(&mut self.state.damage),
+        })
+    }
 
-        // Read pixels from the shared memory fd
-        let rgba = read_shm_to_rgba(&fd, size, width, height, stride, self.state.frame_format)?;
-
-        // Clean up
-        buffer.destroy();
-        pool.destroy();
-
-        Ok((width, height, rgba))
+    /// Withdraw a pending request, so a new one can be made.
+    fn abandon_pending(&mut self) {
+        if let Some(frame) = self.pending.take() {
+            frame.destroy();
+        }
+        self.state.current_frame = None;
     }
 }
 
@@ -427,34 +607,8 @@ pub(crate) fn create_memfd(size: usize) -> Result<OwnedFd, CaptureError> {
     Ok(fd)
 }
 
-/// Read from the shm fd and convert to RGBA.
-pub(crate) fn read_shm_to_rgba(
-    fd: &OwnedFd,
-    size: usize,
-    width: u32,
-    height: u32,
-    stride: u32,
-    format: u32,
-) -> Result<Vec<u8>, CaptureError> {
-    use std::os::fd::AsRawFd;
-
-    // mmap the fd
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            fd.as_raw_fd(),
-            0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        return Err(CaptureError::ShmError("mmap failed".into()));
-    }
-
-    let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
-
+/// Convert a captured shm buffer to RGBA.
+fn to_rgba(data: &[u8], width: u32, height: u32, stride: u32, format: u32) -> Vec<u8> {
     // Convert from compositor format to RGBA.
     //
     // DRM/wl_shm format names describe the BIT LAYOUT as a little-endian 24/32-bit
@@ -503,9 +657,5 @@ pub(crate) fn read_shm_to_rgba(
         }
     }
 
-    unsafe {
-        libc::munmap(ptr, size);
-    }
-
-    Ok(rgba)
+    rgba
 }

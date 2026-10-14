@@ -36,6 +36,9 @@ pub struct Profile {
     pub width: u32,
     pub height: u32,
     pub quality: u8,
+    /// Target bitrate in kbps, overriding `quality`. None in profiles saved
+    /// before this existed.
+    pub bitrate_kbps: Option<u32>,
     /// Free-form "desktop" / "app:<cmd>" string, same as `Args::mode`.
     pub mode: String,
     pub desktop_shell: Option<String>,
@@ -61,6 +64,7 @@ impl Profile {
             width: 1280,
             height: 720,
             quality: 75,
+            bitrate_kbps: None,
             mode: "desktop".into(),
             desktop_shell: None,
             codec: None,
@@ -146,6 +150,16 @@ pub(crate) mod dirs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profiles.json saved before `bitrate_kbps` existed must still load,
+    /// with the bitrate left to `quality`.
+    #[test]
+    fn profile_saved_without_a_bitrate_still_loads() {
+        let mut v = serde_json::to_value(Store { profiles: vec![Profile::new_default()] }).unwrap();
+        v["profiles"][0].as_object_mut().unwrap().remove("bitrate_kbps").expect("field present");
+        let parsed: Store = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.profiles[0].bitrate_kbps, None);
+    }
 
     #[test]
     fn profile_json_round_trip() {
