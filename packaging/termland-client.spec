@@ -169,7 +169,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/io.github.jboero.term
 - Tells a 0.9.0 server it copes with video stopping while the screen is
   idle, and sends input as soon as it is typed rather than on a 100 ms tick.
 - Video decoders open in low-delay mode. NVIDIA's decoder held 3-5 frames
-  back, over 100 ms of latency.
+  back, over 100 ms of latency, and Intel's QSV decoder 3.
 - Trying decoders no longer prints FFmpeg errors for hardware the machine
   does not have.
 
