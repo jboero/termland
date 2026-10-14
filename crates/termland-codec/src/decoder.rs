@@ -293,7 +293,15 @@ impl VideoDecoder {
         // no B-frames to reorder, and without this cuvid holds back up to
         // four frames, which a stream that goes quiet would leave unshown.
         ctx.set_flags(ffmpeg_next::codec::Flags::LOW_DELAY);
-        ctx.decoder().video()
+        let mut opts = ffmpeg_next::Dictionary::new();
+        if matches!(backend, DecoderBackend::IntelQsv | DecoderBackend::HevcQsv | DecoderBackend::H264Qsv) {
+            // QSV keeps async_depth frames in flight (4 by default), and
+            // ignores the low-delay flag.
+            opts.set("async_depth", "1");
+        }
+        ctx.decoder()
+            .open_as_with(codec, opts)
+            .and_then(|opened| opened.video())
             .map_err(|e| DecoderError::InitFailed(format!("{backend}: {e}")))
     }
 

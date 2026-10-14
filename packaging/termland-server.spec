@@ -264,7 +264,10 @@ fi
 - QUIC connections send keep-alives, so an idle session is not dropped.
 - Fix the session loop spinning a CPU core when the cursor or clipboard
   watcher thread exits.
-- Forced keyframes are now real keyframes on NVENC and libx265.
+- Forced keyframes are now real keyframes on NVENC, libx265 and QSV.
+- VA-API encoding works (#46). It never had: frames were not uploaded to
+  the GPU, so every VA-API encoder failed to open, and AMD GPUs went unused
+  without the proprietary AMF driver.
 - Trying encoders no longer prints FFmpeg errors for hardware the machine
   does not have.
 

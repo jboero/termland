@@ -92,6 +92,17 @@ impl EncoderBackend {
     }
 
     /// The wire codec produced by this backend.
+    /// Encodes through VA-API, from frames uploaded to the GPU.
+    fn is_vaapi(&self) -> bool {
+        matches!(
+            self,
+            EncoderBackend::AmdVaapi
+                | EncoderBackend::Vp9Vaapi
+                | EncoderBackend::H265Vaapi
+                | EncoderBackend::H264Vaapi
+        )
+    }
+
     pub fn codec(&self) -> VideoCodec {
         match self {
             EncoderBackend::IntelQsv
@@ -305,6 +316,86 @@ impl std::ops::DerefMut for SendScaler {
 }
 
 /// FFmpeg-based encoder. Works with any backend (HW or SW).
+/// The GPU frame pool a VA-API encoder encodes from. FFmpeg's VA-API
+/// encoders accept only VA surfaces (AV_PIX_FMT_VAAPI), never frames in
+/// system memory, so each converted NV12 frame is uploaded into one.
+struct VaapiFrames {
+    device: *mut ffmpeg_next::ffi::AVBufferRef,
+    frames: *mut ffmpeg_next::ffi::AVBufferRef,
+}
+
+// The buffers are reference-counted FFmpeg objects owned by one encoder and
+// only used from whichever thread holds that encoder.
+unsafe impl Send for VaapiFrames {}
+
+impl VaapiFrames {
+    fn new(width: u32, height: u32) -> Result<Self, String> {
+        use ffmpeg_next::ffi::*;
+        unsafe {
+            // The default VA display: the first DRM render node.
+            let mut device = std::ptr::null_mut();
+            let err = av_hwdevice_ctx_create(
+                &mut device,
+                AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if err < 0 {
+                return Err(format!("no VA-API device ({})", ffmpeg_next::Error::from(err)));
+            }
+            let mut frames = av_hwframe_ctx_alloc(device);
+            if frames.is_null() {
+                av_buffer_unref(&mut device);
+                return Err("allocating VA-API frames".into());
+            }
+            let ctx = (*frames).data as *mut AVHWFramesContext;
+            (*ctx).format = AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*ctx).sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
+            (*ctx).width = width as i32;
+            (*ctx).height = height as i32;
+            (*ctx).initial_pool_size = 8;
+            let err = av_hwframe_ctx_init(frames);
+            if err < 0 {
+                av_buffer_unref(&mut frames);
+                av_buffer_unref(&mut device);
+                return Err(format!("VA-API frames ({})", ffmpeg_next::Error::from(err)));
+            }
+            Ok(Self { device, frames })
+        }
+    }
+
+    /// Upload a frame in system memory (NV12) to a VA surface from the pool,
+    /// carrying over its timestamp and picture type.
+    fn upload(&self, frame: &ffmpeg_next::frame::Video) -> Result<ffmpeg_next::frame::Video, String> {
+        use ffmpeg_next::ffi::*;
+        let mut surface = ffmpeg_next::frame::Video::empty();
+        unsafe {
+            let dst = surface.as_mut_ptr();
+            let err = av_hwframe_get_buffer(self.frames, dst, 0);
+            if err < 0 {
+                return Err(format!("VA surface ({})", ffmpeg_next::Error::from(err)));
+            }
+            let err = av_hwframe_transfer_data(dst, frame.as_ptr(), 0);
+            if err < 0 {
+                return Err(format!("upload to VA surface ({})", ffmpeg_next::Error::from(err)));
+            }
+            (*dst).pts = (*frame.as_ptr()).pts;
+            (*dst).pict_type = (*frame.as_ptr()).pict_type;
+        }
+        Ok(surface)
+    }
+}
+
+impl Drop for VaapiFrames {
+    fn drop(&mut self) {
+        unsafe {
+            ffmpeg_next::ffi::av_buffer_unref(&mut self.frames);
+            ffmpeg_next::ffi::av_buffer_unref(&mut self.device);
+        }
+    }
+}
+
 pub struct FfmpegVideoEncoder {
     backend: EncoderBackend,
     encoder: ffmpeg_next::encoder::Video,
@@ -312,6 +403,9 @@ pub struct FfmpegVideoEncoder {
     pixel_fmt: ffmpeg_next::format::Pixel,
     frame_index: i64,
     config: EncoderConfig,
+    // Declared after `encoder`, so the encoder is dropped (and lets go of its
+    // own reference to the frame pool) first.
+    vaapi: Option<VaapiFrames>,
 }
 
 impl FfmpegVideoEncoder {
@@ -358,6 +452,21 @@ impl FfmpegVideoEncoder {
         encoder.set_time_base(ffmpeg_next::Rational::new(1, config.fps as i32));
         encoder.set_gop(config.keyframe_interval);
 
+        // A VA-API encoder encodes from VA surfaces: give it a pool of them,
+        // into which encode_frame uploads each converted NV12 frame.
+        let vaapi = if backend.is_vaapi() {
+            let frames = VaapiFrames::new(config.width, config.height)
+                .map_err(|e| EncoderError::InitFailed(format!("{backend}: {e}")))?;
+            unsafe {
+                let ctx = encoder.as_mut_ptr();
+                (*ctx).pix_fmt = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+                (*ctx).hw_frames_ctx = ffmpeg_next::ffi::av_buffer_ref(frames.frames);
+            }
+            Some(frames)
+        } else {
+            None
+        };
+
         // For the backends with bitrate-based rate control.
         let kbps = config.rate.kbps(backend.codec());
 
@@ -389,6 +498,8 @@ impl FfmpegVideoEncoder {
                 opts.set("preset", preset);
                 opts.set("look_ahead", "0");
                 opts.set("async_depth", "1");
+                // As for NVENC: otherwise a forced keyframe is not an IDR frame.
+                opts.set("forced_idr", "1");
                 opts.set("low_delay_brc", "1");
                 encoder.set_max_b_frames(0);
                 tracing::info!("QSV tuning: preset={preset}");
@@ -429,6 +540,8 @@ impl FfmpegVideoEncoder {
                 opts.set("preset", preset);
                 opts.set("look_ahead", "0");
                 opts.set("async_depth", "1");
+                // As for NVENC: otherwise a forced keyframe is not an IDR frame.
+                opts.set("forced_idr", "1");
                 encoder.set_max_b_frames(0);
                 tracing::info!("QSV HEVC tuning: preset={preset}");
             }
@@ -465,6 +578,8 @@ impl FfmpegVideoEncoder {
                 opts.set("preset", preset);
                 opts.set("look_ahead", "0");
                 opts.set("async_depth", "1");
+                // As for NVENC: otherwise a forced keyframe is not an IDR frame.
+                opts.set("forced_idr", "1");
                 encoder.set_max_b_frames(0);
                 tracing::info!("QSV H.264 tuning: preset={preset}");
             }
@@ -531,6 +646,7 @@ impl FfmpegVideoEncoder {
             pixel_fmt,
             frame_index: 0,
             config: config.clone(),
+            vaapi,
         })
     }
 }
@@ -590,10 +706,15 @@ impl VideoEncoder for FfmpegVideoEncoder {
         }
         self.frame_index += 1;
 
-        // Send frame to encoder
-        self.encoder.send_frame(&yuv_frame).map_err(|e| {
-            EncoderError::EncodeFailed(format!("send frame: {e}"))
-        })?;
+        // Send frame to encoder (a VA-API one takes it as a VA surface)
+        let sent = match &self.vaapi {
+            Some(vaapi) => {
+                let surface = vaapi.upload(&yuv_frame).map_err(EncoderError::EncodeFailed)?;
+                self.encoder.send_frame(&surface)
+            }
+            None => self.encoder.send_frame(&yuv_frame),
+        };
+        sent.map_err(|e| EncoderError::EncodeFailed(format!("send frame: {e}")))?;
 
         // Drain all available encoded packets.
         let mut results = Vec::new();
@@ -1006,6 +1127,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{backend}: flush: {e}"));
             keyframes += flushed.iter().filter(|p| p.keyframe).count();
             assert_eq!(keyframes, 2, "{backend}: the keyframe forced at frame 6 was not a keyframe");
+            eprintln!("tested {backend}");
             tested += 1;
         }
         if tested == 0 {
@@ -1051,6 +1173,7 @@ mod tests {
             let high = bytes_per_sec(backend, RateTarget::Kbps(3000)).unwrap();
             assert!(q10 * 2.0 < q90, "{backend}: quality 10 gave {q10} B/s, quality 90 {q90} B/s");
             assert!(low * 2.0 < high, "{backend}: 300 kbps gave {low} B/s, 3000 kbps {high} B/s");
+            eprintln!("tested {backend}: q10 {q10:.0} q90 {q90:.0} 300k {low:.0} 3000k {high:.0} B/s");
             tested += 1;
         }
         if tested == 0 {
