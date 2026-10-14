@@ -3,13 +3,18 @@
 //! representative desktop workloads.
 //!
 //! `#[ignore]`d: spawns a real server, which starts a real labwc compositor
-//! and real apps (konsole, mpv). Run it manually and compare two builds or two
-//! server configurations:
+//! and real apps (konsole, mpv, grim). The two benchmarks only measure, so
+//! they also skip unless `TERMLAND_BENCH=1` is set: CI runs ignored tests,
+//! and has neither the apps nor CPU numbers worth reading. Run them by hand
+//! and compare two builds or two server configurations:
 //!
 //! ```sh
-//! TERMLAND_BENCH_LABEL=before \
-//!   cargo test --release -p termland-server --test capture_efficiency -- --ignored --nocapture
+//! TERMLAND_BENCH=1 TERMLAND_BENCH_LABEL=before \
+//!   cargo test --release -p termland-server --test capture_efficiency -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! `idle_session_still_answers_resize_and_attach` is a functional test, and
+//! runs wherever a terminal emulator is installed, CI included.
 //!
 //! Environment:
 //! - `TERMLAND_BENCH_LABEL`: name for this run in the output (default "run").
@@ -135,6 +140,23 @@ fn grim(record: &std::collections::HashMap<String, String>, format: &str, out: &
         .expect("run grim");
     assert!(output.status.success(), "grim failed: {}", String::from_utf8_lossy(&output.stderr));
     output.stdout
+}
+
+/// The benchmarks run only when asked for (see the module doc).
+fn benchmarks_requested() -> bool {
+    let yes = std::env::var_os("TERMLAND_BENCH").is_some_and(|v| v == "1");
+    if !yes {
+        eprintln!("skipping: a benchmark; set TERMLAND_BENCH=1 to run it");
+    }
+    yes
+}
+
+fn first_on_path(names: &[&str]) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    names
+        .iter()
+        .find(|name| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+        .map(|name| name.to_string())
 }
 
 /// A server with one session, driven over TCP the way a client drives it.
@@ -331,8 +353,11 @@ fn psnr(decoded: &[u32], ppm: &[u8]) -> f64 {
 /// Scrolls a terminal for 3 s, then stops; decodes every frame received, and
 /// compares the last decoded frame with a lossless screenshot of the session.
 #[tokio::test]
-#[ignore = "needs labwc, konsole and grim; spawns a real session — run manually"]
+#[ignore = "benchmark: needs labwc, konsole and grim, and TERMLAND_BENCH=1"]
 async fn still_frame_quality() {
+    if !benchmarks_requested() {
+        return;
+    }
     let shell = shell_command(
         "burst",
         "konsole -e",
@@ -360,8 +385,11 @@ async fn still_frame_quality() {
 }
 
 #[tokio::test]
-#[ignore = "needs labwc, konsole and mpv; spawns real sessions — run manually"]
+#[ignore = "benchmark: needs labwc, konsole and mpv, and TERMLAND_BENCH=1"]
 async fn capture_efficiency() {
+    if !benchmarks_requested() {
+        return;
+    }
     let secs: u64 = std::env::var("TERMLAND_BENCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
     let only: Option<Vec<String>> = std::env::var("TERMLAND_BENCH_WORKLOADS")
         .ok()
@@ -395,9 +423,13 @@ async fn capture_efficiency() {
 /// one while nothing on screen is changing: after a resize, and when a client
 /// attaches to an idle session (which must also start on a keyframe).
 #[tokio::test]
-#[ignore = "needs labwc and konsole; spawns a real session — run manually"]
+#[ignore = "needs labwc and a terminal emulator; spawns a real session"]
 async fn idle_session_still_answers_resize_and_attach() {
-    let mut b = Bench::start("idle-resize-attach", "konsole", 27960, true).await;
+    // Any terminal does: it only has to sit there. Same order as the other
+    // real-session tests, so CI's foot is found first.
+    let terminal = first_on_path(&["foot", "konsole", "alacritty", "xterm"])
+        .expect("no terminal emulator available to open a window with");
+    let mut b = Bench::start("idle-resize-attach", &terminal, 27960, true).await;
     let warmup_end = Instant::now() + Duration::from_secs(6);
     while b.next(warmup_end).await.is_some() {}
     let session_id = b.session.id.clone().expect("no SessionReady");
