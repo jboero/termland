@@ -498,6 +498,8 @@ impl FfmpegVideoEncoder {
                 opts.set("preset", preset);
                 opts.set("look_ahead", "0");
                 opts.set("async_depth", "1");
+                // As for NVENC: otherwise a forced keyframe is not an IDR frame.
+                opts.set("forced_idr", "1");
                 opts.set("low_delay_brc", "1");
                 encoder.set_max_b_frames(0);
                 tracing::info!("QSV tuning: preset={preset}");
@@ -538,6 +540,8 @@ impl FfmpegVideoEncoder {
                 opts.set("preset", preset);
                 opts.set("look_ahead", "0");
                 opts.set("async_depth", "1");
+                // As for NVENC: otherwise a forced keyframe is not an IDR frame.
+                opts.set("forced_idr", "1");
                 encoder.set_max_b_frames(0);
                 tracing::info!("QSV HEVC tuning: preset={preset}");
             }
@@ -574,6 +578,8 @@ impl FfmpegVideoEncoder {
                 opts.set("preset", preset);
                 opts.set("look_ahead", "0");
                 opts.set("async_depth", "1");
+                // As for NVENC: otherwise a forced keyframe is not an IDR frame.
+                opts.set("forced_idr", "1");
                 encoder.set_max_b_frames(0);
                 tracing::info!("QSV H.264 tuning: preset={preset}");
             }
