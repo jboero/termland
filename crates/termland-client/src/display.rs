@@ -9,7 +9,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 use crate::Args;
 use crate::connection::{ClientCommand, ConnectParams, ServerEvent, connect};
-use crate::overlay::{self, BarItem, BarLayout, MenuState, RemoteCursor, MENUBAR_HEIGHT};
+use crate::overlay::{self, BarItem, BarLayout, CloseChoice, ClosePromptLayout, MenuState, RemoteCursor, MENUBAR_HEIGHT};
 use termland_protocol::input;
 use winit::window::Fullscreen;
 
@@ -193,7 +193,19 @@ struct App {
     /// Shown in the window until the user closes it: a window launched from
     /// the session manager has no terminal to print it to.
     connect_failed: Option<String>,
+    /// The detach / end session prompt is showing (`request_close`). While it
+    /// is, input goes to it rather than the session.
+    close_prompt: bool,
+    close_layout: Option<ClosePromptLayout>,
+    close_hovered: Option<CloseChoice>,
+    /// When End session was chosen. The window stays until the request has
+    /// gone (`SessionEnded`), or gives up after `END_SESSION_TIMEOUT`.
+    ending_since: Option<std::time::Instant>,
 }
+
+/// How long to wait for an End session request to be sent before closing
+/// the window anyway.
+const END_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl App {
     fn new(args: Args) -> Self {
@@ -211,6 +223,10 @@ impl App {
             last_title: String::new(),
             bar_layout: None,
             bar_hovered: None,
+            close_prompt: false,
+            close_layout: None,
+            close_hovered: None,
+            ending_since: None,
             bar_visible: false,
             fullscreen: false,
             pending_resize: None,
@@ -312,11 +328,47 @@ impl App {
             BarItem::Fullscreen => {
                 self.toggle_fullscreen();
             }
-            BarItem::Quit => {
+            BarItem::Quit => self.request_close(event_loop),
+        }
+    }
+
+    /// The window is being closed (close button, Quit). A running session is
+    /// asked about: detach and keep it, or end it. Asked twice - the close
+    /// button again while the prompt is up - detaches, which loses nothing.
+    /// With no session to keep or end (it never started, or is between
+    /// reconnects), the window just closes as before.
+    fn request_close(&mut self, event_loop: &ActiveEventLoop) {
+        let running = self.session_id.is_some()
+            && self.connect_failed.is_none()
+            && self.reconnecting.is_none();
+        if self.ending_since.is_some() {
+            return;
+        }
+        if self.close_prompt || !running {
+            self.choose_close(CloseChoice::Detach, event_loop);
+            return;
+        }
+        self.close_prompt = true;
+        self.close_hovered = None;
+        if let Some(w) = &self.window { w.request_redraw(); }
+    }
+
+    fn choose_close(&mut self, choice: CloseChoice, event_loop: &ActiveEventLoop) {
+        self.close_prompt = false;
+        self.close_layout = None;
+        match choice {
+            CloseChoice::Detach => {
                 self.send_cmd(ClientCommand::Disconnect);
                 event_loop.exit();
             }
+            CloseChoice::End => {
+                tracing::info!("Ending the session");
+                self.send_cmd(ClientCommand::EndSession);
+                self.ending_since = Some(std::time::Instant::now());
+            }
+            CloseChoice::Cancel => {}
         }
+        if let Some(w) = &self.window { w.request_redraw(); }
     }
 
     fn send_cmd(&self, cmd: ClientCommand) {
@@ -615,6 +667,13 @@ impl App {
             overlay::draw_keyboard_button(&mut buffer, ww_nz.get(), wh_nz.get(),
                 self.osk_child.is_some());
 
+            if self.close_prompt {
+                self.close_layout = Some(overlay::draw_close_prompt(
+                    &mut buffer, ww_nz.get(), wh_nz.get(), self.close_hovered));
+            } else if self.ending_since.is_some() {
+                overlay::draw_status_banner(&mut buffer, ww_nz.get(), wh_nz.get(), "Ending session...");
+            }
+
             let _ = buffer.present();
         }
     }
@@ -741,10 +800,7 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::CloseRequested => {
-                self.send_cmd(ClientCommand::Disconnect);
-                event_loop.exit();
-            }
+            WindowEvent::CloseRequested => self.request_close(event_loop),
             WindowEvent::Resized(size) => {
                 // With Ctrl held, scale the remote frame to the window instead of
                 // resizing the remote session: skip the Resize command entirely and
@@ -764,6 +820,11 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 self.process_events();
                 if self.should_exit { event_loop.exit(); return; }
+                if self.ending_since.is_some_and(|t| t.elapsed() > END_SESSION_TIMEOUT) {
+                    tracing::warn!("End session request not sent in time; closing, the session may still be running");
+                    event_loop.exit();
+                    return;
+                }
                 self.flush_pending_resize();
                 self.update_title();
                 self.render();
@@ -782,6 +843,24 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::ControlLeft | KeyCode::ControlRight))
                 {
                     self.scale_modifier_held = event.state == ElementState::Pressed;
+                }
+
+                // The close prompt takes key presses; releases still go to the
+                // session, so a key held when it opened (Alt of Alt+F4) is not
+                // left stuck down there.
+                if self.close_prompt && event.state == ElementState::Pressed {
+                    if !event.repeat {
+                        let choice = match event.physical_key {
+                            PhysicalKey::Code(KeyCode::Escape) => Some(CloseChoice::Cancel),
+                            PhysicalKey::Code(KeyCode::KeyD | KeyCode::Enter | KeyCode::NumpadEnter) => Some(CloseChoice::Detach),
+                            PhysicalKey::Code(KeyCode::KeyE) => Some(CloseChoice::End),
+                            _ => None,
+                        };
+                        if let Some(choice) = choice {
+                            self.choose_close(choice, event_loop);
+                        }
+                    }
+                    return;
                 }
 
                 // F10 toggles the menubar (hidden by default).
@@ -821,6 +900,12 @@ impl ApplicationHandler for App {
                 self.cursor_win_x = position.x;
                 self.cursor_win_y = position.y;
 
+                if self.close_prompt {
+                    self.close_hovered = self.close_layout.as_ref()
+                        .and_then(|l| overlay::hit_test_close_prompt(l, position.x, position.y));
+                    return;
+                }
+
                 // Hit-test the menubar (window-space) for hover highlight.
                 self.bar_hovered = if self.bar_visible && !self.fullscreen {
                     self.bar_layout.as_ref().and_then(|l|
@@ -848,6 +933,16 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if self.close_prompt {
+                    if state == ElementState::Pressed && button == WinitMouseButton::Left {
+                        if let Some(choice) = self.close_layout.as_ref().and_then(|l|
+                            overlay::hit_test_close_prompt(l, self.cursor_win_x, self.cursor_win_y))
+                        {
+                            self.choose_close(choice, event_loop);
+                        }
+                    }
+                    return;
+                }
                 // The translucent keyboard button (bottom-right) is always
                 // available — tap it to pop up / hide the on-screen keyboard.
                 if state == ElementState::Pressed && button == WinitMouseButton::Left {
@@ -884,6 +979,7 @@ impl ApplicationHandler for App {
                 }));
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.close_prompt { return; }
                 // Don't scroll the remote when the cursor is over the menubar.
                 let over_bar = self.bar_visible && !self.fullscreen
                     && self.cursor_win_y < MENUBAR_HEIGHT as f64;
@@ -898,6 +994,7 @@ impl ApplicationHandler for App {
                 self.send_cmd(ClientCommand::MouseScroll(input::MouseScroll { dx, dy }));
             }
             WindowEvent::Touch(t) => {
+                if self.close_prompt { return; }
                 use winit::event::TouchPhase;
                 let (wx, wy) = (t.location.x, t.location.y);
                 self.cursor_win_x = wx;

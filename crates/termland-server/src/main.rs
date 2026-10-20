@@ -1,4 +1,5 @@
 mod auth;
+mod logout;
 mod media;
 mod quic;
 mod webtransport;
@@ -107,6 +108,12 @@ struct Args {
     /// correspond to a live session.
     #[arg(long, value_name = "ID", value_delimiter = ',')]
     close_session: Vec<String>,
+
+    /// Internal: run inside a desktop session's private D-Bus and end the
+    /// session when Plasma's Log Out is chosen (see logout.rs). Started by
+    /// the desktop shell script; not for use by hand.
+    #[arg(long, hide = true)]
+    logout_service: bool,
 }
 
 #[tokio::main]
@@ -122,6 +129,14 @@ async fn main() -> Result<()> {
             &mut std::io::stdout(),
         );
         return Ok(());
+    }
+
+    if args.logout_service {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(std::io::stderr)
+            .init();
+        return logout::run().await;
     }
 
     // --list-sessions / --close-session are one-shot, host-local admin

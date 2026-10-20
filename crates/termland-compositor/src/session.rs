@@ -36,6 +36,11 @@ pub struct CompositorConfig {
     /// session is running — and leave it pointed at a dead sink if the server
     /// exits without cleaning up.
     pub audio_sink: Option<String>,
+    /// Command for the auto-detected Plasma desktop to run on its session
+    /// bus so that Log Out ends the session (`termland-server
+    /// --logout-service`). `None` leaves Log Out without an effect, as it
+    /// was. Not used with an explicit `desktop_shell`, which brings its own.
+    pub logout_service: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,7 +106,7 @@ impl Compositor {
             SessionMode::Desktop => {
                 let shell = config.desktop_shell
                     .clone()
-                    .unwrap_or_else(detect_desktop_shell);
+                    .unwrap_or_else(|| detect_desktop_shell(config.logout_service.as_deref()));
                 tracing::info!("Desktop shell: {shell}");
                 let d = backend::labwc::launch_detached(
                     config.width, config.height, &shell, log_path, run_as,

@@ -5039,6 +5039,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wtransport",
+ "zbus",
 ]
 
 [[package]]

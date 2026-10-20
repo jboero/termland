@@ -75,7 +75,11 @@ pub enum ClientCommand {
     /// `termland_protocol::FileTransferPayload`'s doc comment for the MVP
     /// size-cap/no-chunking limitation.
     FileTransferSend(FileTransferPayload),
+    /// Leave the session running on the server (resumable).
     Disconnect,
+    /// End the session on the server: its desktop and everything in it.
+    /// Answered with `ServerEvent::SessionEnded` once the request is sent.
+    EndSession,
 }
 
 /// RGBA bytes to softbuffer pixels.
@@ -770,6 +774,19 @@ async fn session_loop<T: AsyncRead + AsyncWrite + Unpin>(
                 Ok(ClientCommand::Disconnect) => {
                     let _ = framed.send(Message::SessionEnd(SessionEnd { reason: "client disconnect".into() })).await;
                     return Ok(LoopExit::ClientQuit);
+                }
+                Ok(ClientCommand::EndSession) => {
+                    // An empty id is "the session on this connection" to the
+                    // server; the known id is the same thing, said exactly.
+                    let close = SessionClose { session_id: session_id.clone().unwrap_or_default() };
+                    // Awaiting the send is what makes this safe to exit on:
+                    // the request has been written, not just queued, when
+                    // SessionEnded reaches the window.
+                    let reason = match framed.send(Message::SessionClose(close)).await {
+                        Ok(()) => "ended by the user".to_string(),
+                        Err(e) => format!("could not end the session, it is still running: {e:#}"),
+                    };
+                    return Ok(LoopExit::SessionEnded { reason });
                 }
                 Ok(ClientCommand::Resize(w, h)) => { let _ = framed.send(Message::SessionResize(SessionResize { width: w, height: h })).await; }
                 Ok(ClientCommand::KeyEvent(ke)) => { let _ = framed.send(Message::KeyEvent(ke)).await; }

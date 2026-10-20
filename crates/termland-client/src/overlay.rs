@@ -602,6 +602,187 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
+// ─── Close prompt (detach or end the session) ─────────────────────────────
+
+/// What closing the window should do to the remote session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseChoice {
+    /// Leave it running, to resume later. The default: nothing is lost.
+    Detach,
+    /// End it: log out of the remote desktop.
+    End,
+    /// Keep the window open.
+    Cancel,
+}
+
+const CLOSE_CHOICES: &[(CloseChoice, &str)] = &[
+    (CloseChoice::Detach, " Detach (D) "),
+    (CloseChoice::End, " End session (E) "),
+    (CloseChoice::Cancel, " Cancel (Esc) "),
+];
+
+const PROMPT_TEXT: &[&str] = &[
+    "Close this session?",
+    "",
+    "Detach: the remote desktop keeps running, and you can resume it later.",
+    "End session: log out of the remote desktop and close everything in it.",
+];
+
+const PROMPT_FG: u32 = 0xCDD6F4;    // BAR_TEXT
+const PROMPT_TITLE: u32 = 0x89B4FA; // the menubar's title colour
+const PROMPT_END: u32 = 0xF38BA8;   // red: the choice that loses work
+
+/// Where each choice's button was drawn, for `hit_test_close_prompt`.
+pub struct ClosePromptLayout {
+    pub buttons: Vec<(CloseChoice, u32, u32, u32, u32)>, // (choice, x, y, w, h)
+}
+
+/// Break `text` into lines of at most `max` characters at spaces, cutting
+/// a word only when it is longer than a line on its own.
+fn wrap(text: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let mut word: String = word.to_string();
+        while word.chars().count() > max {
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            let head: String = word.chars().take(max).collect();
+            word = word.chars().skip(max).collect();
+            lines.push(head);
+        }
+        let needed = if line.is_empty() { word.chars().count() } else { line.chars().count() + 1 + word.chars().count() };
+        if needed > max {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&word);
+    }
+    lines.push(line);
+    lines
+}
+
+/// Positions of the prompt box and its buttons for a `fb_width` x
+/// `fb_height` window: (box x, y, w, h, wrapped text, buttons). Buttons sit
+/// in a row when they fit and are stacked when the window is too narrow.
+#[allow(clippy::type_complexity)]
+fn close_prompt_geometry(fb_width: u32, fb_height: u32) -> (usize, usize, usize, usize, Vec<String>, Vec<(CloseChoice, &'static str, usize, usize, usize)>) {
+    let char_w = 16usize;
+    let line_h = 20usize;
+    let pad = 16usize;
+    let btn_h = 28usize;
+    let gap = 12usize;
+    let fw = fb_width as usize;
+    let box_w = fw.saturating_sub(32).min(1200).max(char_w * 8 + pad * 2);
+    let max_chars = (box_w - pad * 2) / char_w;
+    let lines: Vec<String> = PROMPT_TEXT.iter().flat_map(|t| wrap(t, max_chars)).collect();
+
+    let widths: Vec<usize> = CLOSE_CHOICES.iter().map(|(_, l)| l.chars().count() * char_w).collect();
+    let row_w = widths.iter().sum::<usize>() + gap * (widths.len() - 1);
+    let in_row = row_w <= box_w - pad * 2;
+    let buttons_h = if in_row { btn_h } else { CLOSE_CHOICES.len() * (btn_h + gap) - gap };
+    let box_h = pad + lines.len() * line_h + gap + buttons_h + pad;
+    let box_x = fw.saturating_sub(box_w) / 2;
+    let box_y = (fb_height as usize).saturating_sub(box_h) / 2;
+
+    let top = box_y + pad + lines.len() * line_h + gap;
+    let mut x = box_x + pad;
+    let mut buttons = Vec::new();
+    for (i, ((choice, label), w)) in CLOSE_CHOICES.iter().zip(&widths).enumerate() {
+        if in_row {
+            buttons.push((*choice, *label, x, top, *w));
+            x += w + gap;
+        } else {
+            buttons.push((*choice, *label, box_x + pad, top + i * (btn_h + gap), *w));
+        }
+    }
+    (box_x, box_y, box_w, box_h, lines, buttons)
+}
+
+/// Draw the close prompt centred over the session, dimming what is behind
+/// it, and return where its buttons are. It belongs to this window only:
+/// nothing outside it is blocked.
+pub fn draw_close_prompt(buf: &mut [u32], fb_width: u32, fb_height: u32, hovered: Option<CloseChoice>) -> ClosePromptLayout {
+    let stride = fb_width as usize;
+    let (bx, by, bw, bh, lines, buttons) = close_prompt_geometry(fb_width, fb_height);
+    let btn_h = 28usize;
+
+    fill_rect_alpha(buf, stride, 0, 0, stride, fb_height as usize, 0x000000, 120);
+    fill_rect(buf, stride, bx, by, bw, bh, BAR_BG);
+    draw_rect_outline(buf, stride, bx, by, bw, bh, BAR_BORDER);
+    for (i, line) in lines.iter().enumerate() {
+        let color = if i == 0 { PROMPT_TITLE } else { PROMPT_FG };
+        draw_text(buf, stride, bx + 16, by + 16 + i * 20, line, color);
+    }
+
+    let mut layout = ClosePromptLayout { buttons: Vec::new() };
+    for (choice, label, x, y, w) in buttons {
+        let color = if choice == CloseChoice::End { PROMPT_END } else { PROMPT_FG };
+        if hovered == Some(choice) {
+            fill_rect(buf, stride, x, y, w, btn_h, BAR_HOVER_BG);
+        }
+        draw_rect_outline(buf, stride, x, y, w, btn_h, if choice == CloseChoice::Detach { BAR_ON_FG } else { BAR_BORDER });
+        draw_text(buf, stride, x, y + (btn_h - 16) / 2, label, color);
+        layout.buttons.push((choice, x as u32, y as u32, w as u32, btn_h as u32));
+    }
+    layout
+}
+
+/// The button under (x, y), if any.
+pub fn hit_test_close_prompt(layout: &ClosePromptLayout, x: f64, y: f64) -> Option<CloseChoice> {
+    layout.buttons.iter().find_map(|&(choice, bx, by, bw, bh)| {
+        let inside = x >= bx as f64 && x < (bx + bw) as f64 && y >= by as f64 && y < (by + bh) as f64;
+        inside.then_some(choice)
+    })
+}
+
+#[cfg(test)]
+mod close_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn wrap_breaks_at_spaces_within_the_width() {
+        let lines = wrap("Detach: the remote desktop keeps running", 16);
+        assert_eq!(lines, ["Detach: the", "remote desktop", "keeps running"]);
+        assert!(lines.iter().all(|l| l.chars().count() <= 16));
+    }
+
+    #[test]
+    fn wrap_cuts_only_words_longer_than_a_line() {
+        assert_eq!(wrap("abcdefghij xy", 4), ["abcd", "efgh", "ij", "xy"]);
+        assert_eq!(wrap("", 10), [""]);
+    }
+
+    /// Every button is clickable at its own position and nowhere else, in a
+    /// wide window (one row) and a narrow one (stacked).
+    #[test]
+    fn each_button_is_hit_where_it_is_drawn() {
+        for (w, h) in [(1600u32, 900u32), (480, 800)] {
+            let mut buf = vec![0u32; (w * h) as usize];
+            let layout = draw_close_prompt(&mut buf, w, h, None);
+            assert_eq!(layout.buttons.len(), 3);
+            for &(choice, x, y, bw, bh) in &layout.buttons {
+                assert!(x + bw <= w && y + bh <= h, "{choice:?} off-screen at {w}x{h}");
+                let (cx, cy) = ((x + bw / 2) as f64, (y + bh / 2) as f64);
+                assert_eq!(hit_test_close_prompt(&layout, cx, cy), Some(choice), "{w}x{h}");
+            }
+            assert_eq!(hit_test_close_prompt(&layout, 1.0, 1.0), None);
+        }
+    }
+
+    #[test]
+    fn narrow_windows_stack_the_buttons() {
+        let mut buf = vec![0u32; 480 * 800];
+        let layout = draw_close_prompt(&mut buf, 480, 800, None);
+        let xs: Vec<u32> = layout.buttons.iter().map(|b| b.1).collect();
+        assert!(xs.iter().all(|&x| x == xs[0]), "expected one column, got x = {xs:?}");
+    }
+}
+
 #[cfg(test)]
 mod window_list_tests {
     use super::*;

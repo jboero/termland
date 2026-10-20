@@ -504,7 +504,11 @@ pub fn detect_terminal() -> String {
 ///   3. Bare terminal fallback
 ///
 /// The returned command is passed to `sh -c` inside labwc via its -S flag.
-pub fn detect_desktop_shell() -> String {
+///
+/// `logout_service` is started alongside plasmashell, on the same private
+/// bus, so Plasma's Log Out has something to talk to; without it, Log Out
+/// does nothing. It is left out if it is not safe to embed in the script.
+pub fn detect_desktop_shell(logout_service: Option<&str>) -> String {
     let terminal = detect_terminal();
 
     if has_program("plasmashell") && has_program("dbus-run-session") {
@@ -542,9 +546,20 @@ pub fn detect_desktop_shell() -> String {
         // The trap does not run on SIGKILL, so this does not replace reaping
         // the process group in `registry::close` — it just means the common
         // case never gets that far.
+        //
+        // The logout service is started first so it owns its names before
+        // anything could ask for them, and stopped by the same trap.
+        let (start_logout, logout_pid) = match logout_service {
+            Some(cmd) if validate_shell_command(cmd).is_ok() => (format!("{cmd} & logout=$!; "), " $logout"),
+            Some(cmd) => {
+                tracing::warn!("not starting logout service, unsafe command: {cmd:?}");
+                (String::new(), "")
+            }
+            None => (String::new(), ""),
+        };
         return format!(
-            "dbus-run-session sh -c 'plasmashell --no-respawn & shell=$!; \
-             trap \"kill $shell 2>/dev/null; wait $shell 2>/dev/null\" EXIT INT TERM; \
+            "dbus-run-session sh -c '{start_logout}plasmashell --no-respawn & shell=$!; \
+             trap \"kill $shell{logout_pid} 2>/dev/null; wait $shell 2>/dev/null\" EXIT INT TERM; \
              {terminal}'"
         );
     }
@@ -562,8 +577,29 @@ mod desktop_shell_tests {
     /// Only meaningful where plasmashell is actually detected; elsewhere the
     /// function returns a bare terminal and there is nothing to assert.
     fn plasma_command() -> Option<String> {
-        let cmd = detect_desktop_shell();
+        let cmd = detect_desktop_shell(Some("/usr/bin/termland-server --logout-service"));
         cmd.contains("plasmashell").then_some(cmd)
+    }
+
+    /// Log Out talks to the logout service over the session's bus, so it has
+    /// to be inside dbus-run-session, running before plasmashell, and
+    /// stopped with it.
+    #[test]
+    fn the_logout_service_runs_on_the_session_bus_and_is_stopped() {
+        let Some(cmd) = plasma_command() else { return };
+        let inner = cmd.split_once("dbus-run-session sh -c '").expect("dbus-run-session wrapper").1;
+        assert!(
+            inner.starts_with("/usr/bin/termland-server --logout-service & logout=$!; plasmashell"),
+            "logout service must start first, inside the bus: {cmd}"
+        );
+        assert!(cmd.contains("kill $shell $logout"), "trap must stop the logout service: {cmd}");
+    }
+
+    #[test]
+    fn an_unsafe_logout_service_command_is_left_out() {
+        let cmd = detect_desktop_shell(Some("/tmp/x; rm -rf ~"));
+        assert!(!cmd.contains("rm -rf"), "unsafe command embedded: {cmd}");
+        assert!(!cmd.contains("$logout"), "{cmd}");
     }
 
     /// Bare plasmashell restarts itself when it dies, so a stranded instance

@@ -21,9 +21,11 @@ use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 use termland_protocol::{
-    AudioCodec, Hello, Message, SessionCreate, SessionMode, TermlandCodec, VideoCodec,
-    PROTOCOL_VERSION,
+    AudioCodec, Hello, Message, SessionClose, SessionCreate, SessionMode, TermlandCodec,
+    VideoCodec, PROTOCOL_VERSION,
 };
+
+type Conn = Framed<TcpStream, TermlandCodec>;
 
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -133,6 +135,18 @@ fn sessions(bin: &str) -> Vec<(String, i32)> {
 /// session id and compositor pid (which is the process-group id, since the
 /// compositor is `setsid`'d).
 async fn start_session(port: u16) -> (ChildGuard, SessionGuard, String, i32) {
+    let (server, guard, id, pgid, _detached) = start_session_with(port, |terminal| {
+        format!("#!/bin/sh\nsh -c 'trap \"\" TERM; sleep 600' &\nexec {terminal}\n")
+    })
+    .await;
+    (server, guard, id, pgid)
+}
+
+/// `start_session` with the desktop script's body made from the terminal's
+/// name, returning the connection the session is running on.
+async fn start_session_with(
+    port: u16, script_body: impl FnOnce(&str) -> String,
+) -> (ChildGuard, SessionGuard, String, i32, Conn) {
     let bin = env!("CARGO_BIN_EXE_termland-server");
     let terminal = first_on_path(&["foot", "konsole", "alacritty", "xterm"])
         .expect("no terminal emulator available");
@@ -145,11 +159,7 @@ async fn start_session(port: u16) -> (ChildGuard, SessionGuard, String, i32) {
         .join(format!("termland-teardown-shell-{port}.sh"))
         .to_string_lossy()
         .into_owned();
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\nsh -c 'trap \"\" TERM; sleep 600' &\nexec {terminal}\n"),
-    )
-    .expect("write session shell script");
+    std::fs::write(&script, script_body(&terminal)).expect("write session shell script");
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .expect("chmod session shell script");
 
@@ -255,7 +265,7 @@ async fn start_session(port: u16) -> (ChildGuard, SessionGuard, String, i32) {
     );
     eprintln!("[test] session {} group {pgid}: {}", ready.session_id, describe(&members));
 
-    (server, guard, ready.session_id, pgid)
+    (server, guard, ready.session_id, pgid, framed)
 }
 
 /// Wait for the group to empty, so a slow exit is not read as a leak.
@@ -296,6 +306,100 @@ async fn closing_a_session_leaves_nothing_in_its_process_group() {
         "session {id} is still in the registry after close"
     );
     eprintln!("[test] PASS: group {pgid} is empty and the record is gone");
+}
+
+/// End session in the client: a `SessionClose` on the connection the
+/// session is running on, rather than `--close-session` from the host.
+#[tokio::test]
+#[ignore = "spawns a real compositor; run manually on a desktop"]
+async fn ending_a_session_from_its_client_leaves_nothing() {
+    let (_server, mut guard, id, pgid, mut conn) = start_session_with(27887, |terminal| {
+        format!("#!/bin/sh\nsh -c 'trap \"\" TERM; sleep 600' &\nexec {terminal}\n")
+    })
+    .await;
+    let bin = env!("CARGO_BIN_EXE_termland-server");
+
+    conn.send(Message::SessionClose(SessionClose { session_id: id.clone() }))
+        .await
+        .expect("send SessionClose");
+    guard.id = None;
+
+    let survivors = wait_empty(pgid, Duration::from_secs(10));
+    assert!(survivors.is_empty(), "ending left processes in group {pgid}: {}", describe(&survivors));
+    guard.pgid = None;
+    assert!(
+        !sessions(bin).iter().any(|(sid, _)| *sid == id),
+        "session {id} is still in the registry after End session"
+    );
+    eprintln!("[test] PASS: End session emptied group {pgid} and removed the record");
+}
+
+/// Log Out inside the desktop. Plasma asks `org.kde.LogoutPrompt` on the
+/// session's bus; `--logout-service` answers by exiting labwc, the server
+/// ends the session, and the client is told.
+///
+/// The desktop script has the shape of the auto-detected Plasma one - a
+/// private bus from dbus-run-session, the logout service on it, a terminal
+/// in the foreground - without plasmashell, which would put a second Plasma
+/// on the developer's desktop (see `an_auto_detected_plasma_shell_is_fully_reaped`).
+/// The call is the one Plasma makes, sent to that bus only.
+#[tokio::test]
+#[ignore = "spawns a real compositor; run manually on a desktop"]
+async fn logging_out_inside_the_desktop_ends_the_session() {
+    if first_on_path(&["dbus-run-session"]).is_none() || first_on_path(&["busctl"]).is_none() {
+        eprintln!("[test] SKIP: needs dbus-run-session and busctl");
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_termland-server");
+    let port = 27889;
+    let addr_file = std::env::temp_dir().join(format!("termland-teardown-bus-{port}"));
+    let _ = std::fs::remove_file(&addr_file);
+    let addr_path = addr_file.to_string_lossy().into_owned();
+    let (_server, mut guard, id, pgid, mut conn) = start_session_with(port, |terminal| {
+        format!(
+            "#!/bin/sh\nexec dbus-run-session sh -c '{bin} --logout-service & \
+             echo \"$DBUS_SESSION_BUS_ADDRESS\" > {addr_path}; exec {terminal}'\n"
+        )
+    })
+    .await;
+
+    let addr = std::fs::read_to_string(&addr_file).expect("session bus address").trim().to_string();
+    assert!(!addr.is_empty(), "the desktop script did not record its bus address");
+    // Wait for the service to own its name on that bus before calling it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let call = loop {
+        let out = Command::new("busctl")
+            .args([&format!("--address={addr}"), "call", "org.kde.LogoutPrompt", "/LogoutPrompt",
+                   "org.kde.LogoutPrompt", "promptLogout"])
+            .output()
+            .expect("run busctl");
+        if out.status.success() || Instant::now() > deadline {
+            break out;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert!(call.status.success(), "promptLogout failed: {}", String::from_utf8_lossy(&call.stderr));
+
+    let mut told = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while told.is_none() && Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), conn.next()).await {
+            Ok(Some(Ok(Message::SessionEnd(e)))) => told = Some(e.reason),
+            Ok(Some(Ok(_))) => continue,
+            _ => break,
+        }
+    }
+    let reason = told.expect("the client was not told the session ended");
+    guard.id = None;
+
+    let survivors = wait_empty(pgid, Duration::from_secs(10));
+    assert!(survivors.is_empty(), "logout left processes in group {pgid}: {}", describe(&survivors));
+    guard.pgid = None;
+    assert!(
+        !sessions(bin).iter().any(|(sid, _)| *sid == id),
+        "session {id} is still in the registry after logging out"
+    );
+    eprintln!("[test] PASS: logout ended the session ({reason}), group {pgid} empty");
 }
 
 /// The case that actually bit: the compositor dies first, its children are
