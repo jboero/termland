@@ -1,3 +1,4 @@
+mod askpass;
 mod connection;
 mod display;
 mod desktop;
@@ -198,6 +199,11 @@ impl Args {
 }
 
 fn main() -> Result<()> {
+    // Started by ssh as its askpass (see askpass.rs): the argument is ssh's
+    // prompt, not ours to parse.
+    if std::env::var_os(askpass::MARK).is_some() {
+        std::process::exit(askpass::run());
+    }
     let args = Args::parse();
 
     if let Some(shell) = args.completions {

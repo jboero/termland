@@ -177,15 +177,27 @@ impl AsyncRead for SshStdout {
 }
 
 /// What to report for an ssh that failed with `last` as its final line of
-/// stderr. ssh's own words, plus a pointer for the one failure that is about
-/// termland rather than ssh: sshd answering "subsystem request failed" means
-/// it has no `termland` subsystem - termland-server is not installed there,
-/// or sshd has not been reloaded since it was.
-fn ssh_failure_message(last: &str) -> String {
+/// stderr. ssh's own words, plus a pointer where they are not enough on their
+/// own: sshd answering "subsystem request failed" means it has no `termland`
+/// subsystem - termland-server is not installed there, or sshd has not been
+/// reloaded since it was - and "Host key verification failed" is the last
+/// line both for a key that was not trusted and for one that has changed
+/// (`key_changed`, from ssh's earlier warning), which need different action.
+fn ssh_failure_message(last: &str, key_changed: bool) -> String {
     if last.contains("subsystem request failed") {
         format!(
             "ssh: {last} - sshd on that host has no termland subsystem. Install \
              termland-server there, then reload sshd (systemctl reload sshd)."
+        )
+    } else if last.contains("Host key verification failed") && key_changed {
+        format!(
+            "ssh: {last} - the host's key differs from the one in ~/.ssh/known_hosts. \
+             Find out why before removing the old entry."
+        )
+    } else if last.contains("Host key verification failed") {
+        format!(
+            "ssh: {last} - the host's key is not in ~/.ssh/known_hosts. Connecting \
+             asks you to verify it."
         )
     } else {
         format!("ssh: {last}")
@@ -195,8 +207,28 @@ fn ssh_failure_message(last: &str) -> String {
 /// Spawn `ssh -s <server> termland`. ssh's stderr is still passed through to
 /// ours, as before; a background task also keeps its last line and reaps the
 /// process, which is what `SshStdout` reports if ssh fails.
-fn open_ssh(server: &str, params: &ConnectParams) -> Result<Box<dyn Io>> {
-    spawn_ssh_transport("ssh", &ssh_args(server, &params.ssh_opts))
+///
+/// With `prompt` false ssh runs in batch mode and never asks anything: a
+/// host key it cannot verify, or a key that needs a passphrase, fails the
+/// connection instead. That is for background polling, which repeats every
+/// few seconds and would otherwise ask again each time.
+fn open_ssh(server: &str, params: &ConnectParams, prompt: bool) -> Result<Box<dyn Io>> {
+    let (args, env) = ssh_invocation(server, &params.ssh_opts, prompt);
+    spawn_ssh_transport("ssh", &args, &env)
+}
+
+/// The argv and extra environment for `open_ssh`.
+fn ssh_invocation(
+    server: &str, opts: &[String], prompt: bool,
+) -> (Vec<String>, Vec<(&'static str, std::ffi::OsString)>) {
+    let mut args = ssh_args(server, opts);
+    if prompt {
+        (args, crate::askpass::ssh_env())
+    } else {
+        // First, so it wins over any BatchMode in the user's ssh options.
+        args.insert(0, "-oBatchMode=yes".into());
+        (args, Vec::new())
+    }
 }
 
 /// The ssh argv for `server`. ssh takes no port in its destination - given
@@ -233,10 +265,13 @@ fn ssh_args(server: &str, opts: &[String]) -> Vec<String> {
 
 /// `open_ssh` with the program as a parameter, so tests can stand in a
 /// script that behaves like a failing or succeeding ssh.
-fn spawn_ssh_transport(program: &str, args: &[String]) -> Result<Box<dyn Io>> {
+fn spawn_ssh_transport(
+    program: &str, args: &[String], env: &[(&str, std::ffi::OsString)],
+) -> Result<Box<dyn Io>> {
     use tokio::io::AsyncBufReadExt;
     let mut child = Command::new(program)
         .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -249,9 +284,11 @@ fn spawn_ssh_transport(program: &str, args: &[String]) -> Result<Box<dyn Io>> {
     let (exit_tx, exit) = tokio::sync::watch::channel::<SshExit>(None);
     tokio::spawn(async move {
         let mut last = String::new();
+        let mut key_changed = false;
         let mut lines = tokio::io::BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             eprintln!("{line}");
+            key_changed |= line.contains("REMOTE HOST IDENTIFICATION HAS CHANGED");
             if !line.trim().is_empty() {
                 last = line.trim().to_string();
             }
@@ -259,7 +296,7 @@ fn spawn_ssh_transport(program: &str, args: &[String]) -> Result<Box<dyn Io>> {
         let result = match child.wait().await {
             Ok(status) if status.success() => Ok(()),
             Ok(status) if last.is_empty() => Err(format!("ssh failed ({status})")),
-            Ok(_) => Err(ssh_failure_message(&last)),
+            Ok(_) => Err(ssh_failure_message(&last, key_changed)),
             Err(e) => Err(format!("ssh: {e}")),
         };
         let _ = exit_tx.send(Some(result));
@@ -270,9 +307,12 @@ fn spawn_ssh_transport(program: &str, args: &[String]) -> Result<Box<dyn Io>> {
 }
 
 /// Open the transport to the server: SSH subsystem, plain TCP, or TLS.
-async fn open_io(server: &str, ssh: bool, params: &ConnectParams) -> Result<Box<dyn Io>> {
+/// `prompt` is whether ssh may ask the user anything (see `open_ssh`).
+async fn open_io(
+    server: &str, ssh: bool, params: &ConnectParams, prompt: bool,
+) -> Result<Box<dyn Io>> {
     if ssh {
-        open_ssh(server, params)
+        open_ssh(server, params, prompt)
     } else if params.tls {
         let stream = TcpStream::connect(server).await
             .context(format!("failed to connect to {server}"))?;
@@ -316,11 +356,13 @@ pub enum ControlOp {
     Close(String),
 }
 
-/// Fetch the list of resumable sessions (used by the tray manager).
+/// Fetch the list of resumable sessions (used by the tray manager). Both
+/// callers poll it every few seconds in the background, so ssh is never
+/// allowed to prompt from here; the user is asked when they connect.
 pub async fn fetch_sessions(
     server: &str, ssh: bool, params: &ConnectParams,
 ) -> Result<Vec<termland_protocol::SessionInfo>> {
-    let io = open_io(server, ssh, params).await?;
+    let io = open_io(server, ssh, params, false).await?;
     let mut framed = Framed::new(io, TermlandCodec);
     handshake(&mut framed, params).await?;
     framed.send(Message::SessionList(SessionList {})).await.context("send SessionList")?;
@@ -333,7 +375,7 @@ pub async fn fetch_sessions(
 
 /// Run a one-shot control op against the server and print the result.
 pub async fn run_control(server: &str, ssh: bool, params: ConnectParams, op: ControlOp) -> Result<()> {
-    let io = open_io(server, ssh, &params).await?;
+    let io = open_io(server, ssh, &params, true).await?;
     let mut framed = Framed::new(io, TermlandCodec);
     handshake(&mut framed, &params).await?;
 
@@ -391,7 +433,7 @@ pub async fn connect(
     // ServerEvent::ConnectFailed.
     let server = server.to_string();
     tokio::spawn(async move {
-        let io = match open_io(&server, ssh, &params).await {
+        let io = match open_io(&server, ssh, &params, true).await {
             Ok(io) => io,
             Err(e) => {
                 tracing::error!("Connect failed: {e:#}");
@@ -502,7 +544,8 @@ async fn run_with_reconnect(
             tracing::info!("Reconnecting to {server} in {delay:?} (attempt {attempt})...");
             tokio::time::sleep(delay).await;
 
-            match open_io(&server, ssh, &params).await {
+            // Unattended, and retried every 30s: never prompt from here.
+            match open_io(&server, ssh, &params, false).await {
                 Ok(io) => {
                     tracing::info!("Reconnected on attempt {attempt}");
                     break io;
@@ -1271,6 +1314,18 @@ mod transport_tests {
         }
     }
 
+    /// Background ssh (polling, reconnecting) runs batch-mode, ahead of any
+    /// BatchMode the user set, and without our askpass, so it cannot prompt.
+    #[test]
+    fn only_user_started_ssh_may_prompt() {
+        let opts = vec!["-oBatchMode=no".to_string()];
+        let (args, env) = ssh_invocation("home:9022", &opts, false);
+        assert_eq!(args, ["-oBatchMode=yes", "-oBatchMode=no", "-p", "9022", "-s", "home", "termland"]);
+        assert!(env.is_empty());
+        let (args, _) = ssh_invocation("home:9022", &opts, true);
+        assert_eq!(args, ["-oBatchMode=no", "-p", "9022", "-s", "home", "termland"]);
+    }
+
     fn dest(server: &str) -> Vec<String> {
         ssh_args(server, &[])
     }
@@ -1304,11 +1359,30 @@ mod transport_tests {
             "sh",
             &sh("echo 'Offending ECDSA key in known_hosts:134' >&2; \
                  echo 'Host key verification failed.' >&2; exit 255"),
+            &[],
         )
         .unwrap();
         let mut buf = Vec::new();
         let err = io.read_to_end(&mut buf).await.expect_err("ssh failed, so EOF must be an error");
-        assert_eq!(err.to_string(), "ssh: Host key verification failed.");
+        assert_eq!(
+            err.to_string(),
+            "ssh: Host key verification failed. - the host's key is not in \
+             ~/.ssh/known_hosts. Connecting asks you to verify it."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_host_key_is_called_that() {
+        let mut io = spawn_ssh_transport(
+            "sh",
+            &sh("echo '@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @' >&2; \
+                 echo 'Host key verification failed.' >&2; exit 255"),
+            &[],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let err = io.read_to_end(&mut buf).await.unwrap_err().to_string();
+        assert!(err.contains("differs from the one in ~/.ssh/known_hosts"), "got {err:?}");
     }
 
     #[tokio::test]
@@ -1316,6 +1390,7 @@ mod transport_tests {
         let mut io = spawn_ssh_transport(
             "sh",
             &sh("echo 'subsystem request failed on channel 0' >&2; exit 1"),
+            &[],
         )
         .unwrap();
         let mut buf = Vec::new();
@@ -1326,7 +1401,7 @@ mod transport_tests {
 
     #[tokio::test]
     async fn a_clean_ssh_exit_is_a_plain_eof() {
-        let mut io = spawn_ssh_transport("sh", &sh("printf hello")).unwrap();
+        let mut io = spawn_ssh_transport("sh", &sh("printf hello"), &[]).unwrap();
         let mut buf = Vec::new();
         io.read_to_end(&mut buf).await.expect("clean exit is not an error");
         assert_eq!(buf, b"hello");
