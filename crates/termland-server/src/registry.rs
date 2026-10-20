@@ -212,7 +212,19 @@ pub fn remove(id: &str) {
 
 /// Is `pid` a live process? `kill(pid, 0)` succeeds for a live, signalable
 /// process; EPERM also means it exists (owned by someone else).
+///
+/// It also succeeds for a zombie, and the compositor of a session this
+/// process started is its child, whose handle is dropped once it is running
+/// (`launch_detached`): once it exits nothing else reaps it. So an exited
+/// child is reaped here and reported dead, or the compositor of a session
+/// whose desktop has ended looks alive for as long as this process runs.
+/// For a process that is not our child `waitpid` fails with ECHILD and
+/// changes nothing.
 pub fn pid_alive(pid: u32) -> bool {
+    let mut status = 0;
+    if unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) } == pid as libc::pid_t {
+        return false;
+    }
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
         return true;
@@ -539,6 +551,29 @@ mod reap_tests {
     /// gone and its children had been reparented to init. Orphans keep their
     /// process-group id, so the group is still the handle that reaches them —
     /// and nothing was using it.
+    /// The compositor is our child, and its handle is dropped once it is
+    /// running (launch_detached), so once it exits it is a zombie that
+    /// nothing reaps. kill(pid, 0) succeeds on a zombie: the server took the
+    /// compositor for alive, retried capture forever, and the session never
+    /// ended when its desktop did (labwc exiting on Log Out, or on its
+    /// terminal closing).
+    #[test]
+    fn an_exited_child_is_not_alive() {
+        let child = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        drop(child); // as launch_detached does: no wait, so a zombie once it exits
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!pid_alive(pid), "exited child {pid} reported alive");
+    }
+
+    #[test]
+    fn a_running_process_is_alive() {
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        assert!(pid_alive(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn orphans_of_a_dead_leader_are_still_reaped() {
         let mut g = GroupGuard::spawn("sleep 60 & sleep 60 & exit 0");
