@@ -196,9 +196,39 @@ fn ssh_failure_message(last: &str) -> String {
 /// ours, as before; a background task also keeps its last line and reaps the
 /// process, which is what `SshStdout` reports if ssh fails.
 fn open_ssh(server: &str, params: &ConnectParams) -> Result<Box<dyn Io>> {
-    let mut ssh_args: Vec<String> = params.ssh_opts.clone();
-    ssh_args.extend(["-s".into(), server.to_string(), "termland".into()]);
-    spawn_ssh_transport("ssh", &ssh_args)
+    spawn_ssh_transport("ssh", &ssh_args(server, &params.ssh_opts))
+}
+
+/// The ssh argv for `server`. ssh takes no port in its destination - given
+/// `home:9022` it looks up a host literally named that - but the profile
+/// editor and the TCP/TLS paths all use `host:port`, so a trailing `:port`
+/// is turned into `-p port`. A bare IPv6 address (more than one colon) is
+/// left alone; one with a port must be bracketed, `[::1]:9022`.
+fn ssh_args(server: &str, opts: &[String]) -> Vec<String> {
+    let mut args = opts.to_vec();
+    let (user, host) = match server.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, server),
+    };
+    let split = if let Some(rest) = host.strip_prefix('[') {
+        rest.split_once("]:")
+    } else if host.matches(':').count() == 1 {
+        host.split_once(':')
+    } else {
+        None
+    };
+    let dest = match split {
+        Some((h, port)) if !h.is_empty() && port.parse::<u16>().is_ok() => {
+            args.extend(["-p".into(), port.into()]);
+            match user {
+                Some(u) => format!("{u}@{h}"),
+                None => h.to_string(),
+            }
+        }
+        _ => server.to_string(),
+    };
+    args.extend(["-s".into(), dest, "termland".into()]);
+    args
 }
 
 /// `open_ssh` with the program as a parameter, so tests can stand in a
@@ -1239,6 +1269,29 @@ mod transport_tests {
             attach: None,
             reconnect: true,
         }
+    }
+
+    fn dest(server: &str) -> Vec<String> {
+        ssh_args(server, &[])
+    }
+
+    #[test]
+    fn ssh_destination_port_becomes_dash_p() {
+        assert_eq!(dest("home:9022"), ["-p", "9022", "-s", "home", "termland"]);
+        assert_eq!(dest("me@home:9022"), ["-p", "9022", "-s", "me@home", "termland"]);
+        assert_eq!(dest("[::1]:9022"), ["-p", "9022", "-s", "::1", "termland"]);
+    }
+
+    #[test]
+    fn ssh_destination_without_port_is_untouched() {
+        assert_eq!(dest("home"), ["-s", "home", "termland"]);
+        assert_eq!(dest("me@home"), ["-s", "me@home", "termland"]);
+        assert_eq!(dest("fe80::1"), ["-s", "fe80::1", "termland"]);
+        assert_eq!(dest("home:ssh"), ["-s", "home:ssh", "termland"]);
+        assert_eq!(
+            ssh_args("home", &["-oPort=9022".into()]),
+            ["-oPort=9022", "-s", "home", "termland"],
+        );
     }
 
     fn sh(script: &str) -> Vec<String> {

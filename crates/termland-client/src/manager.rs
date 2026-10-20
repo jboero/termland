@@ -364,7 +364,7 @@ impl eframe::App for ManagerApp {
                     ui.text_edit_singleline(&mut edit.profile.display_name);
                     ui.end_row();
 
-                    ui.label("Server (host:port)");
+                    ui.label("Server ([user@]host[:port])");
                     ui.text_edit_singleline(&mut edit.profile.server);
                     ui.end_row();
 
