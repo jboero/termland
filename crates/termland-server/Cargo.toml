@@ -33,6 +33,9 @@ quinn = { workspace = true, features = ["rustls-aws-lc-rs"] }
 # Resolves against the same quinn 0.11 / rustls 0.23 the rest of the crate
 # already uses, so this adds a protocol, not a second QUIC stack.
 wtransport = "0.7"
+# --logout-service: answers Plasma's Log Out on a desktop session's private
+# bus (see logout.rs). Same zbus 5 the client already builds via ksni.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 # The WebTransport test drives the listener as a real client.

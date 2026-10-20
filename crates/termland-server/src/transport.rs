@@ -1199,6 +1199,14 @@ const SETTLE_FRAMES: u32 = 2;
 /// the low-delay flag; FFmpeg's cuvid then holds up to five frames.
 const LEGACY_SETTLE_FRAMES: u32 = 5;
 
+/// This binary, run as the desktop's logout service (see logout.rs). None if
+/// it has been replaced on disk since the server started, when the path no
+/// longer names a program the session could run.
+fn logout_service_command() -> Option<String> {
+    let exe = std::env::current_exe().ok().filter(|p| p.exists())?;
+    Some(format!("{} --logout-service", exe.to_str()?))
+}
+
 fn capture_thread(
     width: u32,
     height: u32,
@@ -1232,6 +1240,7 @@ fn capture_thread(
 ) {
     let config = termland_compositor::CompositorConfig {
         width, height, mode, desktop_shell, audio_sink,
+        logout_service: logout_service_command(),
     };
     let (mut compositor, comp_pid) = match start_kind {
         StartKind::Create { log_path } => {
