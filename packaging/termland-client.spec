@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.9.0
+%global version 0.9.1
 # See termland-server.spec's comment: EL8's rpmbuild fails hard on the empty
 # debugsourcefiles.list find-debuginfo can produce for a Rust binary.
 %global debug_package %{nil}
@@ -163,6 +163,17 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/io.github.jboero.term
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Wed Oct 21 2026 John Boero - 0.9.1-1
+- Fix "cannot resolve host" for SSH servers given as host:port (or
+  [v6addr]:port); the port is now passed to ssh as -p.
+- An unknown host key is asked about in a "Verify host key" dialog, instead
+  of a password box from the system askpass that read like a passphrase
+  prompt. Passphrase prompts still go to the configured SSH_ASKPASS.
+- Background session-list polls never prompt, so an unverified host does
+  not reopen a dialog every few seconds.
+- Closing a session window asks whether to detach (the remote desktop keeps
+  running) or end the session.
+
 * Wed Oct 14 2026 John Boero - 0.9.0-1
 - --bitrate, and a "Fixed bitrate" profile setting, to set the video
   bitrate directly instead of through quality.

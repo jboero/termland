@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.9.0
+%global version 0.9.1
 # find-debuginfo can produce an empty debugsourcefiles.list for a Rust
 # binary (unlike typical C sources), which newer Fedora's rpmbuild tolerates
 # but EL8's treats as a hard error ("Empty %%files file ... debugsourcefiles
@@ -253,6 +253,14 @@ fi
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Wed Oct 21 2026 John Boero - 0.9.1-1
+- Log Out (or Shut Down / Restart) inside the remote Plasma desktop now
+  ends the session. Nothing answered Plasma's logout request on the
+  session's private D-Bus, so the session stayed up. Shut Down and Restart
+  end the session only; they never reach the host.
+- Fix a session whose compositor had exited being kept as detached: the
+  exited compositor was never reaped, and its zombie was taken for alive.
+
 * Wed Oct 14 2026 John Boero - 0.9.0-1
 - Capture and encode only when the screen changes (#40). An idle 1080p
   session drops from 65% CPU (NVENC) or 268% (SVT-AV1) to under 1%.
