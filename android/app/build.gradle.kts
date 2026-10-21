@@ -170,8 +170,8 @@ android {
         // requestPointerCapture() are all reliably present.
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.9.0"
+        versionCode = 6
+        versionName = "0.9.1"
         ndk { abiFilters += abis }
     }
 
