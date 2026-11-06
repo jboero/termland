@@ -511,10 +511,39 @@ pub fn detect_terminal() -> String {
 pub fn detect_desktop_shell(logout_service: Option<&str>) -> String {
     let terminal = detect_terminal();
     if has_program("plasmashell") && has_program("dbus-run-session") {
-        let shell = if has_program("kwin_wayland") { PlasmaShell::NestedKwin } else { PlasmaShell::Labwc };
+        let shell = if !has_program("kwin_wayland") {
+            PlasmaShell::Labwc
+        } else if !has_render_node() {
+            tracing::warn!(
+                "no usable GPU render node in /dev/dri: KWin cannot run nested without one, so \
+                 Plasma runs directly in labwc, where Plasma 6.8 and later shows no desktop or \
+                 panel, only the terminal"
+            );
+            PlasmaShell::Labwc
+        } else {
+            PlasmaShell::NestedKwin
+        };
         return plasma_desktop_command(shell, logout_service, &terminal);
     }
     terminal
+}
+
+/// The host has a GPU render node this process can open, which a nested KWin
+/// needs: its Wayland backend composites with EGL only. Without one it does
+/// not fail, either; it keeps running and draws nothing, so this has to be
+/// decided before it is started. Measured: in a CPU-rendered labwc, KWin had
+/// its socket up 5 ms after starting and was still running, with nothing
+/// drawn, 12 s later.
+fn has_render_node() -> bool {
+    has_render_node_in(Path::new("/dev/dri"))
+}
+
+fn has_render_node_in(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    entries.flatten().any(|e| {
+        e.file_name().to_string_lossy().starts_with("renderD")
+            && std::fs::OpenOptions::new().read(true).write(true).open(e.path()).is_ok()
+    })
 }
 
 /// Where plasmashell runs.
@@ -914,6 +943,32 @@ mod desktop_shell_tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!signalled && !got, "signalled a process outside the session");
         assert!(!end_desktop(&dir, 999_999), "no pid file: nothing to signal");
+    }
+}
+
+#[cfg(test)]
+mod render_node_tests {
+    use super::*;
+
+    #[test]
+    fn a_render_node_is_needed_for_kwin() {
+        let dir = std::env::temp_dir().join(format!("termland-dri-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!has_render_node_in(&dir), "empty: no GPU");
+        // A display card alone is not a render node.
+        std::fs::write(dir.join("card0"), b"").unwrap();
+        assert!(!has_render_node_in(&dir), "card0 only");
+        std::fs::write(dir.join("renderD128"), b"").unwrap();
+        assert!(has_render_node_in(&dir), "renderD128");
+        // One this process cannot open does not count.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("renderD128"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::OpenOptions::new().read(true).open(dir.join("renderD128")).is_err();
+        if unreadable {
+            assert!(!has_render_node_in(&dir), "renderD128 not openable");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!has_render_node_in(&dir), "no /dev/dri at all");
     }
 }
 
