@@ -154,13 +154,25 @@ impl ToplevelWatcher {
     /// anything else polling the session, and never waits for a window to
     /// appear.
     pub fn poll(&mut self) -> Result<Vec<Toplevel>, ToplevelError> {
+        // Send anything of ours still buffered (binds, acks), or the
+        // compositor never tells us about new windows.
+        let _ = self.event_queue.flush();
+        // Then read what the compositor has sent since last time, without
+        // waiting. dispatch_pending alone only handles events something else
+        // has already read off the socket, and nothing else does: only the
+        // windows present at connect, read by its roundtrip, were ever
+        // listed, and none opened later.
+        if let Some(guard) = self.event_queue.prepare_read() {
+            match guard.read() {
+                Ok(_) => {}
+                Err(wayland_client::backend::WaylandError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(ToplevelError::Connect(format!("read: {e}"))),
+            }
+        }
         self.event_queue
             .dispatch_pending(&mut self.state)
             .map_err(|e| ToplevelError::Connect(format!("dispatch: {e}")))?;
-        // A flush is needed because dispatch_pending only reads what has
-        // already been buffered; without it our bind/ack traffic can sit
-        // unsent and the compositor never tells us about new windows.
-        let _ = self.event_queue.flush();
         Ok(self.windows())
     }
 

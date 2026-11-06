@@ -90,7 +90,13 @@ Each session runs an isolated headless Wayland compositor with its own screen ca
   PAM authentication for any backend your system supports.
 
 ### Session Modes
-- **Desktop**: full multi-window session via labwc (Plasma, GNOME, sway, etc.)
+- **Desktop**: full multi-window session via labwc (Plasma, GNOME, sway, etc.).
+  On a KDE host the default is a full Plasma desktop. KWin runs nested inside
+  labwc and Plasma runs in KWin, since Plasma 6.8 only works under KWin. That
+  needs a GPU: KWin's nested mode has no software rendering. Without one,
+  Plasma 6.8 and later shows no desktop or panel, only a terminal. In a
+  Plasma session Right Ctrl is sent as Left Ctrl, because nested KWin grabs
+  the pointer on Right Ctrl.
 - **App**: single fullscreen application via cage (kiosk mode)
 
 ### Client

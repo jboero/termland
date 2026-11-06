@@ -22,7 +22,7 @@ pub fn launch_detached(
     audio_sink: Option<&str>,
 ) -> Result<DetachedBackend, CompositorError> {
     tracing::info!("Launching detached labwc: {shell_cmd} ({width}x{height})");
-    let config_dir = write_minimal_config(width, height)?;
+    let config_dir = write_minimal_config(width, height, hosts_kwin(shell_cmd))?;
 
     let wrapper = socket_wrapper_cmd(shell_cmd);
     let sh_arg = format!("sh -c '{}'", wrapper.replace('\'', r"'\''"));
@@ -82,7 +82,7 @@ fn random_suffix() -> String {
 /// `create_dir_all`) fails outright with `AlreadyExists` if anything is
 /// already at that exact path, symlink or not, closing the race even if the
 /// suffix were somehow predicted.
-fn write_minimal_config(width: u32, height: u32) -> Result<String, CompositorError> {
+fn write_minimal_config(width: u32, height: u32, nested_kwin: bool) -> Result<String, CompositorError> {
     let dir = std::env::temp_dir()
         .join(format!("termland-labwc-{}-{}", std::process::id(), random_suffix()));
     std::fs::create_dir(&dir)
@@ -98,24 +98,7 @@ fn write_minimal_config(width: u32, height: u32) -> Result<String, CompositorErr
             .map_err(|e| CompositorError::StartFailed(format!("chmod labwc config dir: {e}")))?;
     }
 
-    // rc.xml: basic window manager keybinds + set output mode
-    let rc_xml = format!(r#"<?xml version="1.0"?>
-<labwc_config>
-  <core>
-    <decoration>client</decoration>
-  </core>
-  <output>
-    <name>HEADLESS-1</name>
-    <mode><width>{width}</width><height>{height}</height><refresh>60</refresh></mode>
-  </output>
-  <keyboard>
-    <keybind key="A-F4"><action name="Close"/></keybind>
-    <keybind key="A-Tab"><action name="NextWindow"/></keybind>
-    <keybind key="W-d"><action name="ShowDesktop"/></keybind>
-    <keybind key="W-Return"><action name="Execute" command="konsole"/></keybind>
-  </keyboard>
-</labwc_config>
-"#);
+    let rc_xml = rc_xml(width, height, nested_kwin);
 
     let rc_path = dir.join("rc.xml");
     std::fs::write(&rc_path, rc_xml)
@@ -127,4 +110,73 @@ fn write_minimal_config(width: u32, height: u32) -> Result<String, CompositorErr
     }
 
     Ok(dir.to_string_lossy().to_string())
+}
+
+/// The desktop command runs KWin nested in labwc (`PlasmaShell::NestedKwin`).
+fn hosts_kwin(shell_cmd: &str) -> bool {
+    shell_cmd.contains("kwin_wayland")
+}
+
+/// labwc's rc.xml: the output mode, and basic window manager keybinds.
+///
+/// With KWin nested (`nested_kwin`), KWin is the window manager and labwc
+/// only hosts its one window, so labwc binds no keys (Alt+Tab, Alt+F4 and the
+/// rest have to reach KWin). KWin makes that window full-screen itself
+/// (`--fullscreen`), so it has no title bar either.
+fn rc_xml(width: u32, height: u32, nested_kwin: bool) -> String {
+    let keyboard = if nested_kwin {
+        // labwc loads its default keybinds when rc.xml has none, so one
+        // binding that does nothing, on keys nobody presses, stands in.
+        r#"  <keyboard>
+    <keybind key="W-A-C-S-F24"><action name="None"/></keybind>
+  </keyboard>"#
+    } else {
+        r#"  <keyboard>
+    <keybind key="A-F4"><action name="Close"/></keybind>
+    <keybind key="A-Tab"><action name="NextWindow"/></keybind>
+    <keybind key="W-d"><action name="ShowDesktop"/></keybind>
+    <keybind key="W-Return"><action name="Execute" command="konsole"/></keybind>
+  </keyboard>"#
+    };
+    format!(r#"<?xml version="1.0"?>
+<labwc_config>
+  <core>
+    <decoration>client</decoration>
+  </core>
+  <output>
+    <name>HEADLESS-1</name>
+    <mode><width>{width}</width><height>{height}</height><refresh>60</refresh></mode>
+  </output>
+{keyboard}
+</labwc_config>
+"#)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the one do-nothing binding: anything else would take keys like
+    /// Alt+Tab away from KWin.
+    #[test]
+    fn labwc_binds_no_keys_when_kwin_is_the_desktop() {
+        let rc = rc_xml(1280, 720, true);
+        assert_eq!(rc.matches("<keybind ").count(), 1, "{rc}");
+        assert!(rc.contains(r#"<keybind key="W-A-C-S-F24"><action name="None"/></keybind>"#), "{rc}");
+        assert!(!rc.contains("<default/>"), "<default/> loads labwc's own keybinds: {rc}");
+    }
+
+    #[test]
+    fn labwc_keeps_its_keybinds_without_kwin() {
+        let rc = rc_xml(1280, 720, false);
+        assert!(rc.contains(r#"key="A-Tab""#), "{rc}");
+    }
+
+    #[test]
+    fn kwin_is_recognised_in_the_desktop_command() {
+        let kwin = crate::backend::plasma_desktop_command(crate::backend::PlasmaShell::NestedKwin, None, "konsole");
+        let labwc = crate::backend::plasma_desktop_command(crate::backend::PlasmaShell::Labwc, None, "konsole");
+        assert!(hosts_kwin(&kwin));
+        assert!(!hosts_kwin(&labwc));
+    }
 }

@@ -781,6 +781,10 @@ where
         }
     };
     let mut last_windows: Vec<termland_protocol::WindowInfo> = Vec::new();
+    let mut right_ctrl = RightCtrl::default();
+    // Re-checked as windows come and go: the desktop script records itself
+    // before KWin maps its window.
+    let mut kwin_desktop = nested_kwin(&compositor_runtime_dir, compositor_pid);
     // Polled rather than event-driven: the Wayland connection is blocking, and
     // half a second is well inside what a task list needs while costing
     // nothing when nothing changes (the list is only sent on change).
@@ -812,6 +816,11 @@ where
                             })
                             .collect();
                         if windows != last_windows {
+                            let now = nested_kwin(&compositor_runtime_dir, compositor_pid);
+                            if now && !kwin_desktop {
+                                tracing::info!("Desktop is a nested KWin: Right Ctrl is sent as Left Ctrl, KWin grabs the pointer on it");
+                            }
+                            kwin_desktop = now;
                             last_windows.clone_from(&windows);
                             if let Err(e) = framed
                                 .send(Message::WindowList(termland_protocol::WindowList { windows }))
@@ -955,10 +964,8 @@ where
                             Message::KeyEvent(ke) => {
                                 let pressed = ke.state == termland_protocol::input::KeyState::Pressed;
                                 tracing::debug!("Key received: scancode={} pressed={pressed}", ke.scancode);
-                                let _ = input_tx.send(InputCommand::Key {
-                                    scancode: ke.scancode,
-                                    pressed,
-                                });
+                                let scancode = right_ctrl.map(ke.scancode, pressed, kwin_desktop);
+                                let _ = input_tx.send(InputCommand::Key { scancode, pressed });
                             }
                             Message::TextInput(ti) => {
                                 tracing::debug!("Text received: {} chars", ti.text.chars().count());
@@ -1117,6 +1124,47 @@ impl EncoderTuning {
             preset: self.preset.clone(),
             crf: self.crf,
             extra_svt_params: self.extra_svt_params.clone(),
+        }
+    }
+}
+
+/// evdev codes.
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_RIGHTCTRL: u32 = 97;
+
+/// The session's desktop is KWin nested in labwc (the Plasma desktop; see
+/// `termland_compositor`'s `PlasmaShell::NestedKwin`), whose script, and
+/// only it, records its pid. KWin's own window has no app_id, and its title
+/// ("KDE Wayland Compositor ...") is translated, so neither identifies it.
+fn nested_kwin(runtime_dir: &str, labwc_pid: u32) -> bool {
+    termland_compositor::desktop_pid_file(std::path::Path::new(runtime_dir), labwc_pid).exists()
+}
+
+/// Right Ctrl, sent as Left Ctrl to a nested KWin.
+///
+/// KWin's nested (Wayland) backend toggles a pointer grab on Right Ctrl,
+/// hard-coded with no option to turn it off ("Press right control key to
+/// grab pointer"), and a grabbed pointer stops following termland's
+/// absolute pointer. Applications rarely tell the two Ctrl keys apart.
+///
+/// A release goes out as whatever its press did, so the key cannot be left
+/// held down if the desktop is recognised between the two.
+#[derive(Default)]
+struct RightCtrl {
+    sent_as: Option<u32>,
+}
+
+impl RightCtrl {
+    fn map(&mut self, scancode: u32, pressed: bool, nested_kwin: bool) -> u32 {
+        if scancode != KEY_RIGHTCTRL {
+            return scancode;
+        }
+        if pressed {
+            let code = if nested_kwin { KEY_LEFTCTRL } else { KEY_RIGHTCTRL };
+            self.sent_as = Some(code);
+            code
+        } else {
+            self.sent_as.take().unwrap_or(KEY_RIGHTCTRL)
         }
     }
 }
@@ -1405,6 +1453,13 @@ fn capture_thread(
             // Flush the old encoder before dropping it. This sends
             // EOS so the encoder can properly close.
             let _ = video_encoder.flush();
+            // Close it before opening the replacement, not after. With
+            // NVIDIA's 620.70 driver, closing an NVENC encoder while another
+            // is open crashes the process about 10 s later, in a driver
+            // thread (libnvcuvid); assigning over it did exactly that, on
+            // the first resize of every session. Measured: open-then-close
+            // crashed 3 runs of 3, close-then-open none.
+            drop(video_encoder);
             video_encoder = init_encoder(&tuning, w, h, &supported_codecs);
             encoder_codec = video_encoder.backend().codec();
             encoder_dims = (w, h);
@@ -2080,6 +2135,33 @@ fn cursor_watch_thread(
     }
 
     tracing::info!("Cursor shape watch thread exiting");
+}
+
+#[cfg(test)]
+mod right_ctrl_tests {
+    use super::*;
+
+    #[test]
+    fn right_ctrl_reaches_a_nested_kwin_as_left_ctrl() {
+        let mut rc = RightCtrl::default();
+        assert_eq!(rc.map(KEY_RIGHTCTRL, true, true), KEY_LEFTCTRL);
+        assert_eq!(rc.map(KEY_RIGHTCTRL, false, true), KEY_LEFTCTRL);
+        // Other keys, and other desktops, are untouched.
+        assert_eq!(rc.map(30, true, true), 30);
+        assert_eq!(rc.map(KEY_RIGHTCTRL, true, false), KEY_RIGHTCTRL);
+        assert_eq!(rc.map(KEY_RIGHTCTRL, false, false), KEY_RIGHTCTRL);
+    }
+
+    /// Recognised between press and release: the release must match the
+    /// press, or the key is left held down in the session.
+    #[test]
+    fn a_release_matches_its_press() {
+        let mut rc = RightCtrl::default();
+        assert_eq!(rc.map(KEY_RIGHTCTRL, true, false), KEY_RIGHTCTRL);
+        assert_eq!(rc.map(KEY_RIGHTCTRL, false, true), KEY_RIGHTCTRL);
+        assert_eq!(rc.map(KEY_RIGHTCTRL, true, true), KEY_LEFTCTRL);
+        assert_eq!(rc.map(KEY_RIGHTCTRL, false, false), KEY_LEFTCTRL);
+    }
 }
 
 #[cfg(test)]

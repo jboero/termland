@@ -27,9 +27,17 @@ fn labwc_pid() -> Option<u32> {
     std::env::var("LABWC_PID").ok()?.parse().ok()
 }
 
-/// End the session by exiting labwc, as `labwc --exit` does.
+/// End the session: through the desktop when it can end itself (a nested
+/// KWin, which aborts if labwc goes first; see `termland_compositor::end_desktop`),
+/// otherwise by exiting labwc, as `labwc --exit` does.
 fn end_session(action: &str) -> zbus::fdo::Result<()> {
     let pid = labwc_pid().ok_or_else(|| zbus::fdo::Error::Failed("LABWC_PID is not set".into()))?;
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        if termland_compositor::end_desktop(std::path::Path::new(&runtime_dir), pid) {
+            tracing::info!("{action} requested: ending the desktop to end the session");
+            return Ok(());
+        }
+    }
     tracing::info!("{action} requested: exiting labwc (pid {pid}) to end the session");
     if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
         let e = std::io::Error::last_os_error();
