@@ -499,8 +499,8 @@ pub fn detect_terminal() -> String {
 /// Auto-detect the best default desktop shell command for `--mode desktop`.
 ///
 /// Priority order:
-///   1. KDE Plasma: plasmashell + terminal (panels, plasmoids, wallpaper)
-///   2. GNOME Shell (unlikely to work well in labwc, but we try)
+///   1. KDE Plasma in a nested KWin (`plasma_desktop_command`)
+///   2. KDE Plasma directly in labwc, when KWin is not installed
 ///   3. Bare terminal fallback
 ///
 /// The returned command is passed to `sh -c` inside labwc via its -S flag.
@@ -510,61 +510,100 @@ pub fn detect_terminal() -> String {
 /// does nothing. It is left out if it is not safe to embed in the script.
 pub fn detect_desktop_shell(logout_service: Option<&str>) -> String {
     let terminal = detect_terminal();
-
     if has_program("plasmashell") && has_program("dbus-run-session") {
-        // Start plasmashell (panels/plasmoids) in the background, plus a
-        // terminal in the foreground so something is visible and labwc has a
-        // session process to tie its lifetime to. When the terminal exits,
+        let shell = if has_program("kwin_wayland") { PlasmaShell::NestedKwin } else { PlasmaShell::Labwc };
+        return plasma_desktop_command(shell, logout_service, &terminal);
+    }
+    terminal
+}
+
+/// Where plasmashell runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PlasmaShell {
+    /// In KWin, which runs full-screen as a window in labwc.
+    ///
+    /// Plasma 6.8 only works under KWin. plasmashell learns which screens it
+    /// has from KWin's `kde_output_order_v1` protocol; up to 6.7 it fell back
+    /// to Qt's screen list on compositors without it, and 6.8 removed that
+    /// fallback. Under labwc plasmashell now finds no screens and draws
+    /// nothing: no wallpaper, no panel, just whatever else was started.
+    ///
+    /// labwc stays the outer compositor because capture and input injection
+    /// use wlroots protocols KWin does not offer. KWin is a client of labwc
+    /// that composites with the GPU (its nested mode has no software path),
+    /// and everything in the desktop is a client of KWin.
+    NestedKwin,
+    /// Directly in labwc. Works up to Plasma 6.7; used when KWin is not
+    /// installed.
+    Labwc,
+}
+
+/// The Plasma desktop command for `shell`. Pure, so both forms can be tested
+/// on any machine.
+///
+/// Details here are load-bearing, learned from stranding `plasmashell`
+/// processes on a developer workstation for hours:
+///
+///   --no-respawn   Bare plasmashell restarts itself when it dies, so a
+///                  stranded instance resurrects indefinitely and no amount
+///                  of killing settles it. A real Plasma session passes this
+///                  flag for the same reason.
+///
+///   no `exec`      `exec` would replace this shell, destroying the only
+///                  process that can clean up after plasmashell. Keeping the
+///                  shell costs one process and buys a trap that stops the
+///                  desktop when the session ends, instead of orphaning it.
+///
+///   wait after kill  Without it the shell exits as soon as the signal is
+///                  sent, `dbus-run-session` tears down the private session
+///                  bus, and plasmashell, still shutting down, aborts inside
+///                  libdbus (`_dbus_warn_check_failed` <- `QDBusConnection`),
+///                  a coredump and a KCrash handler on every teardown.
+///                  Waiting keeps the bus alive until plasmashell is done
+///                  with it. With KWin, plasmashell is stopped before KWin,
+///                  so it is not left without its compositor either.
+///
+/// The trap does not run on SIGKILL, so this does not replace reaping the
+/// process group in `registry::close`; it just means the common case never
+/// gets that far.
+///
+/// The logout service is started first so it owns its names before anything
+/// could ask for them, and stopped by the same trap.
+pub fn plasma_desktop_command(shell: PlasmaShell, logout_service: Option<&str>, terminal: &str) -> String {
+    let (start_logout, logout_pid) = match logout_service {
+        Some(cmd) if validate_shell_command(cmd).is_ok() => (format!("{cmd} & logout=$!; "), " $logout"),
+        Some(cmd) => {
+            tracing::warn!("not starting logout service, unsafe command: {cmd:?}");
+            (String::new(), "")
+        }
+        None => (String::new(), ""),
+    };
+    match shell {
+        // KWin gets its own socket name, unique to this session, and
+        // plasmashell is pointed at it once it exists. The session lasts as
+        // long as KWin; Log Out ends it through the logout service.
+        //
+        // KWin's default Wayland socket would be the first free wayland-N,
+        // which another session could take between KWin choosing it and
+        // plasmashell connecting.
+        PlasmaShell::NestedKwin => format!(
+            "dbus-run-session sh -c '{start_logout}\
+             kwin=termland-kwin-$$; \
+             kwin_wayland --socket $kwin --fullscreen true --xwayland --no-lockscreen & kwin_pid=$!; \
+             i=0; while [ ! -S \"$XDG_RUNTIME_DIR/$kwin\" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; \
+             WAYLAND_DISPLAY=$kwin plasmashell --no-respawn & shell=$!; \
+             trap \"kill $shell{logout_pid} 2>/dev/null; wait $shell 2>/dev/null; kill $kwin_pid 2>/dev/null; wait $kwin_pid 2>/dev/null\" EXIT INT TERM; \
+             wait $kwin_pid'"
+        ),
+        // A terminal in the foreground so something is visible and labwc has
+        // a session process to tie its lifetime to. When the terminal exits,
         // labwc exits.
-        //
-        // Two details here are load-bearing, both learned from stranding
-        // `plasmashell` processes on a developer workstation for hours:
-        //
-        //   --no-respawn   Bare plasmashell restarts itself when it dies, so a
-        //                  stranded instance resurrects indefinitely and no
-        //                  amount of killing settles it. A real Plasma session
-        //                  passes this flag for the same reason.
-        //
-        //   no `exec`      `exec` replaced this shell with the terminal,
-        //                  destroying the only process that could clean up
-        //                  after plasmashell. Keeping the shell costs one
-        //                  process and buys a trap that stops the shell when
-        //                  the terminal exits, instead of orphaning it.
-        //
-        // The `wait` after the `kill` is not decoration. Without it the shell
-        // exits as soon as the signal is sent, `dbus-run-session` tears down
-        // the private session bus, and plasmashell — still shutting down —
-        // aborts inside libdbus:
-        //
-        //     abort <- _dbus_warn_check_failed
-        //           <- QDBusConnectionPrivate::getNameOwnerNoCache
-        //           <- QDBusConnectionPrivate::addSignalHookImpl
-        //
-        // which is a coredump and a KCrash handler on every single teardown.
-        // Waiting keeps the bus alive until plasmashell has finished with it.
-        //
-        // The trap does not run on SIGKILL, so this does not replace reaping
-        // the process group in `registry::close` — it just means the common
-        // case never gets that far.
-        //
-        // The logout service is started first so it owns its names before
-        // anything could ask for them, and stopped by the same trap.
-        let (start_logout, logout_pid) = match logout_service {
-            Some(cmd) if validate_shell_command(cmd).is_ok() => (format!("{cmd} & logout=$!; "), " $logout"),
-            Some(cmd) => {
-                tracing::warn!("not starting logout service, unsafe command: {cmd:?}");
-                (String::new(), "")
-            }
-            None => (String::new(), ""),
-        };
-        return format!(
+        PlasmaShell::Labwc => format!(
             "dbus-run-session sh -c '{start_logout}plasmashell --no-respawn & shell=$!; \
              trap \"kill $shell{logout_pid} 2>/dev/null; wait $shell 2>/dev/null\" EXIT INT TERM; \
              {terminal}'"
-        );
+        ),
     }
-
-    terminal
 }
 
 pub mod cage;
@@ -574,43 +613,54 @@ pub mod labwc;
 mod desktop_shell_tests {
     use super::*;
 
-    /// Only meaningful where plasmashell is actually detected; elsewhere the
-    /// function returns a bare terminal and there is nothing to assert.
-    fn plasma_command() -> Option<String> {
-        let cmd = detect_desktop_shell(Some("/usr/bin/termland-server --logout-service"));
-        cmd.contains("plasmashell").then_some(cmd)
+    const LOGOUT: &str = "/usr/bin/termland-server --logout-service";
+
+    /// Both forms of the Plasma command, built directly so the tests do not
+    /// depend on what is installed here.
+    fn plasma_commands() -> [(PlasmaShell, String); 2] {
+        [PlasmaShell::NestedKwin, PlasmaShell::Labwc]
+            .map(|shell| (shell, plasma_desktop_command(shell, Some(LOGOUT), "konsole")))
+    }
+
+    fn inner(cmd: &str) -> &str {
+        cmd.split_once("dbus-run-session sh -c '")
+            .and_then(|(_, rest)| rest.strip_suffix('\''))
+            .expect("expected a `dbus-run-session sh -c '...'` wrapper")
     }
 
     /// Log Out talks to the logout service over the session's bus, so it has
-    /// to be inside dbus-run-session, running before plasmashell, and
+    /// to be inside dbus-run-session, running before the desktop, and
     /// stopped with it.
     #[test]
     fn the_logout_service_runs_on_the_session_bus_and_is_stopped() {
-        let Some(cmd) = plasma_command() else { return };
-        let inner = cmd.split_once("dbus-run-session sh -c '").expect("dbus-run-session wrapper").1;
-        assert!(
-            inner.starts_with("/usr/bin/termland-server --logout-service & logout=$!; plasmashell"),
-            "logout service must start first, inside the bus: {cmd}"
-        );
-        assert!(cmd.contains("kill $shell $logout"), "trap must stop the logout service: {cmd}");
+        for (shell, cmd) in plasma_commands() {
+            assert!(
+                inner(&cmd).starts_with(&format!("{LOGOUT} & logout=$!; ")),
+                "{shell:?}: logout service must start first, inside the bus: {cmd}"
+            );
+            assert!(cmd.contains("kill $shell $logout"), "{shell:?}: trap must stop the logout service: {cmd}");
+        }
     }
 
     #[test]
     fn an_unsafe_logout_service_command_is_left_out() {
-        let cmd = detect_desktop_shell(Some("/tmp/x; rm -rf ~"));
-        assert!(!cmd.contains("rm -rf"), "unsafe command embedded: {cmd}");
-        assert!(!cmd.contains("$logout"), "{cmd}");
+        for shell in [PlasmaShell::NestedKwin, PlasmaShell::Labwc] {
+            let cmd = plasma_desktop_command(shell, Some("/tmp/x; rm -rf ~"), "konsole");
+            assert!(!cmd.contains("rm -rf"), "{shell:?}: unsafe command embedded: {cmd}");
+            assert!(!cmd.contains("$logout"), "{shell:?}: {cmd}");
+        }
     }
 
     /// Bare plasmashell restarts itself when it dies, so a stranded instance
     /// resurrects forever and killing it never settles anything.
     #[test]
     fn plasmashell_is_launched_with_no_respawn() {
-        let Some(cmd) = plasma_command() else { return };
-        assert!(
-            cmd.contains("plasmashell --no-respawn"),
-            "plasmashell must not be allowed to respawn: {cmd}"
-        );
+        for (shell, cmd) in plasma_commands() {
+            assert!(
+                cmd.contains("plasmashell --no-respawn"),
+                "{shell:?}: plasmashell must not be allowed to respawn: {cmd}"
+            );
+        }
     }
 
     /// `exec` replaced the shell with the terminal, destroying the only
@@ -618,35 +668,118 @@ mod desktop_shell_tests {
     /// to survive for the trap to exist at all.
     #[test]
     fn the_wrapper_shell_survives_to_run_its_trap() {
-        let Some(cmd) = plasma_command() else { return };
-        assert!(
-            !cmd.contains("exec "),
-            "exec destroys the shell that owns plasmashell: {cmd}"
-        );
-        assert!(cmd.contains("trap "), "no trap to clean up plasmashell: {cmd}");
-        assert!(
-            cmd.contains("EXIT") && cmd.contains("TERM"),
-            "trap must cover normal exit and termination: {cmd}"
-        );
+        for (shell, cmd) in plasma_commands() {
+            assert!(!cmd.contains("exec "), "{shell:?}: exec destroys the shell that owns plasmashell: {cmd}");
+            assert!(cmd.contains("trap "), "{shell:?}: no trap to clean up plasmashell: {cmd}");
+            assert!(
+                cmd.contains("EXIT") && cmd.contains("TERM"),
+                "{shell:?}: trap must cover normal exit and termination: {cmd}"
+            );
+        }
     }
 
     /// The command is handed to `sh -c`; if it is not valid shell the session
     /// dies at startup with a message about syntax rather than about Termland.
     #[test]
     fn the_command_is_valid_shell() {
-        let Some(cmd) = plasma_command() else { return };
-        // `sh -n` parses without executing.
-        let inner = cmd
-            .split_once("sh -c '")
-            .and_then(|(_, rest)| rest.strip_suffix('\''))
-            .expect("expected a `sh -c '...'` wrapper");
-        let status = std::process::Command::new("sh")
-            .arg("-n")
+        for (shell, cmd) in plasma_commands() {
+            // `sh -n` parses without executing.
+            let status = std::process::Command::new("sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(inner(&cmd))
+                .status()
+                .expect("run sh -n");
+            assert!(status.success(), "{shell:?}: not valid shell: {cmd}");
+        }
+    }
+
+    /// Plasma 6.8 draws nothing outside KWin, so plasmashell has to connect
+    /// to the nested KWin, not to labwc, and KWin has to fill labwc's output.
+    #[test]
+    fn plasmashell_runs_in_the_nested_kwin() {
+        let cmd = plasma_desktop_command(PlasmaShell::NestedKwin, None, "konsole");
+        assert!(cmd.contains("kwin_wayland --socket $kwin --fullscreen true"), "{cmd}");
+        assert!(cmd.contains("WAYLAND_DISPLAY=$kwin plasmashell"), "{cmd}");
+        // Unique to this session: the inner shell's pid.
+        assert!(cmd.contains("kwin=termland-kwin-$$;"), "{cmd}");
+    }
+
+    /// plasmashell is stopped, and waited for, before KWin, so it shuts down
+    /// with its compositor and bus still there.
+    #[test]
+    fn plasmashell_is_stopped_before_kwin() {
+        let cmd = plasma_desktop_command(PlasmaShell::NestedKwin, None, "konsole");
+        let shell = cmd.find("wait $shell").expect("waits for plasmashell");
+        let kwin = cmd.find("kill $kwin_pid").expect("stops kwin");
+        assert!(shell < kwin, "plasmashell must be gone before KWin is stopped: {cmd}");
+    }
+
+    /// Runs the nested-KWin script with stand-ins for kwin_wayland and
+    /// plasmashell, then ends the session as labwc does (SIGTERM to the
+    /// shell), and checks what each saw and the order they stopped in.
+    #[test]
+    fn the_nested_kwin_script_starts_and_stops_the_desktop_in_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("termland-kwin-script-{}", std::process::id()));
+        let bin = dir.join("bin");
+        let runtime = dir.join("run");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&runtime).unwrap();
+        let log = dir.join("log");
+        let stub = |name: &str, body: &str| {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let log_s = log.display();
+        // kwin_wayland: make its socket (a real one: the script waits on -S).
+        stub("kwin_wayland", &format!(
+            "echo \"kwin $*\" >> {log_s}\n\
+             python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' \"$XDG_RUNTIME_DIR/$2\"\n\
+             trap 'echo kwin-stopped >> {log_s}; exit 0' TERM\n\
+             while :; do sleep 0.05; done"
+        ));
+        stub("plasmashell", &format!(
+            "echo \"plasmashell on $WAYLAND_DISPLAY\" >> {log_s}\n\
+             trap 'sleep 0.3; echo plasmashell-stopped >> {log_s}; exit 0' TERM\n\
+             while :; do sleep 0.05; done"
+        ));
+        // dbus-run-session: run its command, as the real one does.
+        stub("dbus-run-session", "exec \"$@\"");
+
+        let cmd = plasma_desktop_command(PlasmaShell::NestedKwin, None, "konsole");
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let mut child = std::process::Command::new("sh")
             .arg("-c")
-            .arg(inner)
-            .status()
-            .expect("run sh -n");
-        assert!(status.success(), "not valid shell: {inner}");
+            .arg(format!("exec {cmd}"))
+            .env("PATH", &path)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .spawn()
+            .expect("run the desktop script");
+        // Wait for plasmashell to start.
+        let started = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("plasmashell on"))
+        });
+        // End the session as labwc does.
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        let _ = child.wait();
+        let lines: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(started, "plasmashell never started: {lines:?}");
+        let socket = lines[0].split_whitespace().nth(2).expect("kwin socket").to_string();
+        assert!(socket.starts_with("termland-kwin-"), "{lines:?}");
+        assert_eq!(
+            lines[1..],
+            [format!("plasmashell on {socket}"), "plasmashell-stopped".into(), "kwin-stopped".into()],
+            "plasmashell must connect to KWin, and stop before it"
+        );
     }
 }
 

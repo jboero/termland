@@ -396,9 +396,68 @@ impl Drop for VaapiFrames {
     }
 }
 
+/// How young an NVENC encoder can be and still be closed straight away.
+///
+/// NVIDIA's 620.70 driver crashes the process when an NVENC encoder is closed
+/// within about a second of being opened and another is opened alongside it:
+/// a worker thread the driver starts in libnvcuvid reads freed memory
+/// (SIGSEGV). termland did exactly that on every session: the client asks for
+/// a resize as soon as its window appears, and the server replaced the first
+/// encoder about 0.4 s after opening it.
+///
+/// Measured on an RTX PRO 4000 Blackwell with 620.70.06, replacing an
+/// encoder after 1 to 5 frames: crashed every time (16 runs), whether or not
+/// it was drained first. Closed 1 s or more after it opened: never. A process
+/// exiting with a young encoder still open hung or crashed too, so a young
+/// encoder cannot be left for later either; it is waited out.
+const NVENC_MIN_LIFETIME: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// How long to wait before closing an encoder of this age, if at all.
+fn close_delay(backend: EncoderBackend, age: std::time::Duration) -> Option<std::time::Duration> {
+    let nvenc = matches!(
+        backend,
+        EncoderBackend::NvidiaEnc | EncoderBackend::H265Nvenc | EncoderBackend::H264Nvenc
+    );
+    (nvenc && age < NVENC_MIN_LIFETIME).then(|| NVENC_MIN_LIFETIME - age)
+}
+
+/// An opened FFmpeg encoder. Closing a young NVENC one waits until it is old
+/// enough (`NVENC_MIN_LIFETIME`). In practice that is once a session, when the
+/// first resize replaces the first encoder, and costs under a second there.
+struct OpenedEncoder {
+    encoder: std::mem::ManuallyDrop<ffmpeg_next::encoder::Video>,
+    backend: EncoderBackend,
+    opened: std::time::Instant,
+}
+
+impl OpenedEncoder {
+    fn new(encoder: ffmpeg_next::encoder::Video, backend: EncoderBackend) -> Self {
+        Self { encoder: std::mem::ManuallyDrop::new(encoder), backend, opened: std::time::Instant::now() }
+    }
+}
+
+impl std::ops::Deref for OpenedEncoder {
+    type Target = ffmpeg_next::encoder::Video;
+    fn deref(&self) -> &Self::Target { &self.encoder }
+}
+impl std::ops::DerefMut for OpenedEncoder {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.encoder }
+}
+
+impl Drop for OpenedEncoder {
+    fn drop(&mut self) {
+        if let Some(delay) = close_delay(self.backend, self.opened.elapsed()) {
+            tracing::info!("{}: waiting {delay:?} to close it, NVENC crashes if closed younger", self.backend);
+            std::thread::sleep(delay);
+        }
+        // SAFETY: taken exactly once, here, and never used again.
+        drop(unsafe { std::mem::ManuallyDrop::take(&mut self.encoder) });
+    }
+}
+
 pub struct FfmpegVideoEncoder {
     backend: EncoderBackend,
-    encoder: ffmpeg_next::encoder::Video,
+    encoder: OpenedEncoder,
     converter: SendScaler,
     pixel_fmt: ffmpeg_next::format::Pixel,
     frame_index: i64,
@@ -613,9 +672,12 @@ impl FfmpegVideoEncoder {
             }
         }
 
-        let encoder = encoder.open_with(opts).map_err(|e| {
-            EncoderError::InitFailed(format!("{backend}: open encoder: {e}"))
-        })?;
+        let encoder = OpenedEncoder::new(
+            encoder.open_with(opts).map_err(|e| {
+                EncoderError::InitFailed(format!("{backend}: open encoder: {e}"))
+            })?,
+            backend,
+        );
         // The CRF-based backends log their rate control above; the rest use `kbps`.
         if !matches!(
             backend,
@@ -869,6 +931,26 @@ pub fn probe_best_encoder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_young_nvenc_encoder_is_closed_later() {
+        use std::time::Duration;
+        for backend in [EncoderBackend::NvidiaEnc, EncoderBackend::H265Nvenc, EncoderBackend::H264Nvenc] {
+            assert_eq!(close_delay(backend, Duration::ZERO), Some(NVENC_MIN_LIFETIME), "{backend}");
+            assert_eq!(close_delay(backend, Duration::from_millis(400)), Some(NVENC_MIN_LIFETIME - Duration::from_millis(400)), "{backend}");
+            assert_eq!(close_delay(backend, NVENC_MIN_LIFETIME), None, "{backend}");
+        }
+    }
+
+    #[test]
+    fn other_encoders_are_closed_straight_away() {
+        for backend in ENCODER_PRIORITY.iter().copied().filter(|b| !matches!(
+            b,
+            EncoderBackend::NvidiaEnc | EncoderBackend::H265Nvenc | EncoderBackend::H264Nvenc
+        )) {
+            assert_eq!(close_delay(backend, std::time::Duration::ZERO), None, "{backend}");
+        }
+    }
 
     /// Every `EncoderBackend`, split by whether it runs on the GPU.
     ///

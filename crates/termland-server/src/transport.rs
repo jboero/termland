@@ -1405,6 +1405,13 @@ fn capture_thread(
             // Flush the old encoder before dropping it. This sends
             // EOS so the encoder can properly close.
             let _ = video_encoder.flush();
+            // Close it before opening the replacement, not after. With
+            // NVIDIA's 620.70 driver, closing an NVENC encoder while another
+            // is open crashes the process about 10 s later, in a driver
+            // thread (libnvcuvid); assigning over it did exactly that, on
+            // the first resize of every session. Measured: open-then-close
+            // crashed 3 runs of 3, close-then-open none.
+            drop(video_encoder);
             video_encoder = init_encoder(&tuning, w, h, &supported_codecs);
             encoder_codec = video_encoder.backend().codec();
             encoder_dims = (w, h);
