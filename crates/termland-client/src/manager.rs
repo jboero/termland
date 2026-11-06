@@ -560,7 +560,7 @@ fn spawn_poll_thread(
 /// Same age formatting as `connection.rs`'s local `format_age` — a tiny
 /// duplicate rather than a shared crate export, matching the precedent in
 /// `termland-server/src/main.rs`.
-fn format_age(secs: u64) -> String {
+pub(crate) fn format_age(secs: u64) -> String {
     if secs < 60 { format!("{secs}s") }
     else if secs < 3600 { format!("{}m", secs / 60) }
     else if secs < 86400 { format!("{}h", secs / 3600) }
@@ -593,7 +593,7 @@ fn codec_from_name(name: &str) -> Option<VideoCodec> {
     }
 }
 
-fn connect_params_for_profile(p: &Profile) -> ConnectParams {
+pub(crate) fn connect_params_for_profile(p: &Profile) -> ConnectParams {
     ConnectParams {
         mode: session_mode_for(&p.mode),
         width: p.width,
