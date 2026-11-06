@@ -414,25 +414,88 @@ const NVENC_MIN_LIFETIME: std::time::Duration = std::time::Duration::from_millis
 
 /// How long to wait before closing an encoder of this age, if at all.
 fn close_delay(backend: EncoderBackend, age: std::time::Duration) -> Option<std::time::Duration> {
-    let nvenc = matches!(
-        backend,
-        EncoderBackend::NvidiaEnc | EncoderBackend::H265Nvenc | EncoderBackend::H264Nvenc
-    );
-    (nvenc && age < NVENC_MIN_LIFETIME).then(|| NVENC_MIN_LIFETIME - age)
+    (is_nvenc(backend) && age < NVENC_MIN_LIFETIME).then(|| NVENC_MIN_LIFETIME - age)
+}
+
+/// The order NVENC encoders may be closed in: newest first.
+///
+/// The same driver crashes the process (libnvcuvid again, about 10 s later)
+/// when an NVENC encoder is closed while one opened after it is still open.
+/// Closing the newest is fine. Measured, two encoders in one process, the
+/// second opened 2 s after the first, 20 s runs: closing the newer while the
+/// older kept encoding, 2 runs of 2 fine; closing the older while the newer
+/// kept encoding, 2 of 2 crashed. One session replacing its encoder closes the
+/// old one before opening the new one (see the server's resize), but a server
+/// running several sessions in one process (`--port`) has encoders of
+/// different ages open together, and sessions end in any order.
+///
+/// So an encoder that is not the newest when dropped is kept open, unused,
+/// until every newer one has been closed, and then closed. Generic over what
+/// it holds so it can be tested without a GPU.
+struct CloseOrder<T> {
+    /// Open encoders by when they were opened, oldest first: `None` while in
+    /// use, `Some` once dropped and waiting for the newer ones to close.
+    open: Vec<(u64, Option<T>)>,
+    next: u64,
+}
+
+impl<T> CloseOrder<T> {
+    const fn new() -> Self {
+        Self { open: Vec::new(), next: 0 }
+    }
+
+    /// Record an encoder as opened; returns its place in the order.
+    fn opened(&mut self) -> u64 {
+        let seq = self.next;
+        self.next += 1;
+        self.open.push((seq, None));
+        seq
+    }
+
+    /// `item` (the encoder `seq`) is no longer used. Returns what can be
+    /// closed now, in the order to close it: `item` if nothing newer is open,
+    /// then each older one that was waiting on it.
+    fn dropped(&mut self, seq: u64, item: T) -> Vec<T> {
+        match self.open.iter_mut().find(|(s, _)| *s == seq) {
+            Some(entry) => entry.1 = Some(item),
+            // Not recorded (cannot happen): nothing to order it against.
+            None => return vec![item],
+        }
+        let mut close = Vec::new();
+        while matches!(self.open.last(), Some((_, Some(_)))) {
+            if let Some((_, Some(item))) = self.open.pop() {
+                close.push(item);
+            }
+        }
+        close
+    }
+}
+
+static NVENC_CLOSE_ORDER: std::sync::Mutex<CloseOrder<ffmpeg_next::encoder::Video>> =
+    std::sync::Mutex::new(CloseOrder::new());
+
+fn is_nvenc(backend: EncoderBackend) -> bool {
+    matches!(backend, EncoderBackend::NvidiaEnc | EncoderBackend::H265Nvenc | EncoderBackend::H264Nvenc)
 }
 
 /// An opened FFmpeg encoder. Closing a young NVENC one waits until it is old
-/// enough (`NVENC_MIN_LIFETIME`). In practice that is once a session, when the
+/// enough (`NVENC_MIN_LIFETIME`); in practice that is once a session, when the
 /// first resize replaces the first encoder, and costs under a second there.
+/// NVENC encoders are also closed newest first (`CloseOrder`).
 struct OpenedEncoder {
     encoder: std::mem::ManuallyDrop<ffmpeg_next::encoder::Video>,
     backend: EncoderBackend,
     opened: std::time::Instant,
+    /// Place in `NVENC_CLOSE_ORDER`, for NVENC encoders.
+    nvenc_seq: Option<u64>,
 }
 
 impl OpenedEncoder {
     fn new(encoder: ffmpeg_next::encoder::Video, backend: EncoderBackend) -> Self {
-        Self { encoder: std::mem::ManuallyDrop::new(encoder), backend, opened: std::time::Instant::now() }
+        let nvenc_seq = is_nvenc(backend).then(|| {
+            NVENC_CLOSE_ORDER.lock().unwrap_or_else(|e| e.into_inner()).opened()
+        });
+        Self { encoder: std::mem::ManuallyDrop::new(encoder), backend, opened: std::time::Instant::now(), nvenc_seq }
     }
 }
 
@@ -451,7 +514,17 @@ impl Drop for OpenedEncoder {
             std::thread::sleep(delay);
         }
         // SAFETY: taken exactly once, here, and never used again.
-        drop(unsafe { std::mem::ManuallyDrop::take(&mut self.encoder) });
+        let encoder = unsafe { std::mem::ManuallyDrop::take(&mut self.encoder) };
+        let Some(seq) = self.nvenc_seq else { return drop(encoder) };
+        let mut order = NVENC_CLOSE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let close = order.dropped(seq, encoder);
+        if close.is_empty() {
+            tracing::info!("{}: kept open until the newer NVENC encoders close; NVENC crashes otherwise", self.backend);
+        }
+        // Under the lock, so nothing is opened or dropped between closes.
+        for encoder in close {
+            drop(encoder);
+        }
     }
 }
 
@@ -940,6 +1013,29 @@ mod tests {
             assert_eq!(close_delay(backend, Duration::from_millis(400)), Some(NVENC_MIN_LIFETIME - Duration::from_millis(400)), "{backend}");
             assert_eq!(close_delay(backend, NVENC_MIN_LIFETIME), None, "{backend}");
         }
+    }
+
+    #[test]
+    fn nvenc_encoders_close_newest_first() {
+        let mut order = CloseOrder::new();
+        let (a, b, c) = (order.opened(), order.opened(), order.opened());
+        // The oldest goes first: it waits for b and c.
+        assert!(order.dropped(a, "a").is_empty());
+        // The newest closes at once.
+        assert_eq!(order.dropped(c, "c"), ["c"]);
+        // b is now the newest, and a was waiting on it.
+        assert_eq!(order.dropped(b, "b"), ["b", "a"]);
+        assert!(order.open.is_empty());
+    }
+
+    #[test]
+    fn one_sessions_replacement_closes_at_once() {
+        // A resize closes the old encoder before opening the new one.
+        let mut order = CloseOrder::new();
+        let old = order.opened();
+        assert_eq!(order.dropped(old, "old"), ["old"]);
+        let new = order.opened();
+        assert_eq!(order.dropped(new, "new"), ["new"]);
     }
 
     #[test]
