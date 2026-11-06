@@ -22,3 +22,7 @@ io.github.cosmic_utils.cosmic-ext-applet-clipboard-manager-db.lock
 /web/wasm/pkg/
 /web/wasm/headless.html
 /crates/termland-web-client/target/
+
+# Core dumps: process memory, which can hold secrets from the environment.
+core
+core.[0-9]*
