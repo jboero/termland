@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.9.1
+%global version 1.0.0
 # find-debuginfo can produce an empty debugsourcefiles.list for a Rust
 # binary (unlike typical C sources), which newer Fedora's rpmbuild tolerates
 # but EL8's treats as a hard error ("Empty %%files file ... debugsourcefiles
@@ -253,6 +253,21 @@ fi
 %{_datadir}/fish/vendor_completions.d/termland-server.fish
 
 %changelog
+* Fri Nov 06 2026 John Boero - 1.0.0-1
+- The KDE desktop works again with Plasma 6.8 (#53). Plasma 6.8 draws
+  nothing outside KWin, so Plasma now runs in a KWin nested inside the
+  session's labwc. This needs a GPU; without one, the desktop is still
+  bare on Plasma 6.8 and later.
+- Sessions no longer crash a few seconds in with NVIDIA driver 620.70
+  (#54). The driver crashes when NVENC encoders are replaced in certain
+  orders, which every session did on its first resize.
+- Closing a session or logging out of Plasma shuts the desktop down in
+  order, instead of leaving KWin and plasmashell crash dumps.
+- Right Ctrl is sent as Left Ctrl to a nested KWin, which would
+  otherwise grab the pointer on it.
+- The session's window list now shows windows opened after the session
+  started. Before, only those present at connect were listed.
+
 * Wed Oct 21 2026 John Boero - 0.9.1-1
 - Log Out (or Shut Down / Restart) inside the remote Plasma desktop now
   ends the session. Nothing answered Plasma's logout request on the
