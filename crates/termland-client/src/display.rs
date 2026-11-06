@@ -4,7 +4,7 @@ use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton as WinitMouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 use crate::Args;
@@ -118,13 +118,16 @@ fn inhibit_shortcuts(window: &Window) -> Result<()> {
 
 pub fn run(args: Args) -> Result<()> {
     let event_loop = EventLoop::new().context("failed to create event loop")?;
-    let mut app = App::new(args);
+    let mut app = App::new(args, event_loop.create_proxy());
     event_loop.run_app(&mut app).context("event loop error")?;
     Ok(())
 }
 
 struct App {
     args: Args,
+    /// Wakes the event loop when the connection has something for it (see
+    /// `start_connection`), so it can sleep the rest of the time.
+    proxy: EventLoopProxy<()>,
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     server_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ServerEvent>>,
@@ -201,17 +204,22 @@ struct App {
     /// When End session was chosen. The window stays until the request has
     /// gone (`SessionEnded`), or gives up after `END_SESSION_TIMEOUT`.
     ending_since: Option<std::time::Instant>,
+    /// The window is fully hidden (X11 and macOS report this; Wayland just
+    /// stops asking for frames). Nothing is drawn until it is shown again.
+    occluded: bool,
 }
 
 /// How long to wait for an End session request to be sent before closing
 /// the window anyway.
 const END_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a window size has to stay put before the server is asked for it.
+const RESIZE_QUIESCE: std::time::Duration = std::time::Duration::from_millis(150);
 
 impl App {
-    fn new(args: Args) -> Self {
+    fn new(args: Args, proxy: EventLoopProxy<()>) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         Self {
-            args, window: None, surface: None, server_rx: None, client_tx: None,
+            args, proxy, window: None, surface: None, server_rx: None, client_tx: None,
             runtime, frame_width: 0, frame_height: 0, frame_buffer: Vec::new(),
             should_exit: false,
             menu: MenuState::new(),
@@ -236,6 +244,7 @@ impl App {
             session_id: None,
             reconnecting: None,
             connect_failed: None,
+            occluded: false,
         }
     }
 
@@ -424,8 +433,20 @@ impl App {
             reconnect: !self.args.no_reconnect,
         };
         match self.runtime.block_on(connect(&server, ssh, params)) {
-            Ok((rx, tx)) => {
-                self.server_rx = Some(rx);
+            Ok((mut rx, tx)) => {
+                // The event loop sleeps until something happens, so anything
+                // from the server has to wake it: relay each event and wake
+                // the loop to handle it.
+                let (relay_tx, relay_rx) = tokio::sync::mpsc::unbounded_channel();
+                let proxy = self.proxy.clone();
+                self.runtime.spawn(async move {
+                    while let Some(event) = rx.recv().await {
+                        if relay_tx.send(event).is_err() || proxy.send_event(()).is_err() {
+                            break;
+                        }
+                    }
+                });
+                self.server_rx = Some(relay_rx);
                 self.client_tx = Some(tx);
                 // Sync initial cursor mode: client_cursor=true means server
                 // should NOT composite cursor (client renders it locally).
@@ -514,9 +535,8 @@ impl App {
     /// for long enough that the size is stable. Prevents flooding the server
     /// with mid-drag sizes.
     fn flush_pending_resize(&mut self) {
-        const QUIESCE: std::time::Duration = std::time::Duration::from_millis(150);
         if let Some((w, h, set_at)) = self.pending_resize {
-            if set_at.elapsed() >= QUIESCE && self.last_sent_size != Some((w, h)) {
+            if set_at.elapsed() >= RESIZE_QUIESCE && self.last_sent_size != Some((w, h)) {
                 self.send_cmd(ClientCommand::Resize(w, h));
                 self.last_sent_size = Some((w, h));
                 self.pending_resize = None;
@@ -553,6 +573,7 @@ impl App {
             if let Ok(mut buffer) = surface.buffer_mut() {
                 buffer.fill(0x11111B);
                 overlay::draw_status_banner(&mut buffer, w.get(), h.get(), &format!("Could not connect: {reason}"));
+                window.pre_present_notify();
                 let _ = buffer.present();
             }
             return;
@@ -674,6 +695,7 @@ impl App {
                 overlay::draw_status_banner(&mut buffer, ww_nz.get(), wh_nz.get(), "Ending session...");
             }
 
+            window.pre_present_notify();
             let _ = buffer.present();
         }
     }
@@ -738,6 +760,37 @@ fn mouse_button_to_linux(button: WinitMouseButton) -> u32 {
 }
 
 impl ApplicationHandler for App {
+    /// The connection has events for us (see `start_connection`).
+    fn user_event(&mut self, _: &ActiveEventLoop, _: ()) {
+        self.process_events();
+        if let Some(w) = &self.window { w.request_redraw(); }
+    }
+
+    /// Everything that is not drawing, once per pass of the loop, and when to
+    /// wake if nothing else does.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.process_events();
+        if self.should_exit { event_loop.exit(); return; }
+        if self.ending_since.is_some_and(|t| t.elapsed() > END_SESSION_TIMEOUT) {
+            tracing::warn!("End session request not sent in time; closing, the session may still be running");
+            event_loop.exit();
+            return;
+        }
+        self.flush_pending_resize();
+        self.update_title();
+        let wake = [
+            self.pending_resize.map(|(_, _, at)| at + RESIZE_QUIESCE),
+            self.ending_since.map(|at| at + END_SESSION_TIMEOUT),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        event_loop.set_control_flow(match wake {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
+        });
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() { return; }
 
@@ -780,7 +833,20 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        // Draw only when something may have changed: an event from the window
+        // system (input can move the cursor or change an overlay) or from the
+        // server (`user_event`). Nothing else redraws, so an idle session
+        // costs nothing; a window that is not shown, minimized for one, is
+        // not drawn either (`occluded`, and on Wayland `pre_present_notify`
+        // holds redraws until the compositor wants a frame, which it does not
+        // for a hidden window).
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            if let Some(w) = &self.window { w.request_redraw(); }
+        }
         match event {
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+            }
             WindowEvent::Focused(gained) => {
                 if gained {
                     // Window gained focus: read local clipboard in a background
@@ -818,17 +884,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.process_events();
-                if self.should_exit { event_loop.exit(); return; }
-                if self.ending_since.is_some_and(|t| t.elapsed() > END_SESSION_TIMEOUT) {
-                    tracing::warn!("End session request not sent in time; closing, the session may still be running");
-                    event_loop.exit();
-                    return;
+                if !self.occluded {
+                    self.render();
                 }
-                self.flush_pending_resize();
-                self.update_title();
-                self.render();
-                if let Some(w) = &self.window { w.request_redraw(); }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 // Debug: log all physical keys so we can see whether F10/F11 reach us.
