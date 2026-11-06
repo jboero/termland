@@ -145,6 +145,8 @@ fn enumerates_a_real_window_from_labwc() {
         .env("WAYLAND_DISPLAY", &display)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env_remove("DISPLAY")
+        // Not the developer's desktop session bus: a KDE terminal registers on it.
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -206,4 +208,71 @@ fn enumerates_a_real_window_from_labwc() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// A window opened after the watcher connected must show up through `poll`,
+/// polled as the server polls it. `poll` used to only dispatch events already
+/// read, and nothing read the socket, so only windows that existed when the
+/// watcher connected were ever listed. A nested KWin, which maps its window
+/// after the session starts, was never seen at all.
+#[test]
+#[ignore = "needs a real headless compositor and mpv; run manually"]
+fn a_window_opened_later_appears_in_poll() {
+    let runtime_dir: PathBuf = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }))
+        .into();
+    first_on_path(&["mpv"]).expect("mpv is used as the window");
+
+    let child = Command::new("labwc")
+        .arg("-S")
+        .arg("sh -c 'echo \"TERMLAND_SOCKET:$WAYLAND_DISPLAY\" >&2; exec sleep 300'")
+        .env("WLR_BACKENDS", "headless")
+        .env("WLR_HEADLESS_OUTPUTS", "1")
+        .env("WLR_HEADLESS_OUTPUT_MODE", "1280x720")
+        .env("WLR_RENDERER", "pixman")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn labwc");
+    let mut guard = LabwcGuard(child);
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let display = wait_for_socket(&mut guard.0, Duration::from_secs(15), log.clone())
+        .unwrap_or_else(|| panic!("labwc never announced a socket:\n{}", dump_log(&log)));
+
+    let mut watcher = ToplevelWatcher::connect(&display, &runtime_dir)
+        .expect("labwc must advertise zwlr_foreign_toplevel_management_v1");
+    assert!(watcher.poll().expect("first poll").is_empty(), "no window yet");
+
+    // Only now open one, nothing of the developer's desktop reachable from it.
+    let mut app = Command::new("mpv")
+        .args(["--no-config", "--really-quiet", "--no-audio", "--vo=wlshm", "--loop", "av://lavfi:testsrc=size=320x240:rate=5"])
+        .env("WAYLAND_DISPLAY", &display)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env_remove("DISPLAY")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn mpv");
+
+    // As the server does: poll every 500 ms.
+    let started = Instant::now();
+    let mut windows = Vec::new();
+    while started.elapsed() < Duration::from_secs(15) {
+        std::thread::sleep(Duration::from_millis(500));
+        windows = watcher.poll().expect("poll");
+        if !windows.is_empty() {
+            break;
+        }
+    }
+    let _ = app.kill();
+    let _ = app.wait();
+    assert!(
+        windows.iter().any(|w| w.app_id == "mpv"),
+        "the window opened after connecting never appeared in poll(): {windows:#?}\n{}",
+        dump_log(&log)
+    );
 }

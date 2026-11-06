@@ -121,18 +121,15 @@ fn hosts_kwin(shell_cmd: &str) -> bool {
 ///
 /// With KWin nested (`nested_kwin`), KWin is the window manager and labwc
 /// only hosts its one window, so labwc binds no keys (Alt+Tab, Alt+F4 and the
-/// rest have to reach KWin) and draws no title bar on KWin's window, which
-/// KWin itself makes full-screen.
+/// rest have to reach KWin). KWin makes that window full-screen itself
+/// (`--fullscreen`), so it has no title bar either.
 fn rc_xml(width: u32, height: u32, nested_kwin: bool) -> String {
     let keyboard = if nested_kwin {
         // labwc loads its default keybinds when rc.xml has none, so one
         // binding that does nothing, on keys nobody presses, stands in.
         r#"  <keyboard>
     <keybind key="W-A-C-S-F24"><action name="None"/></keybind>
-  </keyboard>
-  <windowRules>
-    <windowRule identifier="org.kde.kwin" serverDecoration="no"/>
-  </windowRules>"#
+  </keyboard>"#
     } else {
         r#"  <keyboard>
     <keybind key="A-F4"><action name="Close"/></keybind>
@@ -167,14 +164,12 @@ mod tests {
         assert_eq!(rc.matches("<keybind ").count(), 1, "{rc}");
         assert!(rc.contains(r#"<keybind key="W-A-C-S-F24"><action name="None"/></keybind>"#), "{rc}");
         assert!(!rc.contains("<default/>"), "<default/> loads labwc's own keybinds: {rc}");
-        assert!(rc.contains(r#"identifier="org.kde.kwin" serverDecoration="no""#), "{rc}");
     }
 
     #[test]
     fn labwc_keeps_its_keybinds_without_kwin() {
         let rc = rc_xml(1280, 720, false);
         assert!(rc.contains(r#"key="A-Tab""#), "{rc}");
-        assert!(!rc.contains("org.kde.kwin"), "{rc}");
     }
 
     #[test]

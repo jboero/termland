@@ -12,7 +12,7 @@ pub mod input;
 
 pub use session::{Compositor, CompositorConfig, CompositorError, SessionMode};
 pub use input::InputInjector;
-pub use backend::{end_desktop, validate_shell_command};
+pub use backend::{desktop_pid_file, end_desktop, validate_shell_command};
 pub use cursor_capture::{CursorCapture, CursorCaptureError, CursorCapturer};
 pub use screencopy::{DamageRect, ScreenFrame};
 pub use toplevels::{Toplevel, ToplevelError, ToplevelWatcher};
