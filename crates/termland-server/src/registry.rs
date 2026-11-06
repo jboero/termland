@@ -273,6 +273,11 @@ pub fn list_alive() -> Vec<SessionRecord> {
 const TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Poll interval while waiting for the group to go away.
+/// How long a desktop asked to end itself (`termland_compositor::end_desktop`)
+/// gets to stop plasmashell, then KWin, then labwc, before it is terminated
+/// like any other session.
+const DESKTOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// What happened when a session's process group was terminated.
@@ -421,6 +426,15 @@ fn wait_for_group_exit(pgid: i32, timeout: std::time::Duration) -> bool {
 pub fn close(id: &str) {
     if let Some(rec) = read(id) {
         let pid = rec.compositor_pid as libc::pid_t;
+        // A desktop that can end itself is asked to first: stopping labwc
+        // under a nested KWin makes KWin and plasmashell abort (coredumps).
+        if termland_compositor::end_desktop(std::path::Path::new(&rec.runtime_dir), rec.compositor_pid)
+            && wait_for_group_exit(pid, DESKTOP_GRACE)
+        {
+            tracing::info!("Closed session {id} (desktop ended itself)");
+            remove(id);
+            return;
+        }
         match terminate_group(pid, TERM_GRACE) {
             Reaped::AlreadyGone => {
                 tracing::info!("Closed session {id} (compositor pid {pid} was already gone)");

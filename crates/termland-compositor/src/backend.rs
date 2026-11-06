@@ -586,13 +586,34 @@ pub fn plasma_desktop_command(shell: PlasmaShell, logout_service: Option<&str>, 
         // KWin's default Wayland socket would be the first free wayland-N,
         // which another session could take between KWin choosing it and
         // plasmashell connecting.
+        //
+        // kded6, which D-Bus starts rather than this script, is killed
+        // (`stop_kded`) once plasmashell has stopped and again after KWin.
+        // It crashes in its destructor (the device-notifications module
+        // using a dead Wayland object) however it is asked to quit, even with
+        // KWin still up (`kquitapp6 kded6` did that too), and an instance
+        // D-Bus starts during teardown aborts for want of a display. SIGKILL
+        // runs no destructor and dumps no core. Only this session's: D-Bus
+        // double-forks what it starts, so kded6 is not a child of anything
+        // here, but it keeps the session's process group, which is labwc's
+        // pid (labwc is setsid'd). A plain `pkill kded6` would take the
+        // host's own Plasma session's kded6 with it.
+        //
+        // The script records its pid (`desktop_pid_file`) so the session is
+        // ended through it (`end_desktop`), not by stopping labwc: KWin is a
+        // labwc client and aborts the moment labwc goes, and plasmashell,
+        // a KWin client, with it. Signalled, the trap stops them in order;
+        // then `dbus-run-session` takes the bus down, and labwc exits because
+        // its session command (-S) has.
         PlasmaShell::NestedKwin => format!(
             "dbus-run-session sh -c '{start_logout}\
+             desktop=$XDG_RUNTIME_DIR/termland-desktop-$LABWC_PID; echo $$ > $desktop; \
+             stop_kded() {{ [ -n \"$LABWC_PID\" ] && pkill -KILL -x -g $LABWC_PID kded6; }}; \
              kwin=termland-kwin-$$; \
              kwin_wayland --socket $kwin --fullscreen true --xwayland --no-lockscreen & kwin_pid=$!; \
              i=0; while [ ! -S \"$XDG_RUNTIME_DIR/$kwin\" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; \
              WAYLAND_DISPLAY=$kwin plasmashell --no-respawn & shell=$!; \
-             trap \"kill $shell{logout_pid} 2>/dev/null; wait $shell 2>/dev/null; kill $kwin_pid 2>/dev/null; wait $kwin_pid 2>/dev/null\" EXIT INT TERM; \
+             trap \"trap - EXIT INT TERM; kill $shell{logout_pid} 2>/dev/null; wait $shell 2>/dev/null; stop_kded; kill $kwin_pid 2>/dev/null; wait $kwin_pid 2>/dev/null; stop_kded; rm -f $desktop\" EXIT INT TERM; \
              wait $kwin_pid'"
         ),
         // A terminal in the foreground so something is visible and labwc has
@@ -604,6 +625,34 @@ pub fn plasma_desktop_command(shell: PlasmaShell, logout_service: Option<&str>, 
              {terminal}'"
         ),
     }
+}
+
+/// Where the nested-KWin desktop script records its pid: in the session's
+/// runtime dir, named for its labwc, which exports `LABWC_PID` to it.
+pub fn desktop_pid_file(runtime_dir: &Path, labwc_pid: u32) -> PathBuf {
+    runtime_dir.join(format!("termland-desktop-{labwc_pid}"))
+}
+
+/// Ask the session's desktop to end itself, the clean way to end a session
+/// that has one: SIGTERM to the desktop script, which stops plasmashell and
+/// then KWin, after which labwc exits too. See `PlasmaShell::NestedKwin`.
+///
+/// Returns false, having signalled nothing, when there is no such script (no
+/// pid file: another desktop, or one from before this existed) or the pid in
+/// the file is not in the session's process group, which a stale file whose
+/// pid was reused would not be. The caller then stops labwc itself.
+pub fn end_desktop(runtime_dir: &Path, labwc_pid: u32) -> bool {
+    let Ok(text) = std::fs::read_to_string(desktop_pid_file(runtime_dir, labwc_pid)) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<libc::pid_t>() else {
+        return false;
+    };
+    // labwc is setsid'd, so the session's group id is its pid.
+    if pid <= 0 || unsafe { libc::getpgid(pid) } != labwc_pid as libc::pid_t {
+        return false;
+    }
+    unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
 }
 
 pub mod cage;
@@ -705,6 +754,20 @@ mod desktop_shell_tests {
         assert!(cmd.contains("kwin=termland-kwin-$$;"), "{cmd}");
     }
 
+    /// kded6 is killed only in this session's process group: a bare
+    /// `pkill kded6` would kill the host's own Plasma session's kded6.
+    #[test]
+    fn only_the_sessions_kded_is_killed() {
+        let cmd = plasma_desktop_command(PlasmaShell::NestedKwin, None, "konsole");
+        assert!(cmd.contains(r#"[ -n "$LABWC_PID" ] && pkill -KILL -x -g $LABWC_PID kded6"#), "{cmd}");
+        assert_eq!(cmd.matches("pkill").count(), 1, "{cmd}");
+        let plasma = cmd.find("wait $shell").unwrap();
+        let first = plasma + cmd[plasma..].find("stop_kded").expect("after plasmashell");
+        let kwin = cmd.find("kill $kwin_pid").unwrap();
+        assert!(first < kwin, "kded must go before KWin: {cmd}");
+        assert!(cmd[kwin..].contains("stop_kded"), "and again after KWin: {cmd}");
+    }
+
     /// plasmashell is stopped, and waited for, before KWin, so it shuts down
     /// with its compositor and bus still there.
     #[test]
@@ -747,6 +810,12 @@ mod desktop_shell_tests {
         ));
         // dbus-run-session: run its command, as the real one does.
         stub("dbus-run-session", "exec \"$@\"");
+        // pkill only records what it was asked: this runs on a developer's
+        // desktop, whose own processes it must never reach. (An earlier
+        // version of the script, run by this test, quit the developer's own
+        // kded6, and with it the system tray.)
+        let pkill_log = dir.join("pkill");
+        stub("pkill", &format!("echo \"$*\" >> {}", pkill_log.display()));
 
         let cmd = plasma_desktop_command(PlasmaShell::NestedKwin, None, "konsole");
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
@@ -755,6 +824,11 @@ mod desktop_shell_tests {
             .arg(format!("exec {cmd}"))
             .env("PATH", &path)
             .env("XDG_RUNTIME_DIR", &runtime)
+            .env("LABWC_PID", "4242")
+            // Nothing here may reach the desktop the test runs on.
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("DISPLAY")
             .spawn()
             .expect("run the desktop script");
         // Wait for plasmashell to start.
@@ -762,9 +836,15 @@ mod desktop_shell_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             std::fs::read_to_string(&log).is_ok_and(|l| l.contains("plasmashell on"))
         });
+        // The script (`exec`'d into, so the child itself) recorded its pid.
+        let pid_file = desktop_pid_file(&runtime, 4242);
+        let recorded = std::fs::read_to_string(&pid_file).unwrap_or_default();
         // End the session as labwc does.
         unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        let child_pid = child.id();
         let _ = child.wait();
+        let pid_file_left = pid_file.exists();
+        let pkills = std::fs::read_to_string(&pkill_log).unwrap_or_default();
         let lines: Vec<String> = std::fs::read_to_string(&log)
             .unwrap_or_default()
             .lines()
@@ -773,6 +853,13 @@ mod desktop_shell_tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(started, "plasmashell never started: {lines:?}");
+        assert_eq!(recorded.trim(), child_pid.to_string(), "the script must record its own pid");
+        assert!(!pid_file_left, "the pid file must go with the desktop");
+        assert_eq!(
+            pkills.lines().collect::<Vec<_>>(),
+            ["-KILL -x -g 4242 kded6"; 2],
+            "kded6 is killed in the session's process group only, after plasmashell and after KWin"
+        );
         let socket = lines[0].split_whitespace().nth(2).expect("kwin socket").to_string();
         assert!(socket.starts_with("termland-kwin-"), "{lines:?}");
         assert_eq!(
@@ -780,6 +867,53 @@ mod desktop_shell_tests {
             [format!("plasmashell on {socket}"), "plasmashell-stopped".into(), "kwin-stopped".into()],
             "plasmashell must connect to KWin, and stop before it"
         );
+    }
+
+    /// A process standing in for the desktop script: in its own process
+    /// group (as labwc's session is), recording SIGTERM.
+    fn stand_in_session(dir: &Path) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("trap 'echo term > {}/got; exit 0' TERM; while :; do sleep 0.05; done", dir.display()))
+            .process_group(0)
+            .spawn()
+            .expect("spawn stand-in")
+    }
+
+    #[test]
+    fn end_desktop_signals_the_recorded_script() {
+        let dir = std::env::temp_dir().join(format!("termland-end-desktop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = stand_in_session(&dir);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let group = session.id();
+        std::fs::write(desktop_pid_file(&dir, group), format!("{group}\n")).unwrap();
+        let signalled = end_desktop(&dir, group);
+        let _ = session.wait();
+        let got = std::fs::read_to_string(dir.join("got")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(signalled);
+        assert_eq!(got.trim(), "term");
+    }
+
+    /// A stale pid file must not get an unrelated process signalled.
+    #[test]
+    fn end_desktop_leaves_a_pid_outside_the_session_alone() {
+        let dir = std::env::temp_dir().join(format!("termland-end-desktop-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut other = stand_in_session(&dir);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Recorded for a session whose group is not `other`'s.
+        std::fs::write(desktop_pid_file(&dir, 999_999), other.id().to_string()).unwrap();
+        let signalled = end_desktop(&dir, 999_999);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let got = dir.join("got").exists();
+        let _ = other.kill();
+        let _ = other.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!signalled && !got, "signalled a process outside the session");
+        assert!(!end_desktop(&dir, 999_999), "no pid file: nothing to signal");
     }
 }
 
