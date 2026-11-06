@@ -8,7 +8,7 @@
 # COPR: upload this spec + source tarball for automated builds.
 
 %global crate_name termland
-%global version 0.9.1
+%global version 1.0.0
 # See termland-server.spec's comment: EL8's rpmbuild fails hard on the empty
 # debugsourcefiles.list find-debuginfo can produce for a Rust binary.
 %global debug_package %{nil}
@@ -163,6 +163,14 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/io.github.jboero.term
 %{_datadir}/fish/vendor_completions.d/termland-client.fish
 
 %changelog
+* Fri Nov 06 2026 John Boero - 1.0.0-1
+- The session window draws only when something changes. An idle session
+  used a whole CPU core (84% measured), minimized or not; it now uses
+  none.
+- The tray menu lists each profile's resumable sessions when it is
+  opened ("Loading…" first), with Resume and Close. Nothing is polled
+  in the background.
+
 * Wed Oct 21 2026 John Boero - 0.9.1-1
 - Fix "cannot resolve host" for SSH servers given as host:port (or
   [v6addr]:port); the port is now passed to ssh as -p.

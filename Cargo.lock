@@ -4941,7 +4941,7 @@ dependencies = [
 
 [[package]]
 name = "termland-client"
-version = "0.9.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4977,7 +4977,7 @@ dependencies = [
 
 [[package]]
 name = "termland-codec"
-version = "0.9.1"
+version = "1.0.0"
 dependencies = [
  "ffmpeg-next",
  "libc",
@@ -4990,7 +4990,7 @@ dependencies = [
 
 [[package]]
 name = "termland-compositor"
-version = "0.9.1"
+version = "1.0.0"
 dependencies = [
  "libc",
  "nix 0.29.0",
@@ -5005,7 +5005,7 @@ dependencies = [
 
 [[package]]
 name = "termland-mobile-core"
-version = "0.9.1"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "futures",
@@ -5024,7 +5024,7 @@ dependencies = [
 
 [[package]]
 name = "termland-protocol"
-version = "0.9.1"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "ciborium",
@@ -5035,7 +5035,7 @@ dependencies = [
 
 [[package]]
 name = "termland-server"
-version = "0.9.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bytemuck",
