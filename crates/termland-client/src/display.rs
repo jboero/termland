@@ -215,6 +215,35 @@ const END_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// How long a window size has to stay put before the server is asked for it.
 const RESIZE_QUIESCE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// What to do with a pending window size.
+#[derive(Debug, PartialEq)]
+enum ResizeStep {
+    /// Still settling.
+    Wait,
+    /// Settled at a size the server already has: nothing to send.
+    Drop,
+    /// Settled at a new size: ask the server for it.
+    Send(u32, u32),
+}
+
+/// A settled size is always taken off `pending_resize`, sent or not. It used
+/// to stay pending when it matched the size already sent, the usual case
+/// for a window that opens at its session's size, and the event loop, which
+/// wakes when a pending resize is due, then woke continuously: a core spent
+/// on a still desktop.
+fn settle_resize(
+    pending: Option<(u32, u32, std::time::Instant)>,
+    last_sent: Option<(u32, u32)>,
+) -> ResizeStep {
+    match pending {
+        Some((w, h, at)) if at.elapsed() >= RESIZE_QUIESCE => {
+            if last_sent == Some((w, h)) { ResizeStep::Drop } else { ResizeStep::Send(w, h) }
+        }
+        Some(_) => ResizeStep::Wait,
+        None => ResizeStep::Wait,
+    }
+}
+
 impl App {
     fn new(args: Args, proxy: EventLoopProxy<()>) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -535,8 +564,10 @@ impl App {
     /// for long enough that the size is stable. Prevents flooding the server
     /// with mid-drag sizes.
     fn flush_pending_resize(&mut self) {
-        if let Some((w, h, set_at)) = self.pending_resize {
-            if set_at.elapsed() >= RESIZE_QUIESCE && self.last_sent_size != Some((w, h)) {
+        match settle_resize(self.pending_resize, self.last_sent_size) {
+            ResizeStep::Wait => {}
+            ResizeStep::Drop => self.pending_resize = None,
+            ResizeStep::Send(w, h) => {
                 self.send_cmd(ClientCommand::Resize(w, h));
                 self.last_sent_size = Some((w, h));
                 self.pending_resize = None;
@@ -1096,5 +1127,32 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn settled(w: u32, h: u32) -> Option<(u32, u32, Instant)> {
+        Some((w, h, Instant::now() - RESIZE_QUIESCE - Duration::from_millis(1)))
+    }
+
+    #[test]
+    fn a_settled_size_the_server_has_is_dropped() {
+        assert_eq!(settle_resize(settled(1112, 666), Some((1112, 666))), ResizeStep::Drop);
+    }
+
+    #[test]
+    fn a_settled_new_size_is_sent() {
+        assert_eq!(settle_resize(settled(1278, 692), Some((1280, 720))), ResizeStep::Send(1278, 692));
+        assert_eq!(settle_resize(settled(1278, 692), None), ResizeStep::Send(1278, 692));
+    }
+
+    #[test]
+    fn a_size_still_changing_waits() {
+        assert_eq!(settle_resize(Some((1278, 692, Instant::now())), Some((1280, 720))), ResizeStep::Wait);
+        assert_eq!(settle_resize(None, Some((1280, 720))), ResizeStep::Wait);
     }
 }
