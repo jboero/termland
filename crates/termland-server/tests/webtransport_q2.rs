@@ -145,7 +145,10 @@ async fn webtransport_q2_video_stream_carries_a_real_keyframe() -> Result<()> {
             height: 360,
             audio: false,
             quality: 30,
-            desktop_shell: None,
+            // Not the detected default: on a KDE developer machine that is a
+            // whole Plasma desktop (KWin, plasmashell, kded6...) started on
+            // the developer's own machine. These tests only need frames.
+            desktop_shell: Some("sleep 3600".into()),
             encoder_preset: None,
             encoder_crf: None,
             encoder_extra_params: None,
